@@ -456,18 +456,24 @@ const resolvePackageImportAlias = (
     return unresolvedCandidate("external", [
       `Package metadata ${metadata.path} blocks import alias ${specifier} with ${selected.cause === "null" ? "an explicit null imports target" : "an empty imports target array"}.`,
     ]);
-  // Pattern matches substitute the captured substring into the selected string
-  // target before classification, so recursive and external-package refusals
-  // name the expanded target a concrete specifier selected.
+  // Pattern matches substitute the captured substring into the selected target
+  // string, but a selected non-relative target keeps its class: Node
+  // classifies the declared target before substitution, and reclassifying the
+  // expanded text could launder a bare-package target into a relative one.
   const final =
-    lookup.kind === "pattern-found"
-      ? expandPatternString(
-          selected.value,
-          lookup.capture,
-          packageUrl,
-          "imports",
-        )
-      : selected;
+    lookup.kind !== "pattern-found"
+      ? selected
+      : selected.kind === "non-relative"
+        ? ({
+            kind: "non-relative",
+            value: selected.value.replaceAll("*", () => lookup.capture),
+          } as const)
+        : expandPatternString(
+            selected.value,
+            lookup.capture,
+            packageUrl,
+            "imports",
+          );
   if (final.kind === "invalid")
     return unresolvedCandidate("rejected", [
       `Package metadata ${metadata.path}: ${final.limitation}`,
@@ -1101,9 +1107,10 @@ const forbiddenExportSegment = (value: string): string | undefined =>
     .find((raw) => decodedSegmentIsForbidden(raw));
 
 // Node rejects a forbidden segment in the captured subpath itself, whether or
-// not the selected target interpolates the `*`.
+// not the selected target interpolates the `*`. Backslash separates capture
+// segments the same way it separates target segments.
 const forbiddenCapturedSegment = (capture: string): string | undefined =>
-  capture.split("/").find((raw) => decodedSegmentIsForbidden(raw));
+  capture.split(/[\\/]/u).find((raw) => decodedSegmentIsForbidden(raw));
 
 const selectStringPackageTarget = (
   value: string,

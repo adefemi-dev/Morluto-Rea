@@ -2660,6 +2660,49 @@ describe("package import alias pattern captures", () => {
       limitations: [expect.stringContaining("pattern capture")],
     });
   });
+
+  it("refuses a backslash-separated capture escape", () => {
+    const files = aliasFiles({
+      "package.json": JSON.stringify({
+        imports: { "#x/*": "./src/safe.mjs" },
+      }),
+      "main.js": "",
+      "src/safe.mjs": "",
+    });
+    const outcome = resolve({
+      declaredPath: "#x/..\\child",
+      sourcePath: "main.js",
+      context: "module-specifier",
+      moduleKind: "import",
+      files,
+    });
+    expect(outcome).toMatchObject({
+      resolution_status: "rejected",
+      resolved_path: null,
+    });
+  });
+
+  it("does not launder a non-relative target through capture substitution", () => {
+    const files = aliasFiles({
+      "package.json": JSON.stringify({
+        imports: { "#*": ".*" },
+      }),
+      "main.js": "",
+      "safe.js": "",
+    });
+    const outcome = resolve({
+      declaredPath: "#/safe.js",
+      sourcePath: "main.js",
+      context: "module-specifier",
+      moduleKind: "import",
+      files,
+    });
+    expect(outcome).toMatchObject({
+      resolution_status: "external",
+      resolved_path: null,
+    });
+    expect(outcome.resolved_path).not.toBe("safe.js");
+  });
 });
 
 const resolve = (input: ResolveArtifactPathInput) =>
