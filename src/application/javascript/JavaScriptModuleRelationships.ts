@@ -103,7 +103,10 @@ export const addJavaScriptSourceModules = (
             logical_module_key: file.path,
             module_format: moduleFormat(file.path, semantic.ir),
             import_relationships: semantic.ir.moduleLinks.filter(
-              ({ kind }) => kind === "import" || kind === "require",
+              ({ kind }) =>
+                kind === "import" ||
+                kind === "require" ||
+                kind === "type-import",
             ).length,
             export_relationships: exports.length,
             export_names: retainedExports,
@@ -157,7 +160,12 @@ export function* addJavaScriptModuleRelationshipsSteps(
       else if (link.specifier !== null)
         addImportRelationship(input, source, omissions, {
           specifier: link.specifier,
-          importedPath: link.importedName === null ? [] : [link.importedName],
+          importedPath:
+            link.importedName === null
+              ? []
+              : link.kind === "type-import"
+                ? link.importedName.split(".")
+                : [link.importedName],
         });
     }
   }
@@ -376,6 +384,7 @@ const relationshipProperties = (
 ) => ({
   module_link_kind: link.kind,
   ...moduleResolutionModeProperties(link.resolutionMode),
+  ...typeNamespaceExportProperties(link.exportedTypeName),
   specifier: origin?.specifier ?? link.specifier,
   imported_name: origin?.importedPath.at(-1) ?? link.importedName,
   imported_path: origin?.importedPath ?? [],
@@ -389,6 +398,9 @@ const relationshipProperties = (
       ? jsonStatus(target.file)
       : null,
 });
+
+const typeNamespaceExportProperties = (name: string | undefined) =>
+  name === undefined ? {} : { exported_type_name: name };
 
 const relationshipEvidence = (
   input: RelationshipInput,

@@ -36,11 +36,16 @@ const analyze: JavaScriptSourceWorkerAnalyzer = async (
   const receivers = await completeJavaScriptAnalysisSteps(
     classifyParsedJavaScriptOpenReceiversSteps(parsed),
   );
+  const staticImportResolutionMode = moduleKindForJavaScriptReference(
+    file.path,
+    "static-import",
+  );
   const facts = await completeJavaScriptAnalysisSteps(
     analyzeParsedJavaScriptStaticSourceSteps(
       file.text.value,
       parsed,
       receivers,
+      staticImportResolutionMode,
     ),
   );
   const resultBudgetBytes = await callbacks.checkpoint(facts);
@@ -54,10 +59,7 @@ const analyze: JavaScriptSourceWorkerAnalyzer = async (
     );
   await callbacks.phase("semantic");
   const ir = await completeJavaScriptAnalysisSteps(
-    analyzeParsedJavaScriptSemanticsSteps(
-      parsed,
-      moduleKindForJavaScriptReference(file.path, "static-import"),
-    ),
+    analyzeParsedJavaScriptSemanticsSteps(parsed, staticImportResolutionMode),
   );
   parsed = null;
   const module = projectJavaScriptModuleSemantics(ir);

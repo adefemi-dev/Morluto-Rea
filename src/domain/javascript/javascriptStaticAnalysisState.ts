@@ -61,6 +61,7 @@ export interface JavaScriptAnalysisAccumulator {
 
 /** Shared source and accumulator for helper inspections. */
 export interface JavaScriptFindingContext {
+  readonly staticImportResolutionMode?: "import" | "require";
   readonly rpcScan: JavaScriptRpcScan;
   readonly source: string;
   readonly accumulator: JavaScriptAnalysisAccumulator;
@@ -79,6 +80,7 @@ export interface JavaScriptFindingContext {
 
 /** Candidate import, require, worker, or service-worker reference. */
 export interface JavaScriptReferenceInput {
+  readonly resolutionMode?: "import" | "require";
   readonly node: t.Node;
   readonly kind: JavaScriptStaticReference["kind"];
   readonly specifier: string | undefined;

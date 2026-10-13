@@ -373,10 +373,15 @@ function* analyzeArtifactFileSteps<
   }
   const openReceiverFacts =
     yield* classifyParsedJavaScriptOpenReceiversSteps(parsed);
+  const staticImportResolutionMode = moduleKindForJavaScriptReference(
+    file.path,
+    "static-import",
+  );
   const analysis = yield* analyzeParsedJavaScriptStaticSourceSteps(
     file.text.value,
     parsed,
     openReceiverFacts,
+    staticImportResolutionMode,
   );
   const staticFindings = findingCount(analysis);
   yield;
@@ -384,7 +389,7 @@ function* analyzeArtifactFileSteps<
     analysis.parse_status === "complete" || analysis.parse_status === "partial"
       ? yield* analyzeParsedJavaScriptSemanticsSteps(
           parsed,
-          moduleKindForJavaScriptReference(file.path, "static-import"),
+          staticImportResolutionMode,
         )
       : null;
   const projected =

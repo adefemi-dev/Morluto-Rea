@@ -1,4 +1,5 @@
 import * as t from "@babel/types";
+import { typescriptImportResolutionMode } from "./typescriptImportResolutionMode.js";
 import { collectElectronWrappedCallPaths } from "./electronWrappedCallPaths.js";
 import {
   ELECTRON_IDENTITY_LIMITATION,
@@ -73,9 +74,15 @@ export const analyzeParsedJavaScriptStaticSource = (
   source: string,
   file: ParsedJavaScriptSource,
   openReceiverFacts?: ReadonlyMap<number, JavaScriptOpenReceiverFact>,
+  staticImportResolutionMode: "import" | "require" = "import",
 ): JavaScriptStaticAnalysis =>
   completeSemanticSteps(
-    analyzeParsedJavaScriptStaticSourceSteps(source, file, openReceiverFacts),
+    analyzeParsedJavaScriptStaticSourceSteps(
+      source,
+      file,
+      openReceiverFacts,
+      staticImportResolutionMode,
+    ),
   );
 
 /** Static analysis that yields during its source traversal; results are unchanged. */
@@ -83,6 +90,7 @@ export function* analyzeParsedJavaScriptStaticSourceSteps(
   source: string,
   file: ParsedJavaScriptSource,
   openReceiverFacts?: ReadonlyMap<number, JavaScriptOpenReceiverFact>,
+  staticImportResolutionMode: "import" | "require" = "import",
 ): Generator<void, JavaScriptStaticAnalysis> {
   const accumulator = createJavaScriptAnalysisAccumulator(source.length);
   const bindings = yield* indexJavaScriptBindingsSteps(file.program);
@@ -96,6 +104,7 @@ export function* analyzeParsedJavaScriptStaticSourceSteps(
     {
       source,
       accumulator,
+      staticImportResolutionMode,
       ...(openReceiverFacts === undefined ? {} : { openReceiverFacts }),
       electronBindings: electronIdentity.bindings,
       rpcScan: createJavaScriptRpcScan(source, clientRoots),
@@ -230,7 +239,12 @@ const inspectNode = (
   bindings: JavaScriptSemanticAnalysisState,
 ): void => {
   const { source, accumulator } = findings;
-  inspectElectronStaticNode(node, findings);
+  const resolutionMode = typescriptImportResolutionMode(node);
+  inspectElectronStaticNode(
+    node,
+    findings,
+    resolutionMode ?? findings.staticImportResolutionMode,
+  );
   if (t.isCallExpression(node)) {
     inspectBundlerBootstrap(source, node, accumulator, bindings);
     inspectBundlerRegistration(source, node, accumulator, bindings);
@@ -247,19 +261,28 @@ const inspectNode = (
   } else if (
     (t.isImportDeclaration(node) || t.isExportAllDeclaration(node)) &&
     node.source !== undefined
-  )
+  ) {
     addReference(findings, {
       node,
       kind: "static-import",
       specifier: node.source.value,
+      ...(resolutionMode === undefined ? {} : { resolutionMode }),
     });
-  else if (t.isExportNamedDeclaration(node) && node.source != null)
+  } else if (t.isExportNamedDeclaration(node) && node.source != null) {
     addReference(findings, {
       node,
       kind: "static-import",
       specifier: node.source.value,
+      ...(resolutionMode === undefined ? {} : { resolutionMode }),
     });
-  else if (t.isImportExpression(node))
+  } else if (t.isTSImportType(node)) {
+    addReference(findings, {
+      node,
+      kind: "type-import",
+      specifier: stringValue(node.source),
+      ...(resolutionMode === undefined ? {} : { resolutionMode }),
+    });
+  } else if (t.isImportExpression(node))
     addReference(findings, {
       node,
       kind: "dynamic-import",
