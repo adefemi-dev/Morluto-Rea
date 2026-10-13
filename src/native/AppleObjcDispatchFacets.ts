@@ -200,7 +200,14 @@ export const decodeObjcDispatchFacets = (input: {
         budget.markTruncated();
         break;
       }
-      protocolReader.record(read.pointer(section.address + BigInt(index * 8)));
+      const field = section.address + BigInt(index * 8);
+      try {
+        protocolReader.record(read.pointer(field));
+      } catch (cause) {
+        failures.push(
+          `${hex(field)}: ${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+      }
     }
   }
   const visited = new Set<string>();
