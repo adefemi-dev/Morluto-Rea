@@ -605,4 +605,19 @@ describe("Apple dispatch unmapped protocol-list slot", () => {
       reason: expect.stringContaining("0x100009000"),
     });
   });
+
+  it("bounds failed protocol-list slots by the record budget", () => {
+    // The section size is file-declared, so a crafted image can claim an
+    // arbitrarily large unmapped protocol list. Failed slots must spend the
+    // record budget like decoded ones, otherwise the loop runs unbounded.
+    const bytes = image("protocol");
+    bytes.writeBigUInt64LE(80000n, 224);
+    const result = decodeAppleDispatchMetadata(bytes, 100, provenance);
+    const coverage = classCoverage(result);
+    expect(coverage).toMatchObject({ status: "partial" });
+    expect(coverage?.reason).toContain("max_records_reached");
+    const failures =
+      coverage?.reason?.match(/Unmapped or ambiguous metadata pointer/g) ?? [];
+    expect(failures.length).toBeLessThanOrEqual(100);
+  });
 });

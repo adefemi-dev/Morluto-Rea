@@ -204,6 +204,10 @@ export const decodeObjcDispatchFacets = (input: {
       try {
         protocolReader.record(read.pointer(field));
       } catch (cause) {
+        // A failed slot still spends the record budget: without this, a
+        // file-declared section size bounds the loop while failed reads never
+        // trip budget.isFull(), letting crafted images force unbounded attempts.
+        if (!budget.admit()) break;
         failures.push(
           `${hex(field)}: ${cause instanceof Error ? cause.message : String(cause)}`,
         );
