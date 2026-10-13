@@ -77,6 +77,13 @@ describe("exact package import lookup", () => {
     });
   });
 
+  it("does not match a pattern key that lacks the required hash prefix", () => {
+    expect(lookupExactPackageImport({ "*": "./src/*.js" }, "#foo")).toEqual({
+      kind: "pattern-unresolved",
+      declared: ["*"],
+    });
+  });
+
   it("does not claim a miss when no pattern key matches", () => {
     expect(
       lookupExactPackageImport({ "#internal/*": "./src/*.js" }, "#other/a"),
