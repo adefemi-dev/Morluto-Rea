@@ -1,5 +1,5 @@
 import { randomUUID, createHash } from "node:crypto";
-import { access, realpath, writeFile } from "node:fs/promises";
+import { access, realpath, writeFile, open } from "node:fs/promises";
 import { constants } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import type { ExecutionOptions } from "../application/AnalysisProvider.js";
@@ -18,6 +18,7 @@ import {
   AnalysisArtifactChangedError,
   AnalysisInputError,
   AnalysisOutputError,
+  AnalysisUnsupportedTargetError,
 } from "../domain/analysisErrorCore.js";
 import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 import { createEvidence } from "../domain/evidence.js";
@@ -34,9 +35,47 @@ import { wabtFailure } from "./WabtFailures.js";
 import { parseWabtOutput } from "./WabtOutput.js";
 import { parseWabtWat } from "./WabtWat.js";
 import { associateWasmGlue } from "./WasmGlueAdapter.js";
+import {
+  isWasmComponent,
+  readWasmPreamble,
+} from "../domain/wasm/wasmPreamble.js";
 
 type Launcher = NonNullable<Parameters<typeof runOwnedCommand>[2]>["launcher"];
 const OPERATION = "inspect_wasm_artifact";
+
+/**
+ * Route a component before any WABT configuration or command. An unreadable
+ * path is left to the stable read, which reports it after tool checks.
+ */
+const selectsWasmComponent = async (path: string): Promise<boolean> => {
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(
+      path,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+    const header = Buffer.alloc(8);
+    const { bytesRead } = await handle.read(header, 0, header.length, 0);
+    return isWasmComponent(readWasmPreamble(header.subarray(0, bytesRead)));
+  } catch (cause: unknown) {
+    // The authoritative stable read classifies inaccessible selections.
+    void cause;
+    return false;
+  } finally {
+    await handle?.close();
+  }
+};
+
+const componentSelected = (path: string): AnalysisUnsupportedTargetError =>
+  new AnalysisUnsupportedTargetError(
+    OPERATION,
+    path,
+    "WebAssembly component (layer 1), not a core module; WABT decodes core modules only",
+    {
+      remediationAction:
+        "Decode WebAssembly components with inspect_wasm_component.",
+    },
+  );
 const digest = (text: string) =>
   createHash("sha256").update(text).digest("hex");
 /** Run caller-supplied WABT against private copies of exactly selected bytes. */
@@ -83,6 +122,8 @@ export class WabtArtifactProvider implements WasmArtifactPort {
     let capturedOutput: AnalysisCapturedOutput | undefined;
     try {
       if (options?.signal?.aborted) throw new AnalysisCancelledError(OPERATION);
+      if (await selectsWasmComponent(input.path))
+        throw componentSelected(input.path);
       await this.close();
       const directory = this.environment.REA_WABT_BIN_DIRECTORY ?? "";
       if (!isAbsolute(directory))
@@ -201,6 +242,9 @@ export class WabtArtifactProvider implements WasmArtifactPort {
         WABT_LIMITS.inputBytes,
         options?.signal,
       );
+      // The early probe can race a replaced file; the stable read decides.
+      if (isWasmComponent(readWasmPreamble(selected.bytes)))
+        throw componentSelected(input.path);
       const artifact = {
         path: input.path,
         sha256: selected.sha256,
