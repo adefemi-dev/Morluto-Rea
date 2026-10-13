@@ -1,4 +1,4 @@
-import { writeFile } from "node:fs/promises";
+import { mkdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
@@ -50,29 +50,35 @@ const structured = (result: CallToolResult): Record<string, unknown> => {
   return z.record(z.string(), z.unknown()).parse(result.structuredContent);
 };
 
-it("opens a headerless image when architecture and entry are supplied", async () => {
-  const root = await createTestTempDirectory("rea-raw-mcp-");
-  const path = join(root, "ecu.bin");
-  await writeFile(path, Buffer.from("1eff2fe1", "hex"));
-  const { client } = await connect();
-  const opened = await client.callTool({
-    name: "open_binary",
-    arguments: {
+it.each([
+  ["arm", "0x08000000", "0x8000000", "1eff2fe1"],
+  ["6502", "0x008001", "0x8001", "a92a60"],
+])(
+  "opens a headerless %s image when architecture and entry are supplied",
+  async (architecture, entryPoint, canonical, bytes) => {
+    const root = await createTestTempDirectory("rea-raw-mcp-");
+    const path = join(root, "ecu.bin");
+    await writeFile(path, Buffer.from(bytes, "hex"));
+    const { client } = await connect();
+    const opened = await client.callTool({
+      name: "open_binary",
+      arguments: {
+        path,
+        format: "raw-binary",
+        architecture,
+        entry_point: entryPoint,
+      },
+    });
+    expect(opened.isError).not.toBe(true);
+    expect(structured(opened).result).toMatchObject({
       path,
       format: "raw-binary",
-      architecture: "arm",
-      entry_point: "0x08000000",
-    },
-  });
-  expect(opened.isError).not.toBe(true);
-  expect(structured(opened).result).toMatchObject({
-    path,
-    format: "raw-binary",
-    kind: "executable",
-    architecture: "arm",
-    entry_point: "0x8000000",
-  });
-});
+      kind: "executable",
+      architecture,
+      entry_point: canonical,
+    });
+  },
+);
 
 it("rejects an unaligned AArch64 entry before selecting or starting a provider", async () => {
   const root = await createTestTempDirectory("rea-raw-mcp-alignment-");
@@ -217,3 +223,54 @@ it("reuses a canonical raw entry and replaces the session when the entry changes
   expect(created).toEqual(["0x8000000", "0x9000000"]);
   expect(closed).toEqual(["0x8000000"]);
 });
+
+it.skipIf(process.platform !== "win32")(
+  "replaces a Windows raw session when its requested path changes to a junction",
+  async () => {
+    const root = await createTestTempDirectory("rea-raw-mcp-linked-reopen-");
+    const actual = join(root, "actual");
+    const linked = join(root, "linked");
+    await mkdir(actual);
+    const path = join(actual, "image.bin");
+    await writeFile(path, Buffer.from("a92a60", "hex"));
+    await symlink(actual, linked, "junction");
+    const created: string[] = [];
+    const executed: string[] = [];
+    const fixture = createCacheProvider([]);
+    const { client } = await connect({
+      ...fixture,
+      createClient: (target) => {
+        created.push(target.sourcePath ?? target.path);
+        return {
+          execute: (operation) => {
+            if (operation === "address_name")
+              executed.push(target.sourcePath ?? target.path);
+            return Promise.resolve(
+              observed(operation === "address_name" ? "entry" : null),
+            );
+          },
+          close: () => Promise.resolve(ok(null)),
+        };
+      },
+    });
+    for (const requested of [path, join(linked, "image.bin")]) {
+      const opened = await client.callTool({
+        name: "open_binary",
+        arguments: {
+          path: requested,
+          format: "raw-binary",
+          architecture: "6502",
+          entry_point: "0x8001",
+        },
+      });
+      expect(opened.isError, JSON.stringify(opened)).not.toBe(true);
+      const address = await client.callTool({
+        name: "address_name",
+        arguments: { address: "0x8001" },
+      });
+      expect(address.isError, JSON.stringify(address)).not.toBe(true);
+    }
+    expect(created).toEqual([path, join(linked, "image.bin")]);
+    expect(executed).toEqual([path, join(linked, "image.bin")]);
+  },
+);
