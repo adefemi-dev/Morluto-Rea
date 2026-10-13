@@ -507,31 +507,34 @@ describe("SVG xlink:href context", () => {
     ]);
   });
 
-  it("stops SVG context at foreignObject and resumes it for a nested svg", () => {
-    const result = captureSvg(
-      svgDocument([
-        { name: "svg", parent: 0 },
-        { name: "foreignObject", parent: 1 },
-        {
-          name: "A",
-          parent: 2,
-          attributes: [["xlink:href", "/xl-html-fo"]],
-        },
-        { name: "svg", parent: 2 },
-        {
-          name: "a",
-          parent: 4,
-          attributes: [["xlink:href", "/xl-nested"]],
-        },
-      ]),
-    );
-    expect(urlFor(result, 3)).toBeUndefined();
-    expect(urlFor(result, 5)).toMatchObject({
-      attribute: "href",
-      url: `${origin}/xl-nested`,
-      destination_scope: "approved",
-    });
-  });
+  it.each(["foreignObject", "desc", "title"])(
+    "stops SVG context at %s and resumes it for a nested svg",
+    (integrationPoint) => {
+      const result = captureSvg(
+        svgDocument([
+          { name: "svg", parent: 0 },
+          { name: integrationPoint, parent: 1 },
+          {
+            name: "A",
+            parent: 2,
+            attributes: [["xlink:href", "/xl-html-fo"]],
+          },
+          { name: "svg", parent: 2 },
+          {
+            name: "a",
+            parent: 4,
+            attributes: [["xlink:href", "/xl-nested"]],
+          },
+        ]),
+      );
+      expect(urlFor(result, 3)).toBeUndefined();
+      expect(urlFor(result, 5)).toMatchObject({
+        attribute: "href",
+        url: `${origin}/xl-nested`,
+        destination_scope: "approved",
+      });
+    },
+  );
 
   it("keeps an empty href ahead of xlink:href", () => {
     const baseUrl = `${origin}/screens/assets/`;

@@ -2,6 +2,7 @@ import { numberValue } from "./CdpCaptureValues.js";
 
 const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
 const XLINK_NAMESPACE = "http://www.w3.org/1999/xlink";
+const HTML_INTEGRATION_POINTS = new Set(["foreignObject", "desc", "title"]);
 
 interface DomSnapshotNodes {
   readonly nodeTypes: readonly number[];
@@ -109,7 +110,7 @@ export const domSvgLink = (
 };
 
 // Chrome's HTML parser records SVG local names (`svg`, `foreignObject`).
-// Descendants of foreignObject are HTML until a nested `svg`.
+// Children of SVG HTML integration points use HTML rules until a nested `svg`.
 const elementInSvgContext = (
   index: number,
   nodes: DomSnapshotNodes,
@@ -135,7 +136,11 @@ const elementInSvgContext = (
     }
     const parent = Math.trunc(nodes.parents[current] ?? -1);
     if (parent < 0 || parent === current) break;
-    if (stringAt(nodes.strings, nodes.nodeNames[parent]) === "foreignObject")
+    if (
+      HTML_INTEGRATION_POINTS.has(
+        stringAt(nodes.strings, nodes.nodeNames[parent]),
+      )
+    )
       break;
     current = parent;
   }
