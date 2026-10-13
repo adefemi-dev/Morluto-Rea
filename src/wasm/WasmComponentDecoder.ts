@@ -27,8 +27,15 @@ import {
   WasmComponentFormatFailure,
   WasmComponentReader,
 } from "./WasmComponentReader.js";
-import { resolveCanonRelationships } from "./WasmComponentRelationships.js";
-import type { TypeDecodeContext } from "./WasmComponentTypeContext.js";
+import {
+  createRelationshipBudget,
+  resolveCanonRelationships,
+  type RelationshipBudget,
+} from "./WasmComponentRelationships.js";
+import {
+  decodeTypeAtomically,
+  type TypeDecodeContext,
+} from "./WasmComponentTypeContext.js";
 import {
   decodeAlias,
   decodeComponentType,
@@ -104,6 +111,7 @@ interface DecodeState {
   readonly types: TypeDecodeContext;
   readonly notDecoded: WasmComponentDecoding["notDecoded"];
   readonly signal: AbortSignal | undefined;
+  readonly relationships: RelationshipBudget;
   sectionsSinceYield: number;
 }
 
@@ -209,6 +217,7 @@ export const decodeWasmComponent = async (
     types: { scopes: [], features, depth: 0 },
     notDecoded: [],
     signal,
+    relationships: createRelationshipBudget(),
     sectionsSinceYield: 0,
   };
   await decodeComponentAt(state, {
@@ -262,7 +271,11 @@ const decodeComponentAt = async (
     const section = reader.sub(reader.u32("section size"), "section");
     await decodeRecordedSection(context, id, section);
   }
-  const relationships = resolveCanonRelationships(component, context.spaces);
+  const relationships = resolveCanonRelationships(
+    component,
+    context.spaces,
+    state.relationships,
+  );
   component.lifts = relationships.lifts;
   component.lowers = relationships.lowers;
 };
@@ -364,7 +377,9 @@ const SECTION_DECODERS = new Map<number, SectionDecoder>([
     ({ state, component, spaces }, reader) =>
       decodeVector(reader, "core types", () => {
         const start = reader.offset;
-        const type = decodeCoreType(reader, state.types);
+        const type = decodeTypeAtomically(state.types, () =>
+          decodeCoreType(reader, state.types),
+        );
         component.core_types.push({
           index: spaces.add("core type", { kind: "other" }),
           range: { start, end: reader.offset },
@@ -399,7 +414,9 @@ const SECTION_DECODERS = new Map<number, SectionDecoder>([
     ({ state, component, spaces }, reader) =>
       decodeVector(reader, "types", () => {
         const start = reader.offset;
-        const type = decodeComponentType(reader, state.types);
+        const type = decodeTypeAtomically(state.types, () =>
+          decodeComponentType(reader, state.types),
+        );
         component.types.push({
           index: spaces.add("type", { kind: "other" }),
           range: { start, end: reader.offset },

@@ -231,7 +231,7 @@ it.each([
   }
 });
 
-it("points a selected component to the component decoder before running WABT", async () => {
+it("routes a selected component before any WABT configuration or command", async () => {
   const selectedRoot = await createTestTempDirectory("rea-wabt-component-");
   const path = join(selectedRoot, "component.wasm");
   await writeFile(path, Buffer.from([0, 0x61, 0x73, 0x6d, 0x0d, 0, 1, 0]));
@@ -271,6 +271,16 @@ it("points a selected component to the component decoder before running WABT", a
       remediationAction: expect.stringContaining("inspect_wasm_component"),
     },
   });
-  expect(commands.every((args) => args[0] === "--version")).toBe(true);
-  await expect(access(runtimePath)).rejects.toMatchObject({ code: "ENOENT" });
+  expect(commands).toEqual([]);
+  expect(runtimePath).toBe("");
+
+  const unconfigured = new WabtArtifactProvider({}, undefined, () => {
+    throw new Error("Must not allocate");
+  });
+  expect(
+    await unconfigured.inspect({ path, glue_paths: [], candidate_paths: [] }),
+  ).toMatchObject({
+    ok: false,
+    error: { _tag: "AnalysisUnsupportedTargetError" },
+  });
 });

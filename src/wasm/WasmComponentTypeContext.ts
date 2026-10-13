@@ -37,6 +37,23 @@ export const vector = <T>(
   return values;
 };
 
+/**
+ * Decode one top-level type; if it fails, drop every scope it registered so
+ * no partially decoded scope or provisional range survives.
+ */
+export const decodeTypeAtomically = <T>(
+  context: TypeDecodeContext,
+  decode: () => T,
+): T => {
+  const registered = context.scopes.length;
+  try {
+    return decode();
+  } catch (cause: unknown) {
+    context.scopes.length = registered;
+    throw cause;
+  }
+};
+
 /** Register a flat declaration scope for a component, instance or module type. */
 export const openScope = (
   reader: WasmComponentReader,

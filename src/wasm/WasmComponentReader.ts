@@ -14,7 +14,8 @@ export class WasmComponentFormatFailure extends Error {
   }
 }
 
-const UTF8 = new TextDecoder("utf-8", { fatal: true });
+/** Names are length-prefixed bytes, so a leading U+FEFF is kept, not stripped. */
+const UTF8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 /** Bounded cursor over one byte range; every offset is an absolute file offset. */
 export class WasmComponentReader {

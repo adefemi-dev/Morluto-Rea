@@ -15,6 +15,10 @@ import {
   withPreamble,
 } from "./WasmComponentBinary.fixture.js";
 import { WasmComponentFormatFailure } from "./WasmComponentReader.js";
+import {
+  MAX_CORE_IMPORT_BINDINGS,
+  WasmComponentRelationshipLimit,
+} from "./WasmComponentRelationships.js";
 
 const failureOf = async (bytes: Uint8Array) => {
   try {
@@ -302,6 +306,101 @@ describe("decodeWasmComponent partial coverage", () => {
     ).toEqual([
       { index: 0, core_version: null, status: "not_decoded" },
       { index: 1, core_version: 1, status: "not_decoded" },
+    ]);
+  });
+});
+
+describe("decodeWasmComponent resource bounds", () => {
+  it("counts start results without allocating an entry per result", async () => {
+    const decoded = await decodeWasmComponent(
+      component(
+        section(9, [0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x0f]),
+        section(12, vec([0x7f, 0x01, 0x01])),
+      ),
+    );
+    const [root] = decoded.components;
+    expect(root?.start?.results).toBe(4_294_967_295);
+    expect(root?.values[0]?.index).toBe(4_294_967_295);
+  });
+
+  it("traces many lifts and exports in linear time", async () => {
+    const count = 20_000;
+    const lifts = Array.from({ length: count }, () => [
+      0x00, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    const exports = Array.from({ length: count }, (_, index) => [
+      ...externName(`e${String(index)}`),
+      0x01,
+      0x00,
+      0x00,
+    ]);
+    const decoded = await decodeWasmComponent(
+      component(
+        section(10, vec([...externName("f"), 0x01, ...u32(0)])),
+        section(8, vec(...lifts)),
+        section(11, vec(...exports)),
+      ),
+    );
+    const [root] = decoded.components;
+    expect(root?.lifts).toHaveLength(count);
+    expect(
+      root?.lifts.every(({ exported_as }) => exported_as.length === 0),
+    ).toBe(true);
+  });
+
+  it("fails instead of materializing multiplicative lower bindings", async () => {
+    const names = Array.from({ length: 300 }, (_, index) => [
+      ...name(`n${String(index)}`),
+      0x00,
+      ...u32(0),
+    ]);
+    const instantiations = Array.from({ length: 300 }, () => [
+      0x00,
+      ...u32(0),
+      ...vec([...name("a"), 0x12, ...u32(0)]),
+    ]);
+    expect(300 * 300).toBeGreaterThan(MAX_CORE_IMPORT_BINDINGS);
+    await expect(
+      decodeWasmComponent(
+        component(
+          section(10, vec([...externName("f"), 0x01, ...u32(0)])),
+          section(8, vec([0x01, 0x00, ...u32(0), ...vec()])),
+          section(2, vec([0x01, ...vec(...names)], ...instantiations)),
+        ),
+      ),
+    ).rejects.toBeInstanceOf(WasmComponentRelationshipLimit);
+  });
+});
+
+describe("decodeWasmComponent name and scope fidelity", () => {
+  it("keeps a leading U+FEFF in length-prefixed names", async () => {
+    const decoded = await decodeWasmComponent(
+      component(
+        section(
+          10,
+          vec(
+            [...externName("\uFEFFrun"), 0x01, ...u32(0)],
+            [...externName("run"), 0x01, ...u32(0)],
+          ),
+        ),
+      ),
+    );
+    expect(decoded.components[0]?.imports.map(({ name }) => name)).toEqual([
+      "\uFEFFrun",
+      "run",
+    ]);
+  });
+
+  it("drops the scopes of a type that fails partway", async () => {
+    const decoded = await decodeWasmComponent(
+      component(section(7, [0x01, 0x42, 0x02, 0x01, 0x7f, 0xff])),
+    );
+    expect(decoded.typeScopes).toEqual([]);
+    expect(decoded.components[0]?.types).toEqual([]);
+    expect(decoded.notDecoded).toEqual([
+      expect.objectContaining({
+        reason: expect.stringContaining("Unknown type declaration 0xff"),
+      }),
     ]);
   });
 });

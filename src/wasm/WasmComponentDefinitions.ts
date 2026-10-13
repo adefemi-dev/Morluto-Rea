@@ -158,8 +158,7 @@ export const decodeStart = (
     args.push(reader.u32("start argument value"));
   const results = reader.u32("start result count");
   reader.expectEnd("start section");
-  for (let index = 0; index < results; index += 1)
-    spaces.add("value", { kind: "other" });
+  spaces.addAnonymous("value", results);
   component.start = {
     range: { start, end: reader.offset },
     func,
