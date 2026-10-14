@@ -1,7 +1,12 @@
 import {
+  isGhidraFunctionOperation,
   parseGhidraFunctionInput,
   parseGhidraFunctionResult,
 } from "../dist/ghidra/GhidraFunctionValues.js";
+import {
+  parseGhidraInventoryInput,
+  parseGhidraInventoryResult,
+} from "../dist/ghidra/GhidraInventoryValues.js";
 
 import {
   assertDossier,
@@ -11,10 +16,17 @@ import {
   dossierSummary,
   matchesSymbol,
   requireProcedure,
+  symbolTail,
 } from "./verify-real-ghidra-assertions.mjs";
 
+// Function checks also use inventory operations such as
+// resolve_containing_procedure, so route each operation to its own parser
+// exactly as GhidraProvider does.
 async function functionCall(client, operation, parameters) {
-  const input = parseGhidraFunctionInput(operation, parameters);
+  const isFunctionOperation = isGhidraFunctionOperation(operation);
+  const input = isFunctionOperation
+    ? parseGhidraFunctionInput(operation, parameters)
+    : parseGhidraInventoryInput(operation, parameters);
   if (!input.ok) throw input.error;
   const called = await client.callTool(operation, input.value);
   if (!called.ok)
@@ -22,7 +34,9 @@ async function functionCall(client, operation, parameters) {
       `Ghidra ${operation} failed for ${JSON.stringify(input.value)}: ${called.error.message}`,
       { cause: called.error },
     );
-  const parsed = parseGhidraFunctionResult(operation, called.value);
+  const parsed = isFunctionOperation
+    ? parseGhidraFunctionResult(operation, called.value)
+    : parseGhidraInventoryResult(operation, called.value);
   if (!parsed.ok) throw parsed.error;
   return parsed.value;
 }

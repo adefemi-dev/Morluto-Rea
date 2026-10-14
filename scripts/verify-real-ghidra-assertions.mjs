@@ -189,12 +189,25 @@ export async function assertCleanup(coordinates) {
 }
 
 export function assertDebugFixture(observed) {
+  // Ghidra imports a digest-named snapshot (see GhidraTargetSnapshot.ts), so
+  // the Program identity is the snapshot name bound to the target SHA-256.
+  const snapshotName = `target-${observed.target.sha256.slice(0, 12)}.bin`;
   if (
     !Array.isArray(observed.documents) ||
     observed.documents.length !== 1 ||
-    !observed.documents[0].includes("debug")
+    observed.documents[0] !== snapshotName ||
+    observed.session.target.name !== snapshotName ||
+    observed.session.target.sha256 !== observed.target.sha256
   )
-    throw new Error("Ghidra did not expose exactly one debug Program identity");
+    throw new Error(
+      `Ghidra did not expose exactly one debug Program identity: ${JSON.stringify(
+        {
+          documents: observed.documents,
+          expected: snapshotName,
+          session_target: observed.session.target,
+        },
+      )}`,
+    );
   const entry = findValue(observed.procedures, "rea_ghidra_inventory_entry");
   const leaf = findValue(observed.procedures, "rea_ghidra_inventory_leaf");
   const external = observed.procedures.find(
