@@ -117,6 +117,8 @@ export class GhidraClient {
   #startupController: AbortController | undefined;
   #startPromise: Promise<GhidraStartResult> | undefined;
   #ready = false;
+  // The latest startup ended without a ready bridge, so no session exists.
+  #startupFailed = false;
   #closePromise: Promise<void> | undefined;
   readonly #failure = bindGhidraSessionFailure(
     () => this.#diagnostics(),
@@ -218,6 +220,7 @@ export class GhidraClient {
     void started.then(
       (result) => {
         signal?.removeEventListener("abort", onAbort);
+        this.#startupFailed = !result.ok;
         if (result.ok) this.#ready = true;
         else reset();
       },
@@ -226,6 +229,7 @@ export class GhidraClient {
           { error: cause instanceof Error ? cause.message : String(cause) },
           "Ghidra startup promise rejected during bookkeeping",
         );
+        this.#startupFailed = true;
         reset();
       },
     );
@@ -490,6 +494,7 @@ export class GhidraClient {
 
   #requestClose(forceStop: boolean): Promise<void> {
     this.#ready = false;
+    this.#startupFailed = false;
     const starting = this.#startPromise;
     const controller = this.#startupController;
     controller?.abort();
@@ -524,7 +529,11 @@ export class GhidraClient {
                 this.#socketRoot !== undefined ||
                 this.#snapshotOwners.size > 0)
             ? "unknown"
-            : undefined;
+            : this.#startupFailed && this.#startPromise === undefined
+              ? // Nothing was retained, but no session ever became ready:
+                // probing health would launch a fresh one instead.
+                "not_started"
+              : undefined;
     if (state === undefined) return undefined;
     return {
       state,
