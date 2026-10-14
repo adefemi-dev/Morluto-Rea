@@ -6,19 +6,31 @@
 # installer: `rea setup` never installs Java or Ghidra, and this script is
 # operator-owned environment provisioning for disposable cloud containers.
 #
-# What it does, idempotently:
-#   1. Installs a full JDK 21 (with javac), procps (`ps`), unzip, and curl
-#      through apt-get, only when they are missing.
-#   2. Downloads the official Ghidra release archive from the
+# What it does, idempotently. Each step runs on its own, so one failure (for
+# example a blocked download) does not stop the others; a summary at the end
+# lists every step's result:
+#   1. Prerequisites: installs a full JDK 21 (with javac), procps (`ps`),
+#      unzip, curl, and Python venv support through apt-get, only when they
+#      are missing.
+#   2. REA package: downloads rea-agents into the npm cache with the same
+#      command `.mcp.json` uses, so the MCP server starts quickly.
+#   3. pwntools: creates a Python environment at PWNTOOLS_VENV (default
+#      /opt/rea-pwntools) with the exact versions REA's ELF layout adapter
+#      requires (pwntools 4.15.0, pyelftools 0.33, unicorn 2.1.2).
+#   4. Ghidra: downloads the official release archive from the
 #      NationalSecurityAgency/ghidra GitHub release, verifies its SHA-256,
-#      and extracts it under GHIDRA_PREFIX (default /opt).
-#   3. Links ghidraRun into BIN_DIR (default /usr/local/bin).
+#      extracts it under GHIDRA_PREFIX (default /opt), and links ghidraRun into
+#      BIN_DIR (default /usr/local/bin).
 #
-# After it runs, add this environment variable in the same environment
-# settings so the REA MCP server sees the installation:
+# After it runs, add these environment variables in the same environment
+# settings so the REA MCP server sees the installations:
 #   GHIDRA_INSTALL_DIR=/opt/ghidra_12.1.4_PUBLIC
-# rea-agents 6.4.0 requires it. Later releases also discover Ghidra through
-# the ghidraRun PATH link when the variable is unset.
+#   REA_PWNTOOLS_PYTHON=/opt/rea-pwntools/bin/python
+# rea-agents 6.4.0 requires GHIDRA_INSTALL_DIR. Later releases also discover
+# Ghidra through the ghidraRun PATH link when the variable is unset.
+#
+# The script exits 0 even when a step fails, so a blocked download cannot
+# stop sessions from starting. Set STRICT=1 to exit 1 when any step fails.
 #
 # Optional overrides:
 #   GHIDRA_VERSION   Ghidra release, default 12.1.4 (REA accepts 12.1.x and
@@ -28,11 +40,18 @@
 #   GHIDRA_ZIP       Absolute path to an already downloaded release archive.
 #   GHIDRA_PREFIX    Extraction parent directory, default /opt.
 #   BIN_DIR          Directory for the ghidraRun link, default /usr/local/bin.
+#   REA_VERSION      rea-agents version to pre-download, default 6.4.0
+#                    (keep it equal to the version pinned in .mcp.json).
+#   PWNTOOLS_VENV    pwntools environment directory, default /opt/rea-pwntools.
+#   SKIP_PWNTOOLS=1  Skip step 3.
 set -euo pipefail
 
 GHIDRA_VERSION="${GHIDRA_VERSION:-12.1.4}"
 GHIDRA_PREFIX="${GHIDRA_PREFIX:-/opt}"
 BIN_DIR="${BIN_DIR:-/usr/local/bin}"
+REA_VERSION="${REA_VERSION:-6.4.0}"
+PWNTOOLS_VENV="${PWNTOOLS_VENV:-/opt/rea-pwntools}"
+PWNTOOLS_PINS=(pwntools==4.15.0 pyelftools==0.33 unicorn==2.1.2)
 GHIDRA_DIR="${GHIDRA_PREFIX}/ghidra_${GHIDRA_VERSION}_PUBLIC"
 RELEASE_API="https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/tags/Ghidra_${GHIDRA_VERSION}_build"
 
@@ -63,8 +82,12 @@ ensure_packages() {
   command -v ps >/dev/null 2>&1 || missing+=(procps)
   command -v unzip >/dev/null 2>&1 || missing+=(unzip)
   command -v curl >/dev/null 2>&1 || missing+=(curl ca-certificates)
+  command -v python3 >/dev/null 2>&1 || missing+=(python3)
+  if [ "${SKIP_PWNTOOLS:-0}" != 1 ] && ! python3 -c 'import ensurepip, venv' >/dev/null 2>&1; then
+    missing+=(python3-venv)
+  fi
   if [ "${#missing[@]}" -eq 0 ]; then
-    log "prerequisites present: javac, ps, unzip, curl"
+    log "prerequisites present: javac, ps, unzip, curl, python3"
     return
   fi
   command -v apt-get >/dev/null 2>&1 || die "apt-get not found; install ${missing[*]} manually"
@@ -139,6 +162,7 @@ install_ghidra() {
   [ ! -e "$GHIDRA_DIR" ] || die "${GHIDRA_DIR} exists but is not Ghidra ${GHIDRA_VERSION}; remove it first"
 
   WORK_DIR="$(mktemp -d)"
+  trap cleanup EXIT
   work="$WORK_DIR"
   if [ -n "${GHIDRA_ZIP:-}" ]; then
     [ -f "$GHIDRA_ZIP" ] || die "GHIDRA_ZIP does not exist: ${GHIDRA_ZIP}"
@@ -174,9 +198,81 @@ link_launcher() {
   log "linked ${link} -> ${target}"
 }
 
-ensure_packages
-check_java_major
-install_ghidra
-link_launcher
-log "done. Set GHIDRA_INSTALL_DIR=${GHIDRA_DIR} in the environment variables, then verify"
-log "inside a session with: npx -y --prefix=/ rea-agents@6.4.0 doctor --json"
+# Runs the same command .mcp.json uses so the package lands in the npm cache.
+prewarm_rea() {
+  command -v npx >/dev/null 2>&1 || die "npx not found; the MCP server will download REA on first start"
+  (cd / && npx -y --prefix=/ "rea-agents@${REA_VERSION}" --version) >&2
+  log "rea-agents ${REA_VERSION} is in the npm cache"
+}
+
+pwntools_ready() {
+  [ -x "${PWNTOOLS_VENV}/bin/python" ] || return 1
+  "${PWNTOOLS_VENV}/bin/python" - <<'PY' >/dev/null 2>&1
+from importlib.metadata import version
+assert version("pwntools") == "4.15.0"
+assert version("pyelftools") == "0.33"
+assert version("unicorn") == "2.1.2"
+PY
+}
+
+install_pwntools() {
+  if pwntools_ready; then
+    log "pwntools environment already present at ${PWNTOOLS_VENV}"
+    return
+  fi
+  as_root python3 -m venv "$PWNTOOLS_VENV"
+  as_root "${PWNTOOLS_VENV}/bin/python" -m pip install -q --disable-pip-version-check "${PWNTOOLS_PINS[@]}"
+  pwntools_ready || die "pwntools environment at ${PWNTOOLS_VENV} does not report the pinned versions"
+  log "installed ${PWNTOOLS_PINS[*]} at ${PWNTOOLS_VENV}"
+}
+
+install_ghidra_and_link() {
+  check_java_major
+  install_ghidra
+  link_launcher
+}
+
+STEP_RESULTS=()
+FAILED=0
+
+# Runs one step in a subshell with errexit active, records its result, and
+# continues with the next step either way.
+run_step() {
+  local name="$1" rc
+  shift
+  log "--- ${name}"
+  set +e
+  (
+    set -e
+    "$@"
+  )
+  rc=$?
+  set -e
+  if [ "$rc" -eq 0 ]; then
+    STEP_RESULTS+=("ok      ${name}")
+  else
+    STEP_RESULTS+=("FAILED  ${name}")
+    FAILED=1
+  fi
+}
+
+run_step "prerequisites" ensure_packages
+run_step "REA package (npm cache)" prewarm_rea
+if [ "${SKIP_PWNTOOLS:-0}" = 1 ]; then
+  STEP_RESULTS+=("skipped pwntools (SKIP_PWNTOOLS=1)")
+else
+  run_step "pwntools" install_pwntools
+fi
+run_step "Ghidra ${GHIDRA_VERSION}" install_ghidra_and_link
+
+log "=== summary"
+for result in "${STEP_RESULTS[@]}"; do
+  log "$result"
+done
+log "environment variables for the REA MCP server:"
+log "  GHIDRA_INSTALL_DIR=${GHIDRA_DIR}"
+log "  REA_PWNTOOLS_PYTHON=${PWNTOOLS_VENV}/bin/python"
+log "check inside a session with: npx -y --prefix=/ rea-agents@${REA_VERSION} doctor --json"
+if [ "$FAILED" -eq 1 ] && [ "${STRICT:-0}" = 1 ]; then
+  exit 1
+fi

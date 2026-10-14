@@ -17,36 +17,56 @@ It runs `npx` with `--prefix=/` because this repository's own `package.json`
 is also named `rea-agents`; without it, `npx` resolves the local project and
 fails with `rea: not found`.
 
-### Add Ghidra to the cloud environment
+### Add Ghidra and pwntools to the cloud environment
 
 1. Open the cloud environment menu in a session's title bar and choose
    **Edit**.
 2. Paste the contents of [`claude-cloud-setup.sh`](claude-cloud-setup.sh)
-   into **Setup script**. It installs a full JDK 21, `procps`, `unzip`, and
-   `curl` only when missing, downloads the official Ghidra 12.1.4 archive
-   from the NationalSecurityAgency/ghidra GitHub release, verifies the
-   SHA-256 that GitHub reports for the asset, and extracts it to
-   `/opt/ghidra_12.1.4_PUBLIC`.
-3. Add this environment variable in the same settings:
+   into **Setup script**. It runs four independent steps and prints a summary:
+   - prerequisites: a full JDK 21, `procps`, `unzip`, `curl`, and Python venv
+     support, installed only when missing;
+   - REA package: pre-downloads `rea-agents@6.4.0` with the same command
+     `.mcp.json` uses (measured: 9.4 s cold start, 1.9 s once cached);
+   - pwntools: `/opt/rea-pwntools` with pwntools 4.15.0, pyelftools 0.33 and
+     unicorn 2.1.2, which REA's ELF layout adapter requires;
+   - Ghidra: the official 12.1.4 archive from the NationalSecurityAgency/ghidra
+     GitHub release, checked against the SHA-256 GitHub reports and extracted
+     to `/opt/ghidra_12.1.4_PUBLIC`.
+
+   A failed step does not stop the others, and the script exits 0 so sessions
+   still start. Set `STRICT=1` to make any failure exit 1.
+
+3. Add these environment variables in the same settings:
 
    ```
    GHIDRA_INSTALL_DIR=/opt/ghidra_12.1.4_PUBLIC
+   REA_PWNTOOLS_PYTHON=/opt/rea-pwntools/bin/python
    ```
 
-   `rea-agents` 6.4.0 requires it. Later releases can also find Ghidra through
-   the `/usr/local/bin/ghidraRun` link the script creates.
+   `rea-agents` 6.4.0 requires `GHIDRA_INSTALL_DIR`. Later releases can also
+   find Ghidra through the `/usr/local/bin/ghidraRun` link the script creates.
 
-4. Start a new session and check:
+4. Under **Network access**, allow these hosts (keep package managers allowed;
+   PyPI and npm are already on that list):
+
+   ```
+   api.github.com
+   github.com
+   release-assets.githubusercontent.com
+   objects.githubusercontent.com
+   ```
+
+5. Start a new session and check:
 
    ```bash
    npx -y --prefix=/ rea-agents@6.4.0 doctor --json
    ```
 
-The environment's network policy must allow `api.github.com` and GitHub
-release downloads. If the API is unreachable, the script stops with
-`could not resolve the Ghidra 12.1.4 release asset`. To install from an
-archive you supply instead, set `GHIDRA_ZIP` to its absolute path and
-`GHIDRA_SHA256` to the checksum published on the release page.
+If GitHub is unreachable, the Ghidra step fails with
+`could not resolve the Ghidra 12.1.4 release asset` while the other steps still
+finish. To install from an archive you supply instead, set `GHIDRA_ZIP` to its
+absolute path and `GHIDRA_SHA256` to the checksum published on the release
+page.
 
 ## Claude Desktop on Windows
 
@@ -175,11 +195,14 @@ analysis that needs REA's tools.
 
 ## Verification status
 
-- Cloud: the setup script was tested with a synthetic archive for a fresh
-  install, an idempotent rerun, a checksum mismatch, a refused launcher
-  replacement, and a blocked GitHub API. A real Ghidra download was not
-  possible from the session that wrote it, because its network policy blocks
-  that repository's release pages.
+- Cloud: the setup script's Ghidra step was tested with a synthetic archive
+  for a fresh install, an idempotent rerun, a checksum mismatch, a refused
+  launcher replacement, and a blocked GitHub API (the other steps still
+  completed). The pwntools and REA pre-download steps ran for real, and
+  `inspect-binary-layout /usr/bin/ls` then returned 31 sections and 128
+  symbols through the script-built pwntools environment. A real Ghidra
+  download was not possible from the session that wrote it, because its
+  network policy blocks that repository's release pages.
 - Windows: confirmed on one Windows machine with the Store build of Claude
   Desktop, Node.js 24.16.0, Temurin JDK 21.0.12 and Ghidra 12.1.4. After the
   private-file registration above, a Chat tab session opened
