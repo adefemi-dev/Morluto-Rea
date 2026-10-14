@@ -17,10 +17,11 @@
 #   3. pwntools: creates a Python environment at PWNTOOLS_VENV (default
 #      /opt/rea-pwntools) with the exact versions REA's ELF layout adapter
 #      requires (pwntools 4.15.0, pyelftools 0.33, unicorn 2.1.2).
-#   4. Ghidra: downloads the official release archive from the
-#      NationalSecurityAgency/ghidra GitHub release, verifies its SHA-256,
-#      extracts it under GHIDRA_PREFIX (default /opt), and links ghidraRun into
-#      BIN_DIR (default /usr/local/bin).
+#   4. Ghidra: downloads the official release archive from a GitHub release
+#      (default: the operator's adefemi-dev/ghidra-dist mirror, because cloud
+#      sessions can reach only repositories attached to them), verifies it
+#      against the official SHA-256, extracts it under GHIDRA_PREFIX (default
+#      /opt), and links ghidraRun into BIN_DIR (default /usr/local/bin).
 #
 # After it runs, add these environment variables in the same environment
 # settings so the REA MCP server sees the installations:
@@ -35,8 +36,15 @@
 # Optional overrides:
 #   GHIDRA_VERSION   Ghidra release, default 12.1.4 (REA accepts 12.1.x and
 #                    verifies its bridge with 12.1.4).
-#   GHIDRA_SHA256    Expected archive SHA-256. Required when the GitHub API
-#                    does not report an asset digest.
+#   GHIDRA_RELEASE_REPO  GitHub owner/repo holding the release, default
+#                    adefemi-dev/ghidra-dist. Use NationalSecurityAgency/ghidra
+#                    where the official repository is reachable.
+#   GHIDRA_RELEASE_TAG   Release tag, default v<version> for a mirror and
+#                    Ghidra_<version>_build for NationalSecurityAgency/ghidra.
+#   GHIDRA_SHA256    Expected archive SHA-256. Defaults to the official value
+#                    pinned below for known versions; required otherwise.
+#   GH_TOKEN         Optional GitHub token for a private release repository
+#                    when no proxy supplies credentials. Never logged.
 #   GHIDRA_ZIP       Absolute path to an already downloaded release archive.
 #   GHIDRA_PREFIX    Extraction parent directory, default /opt.
 #   BIN_DIR          Directory for the ghidraRun link, default /usr/local/bin.
@@ -53,7 +61,22 @@ REA_VERSION="${REA_VERSION:-6.4.0}"
 PWNTOOLS_VENV="${PWNTOOLS_VENV:-/opt/rea-pwntools}"
 PWNTOOLS_PINS=(pwntools==4.15.0 pyelftools==0.33 unicorn==2.1.2)
 GHIDRA_DIR="${GHIDRA_PREFIX}/ghidra_${GHIDRA_VERSION}_PUBLIC"
-RELEASE_API="https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/tags/Ghidra_${GHIDRA_VERSION}_build"
+GHIDRA_RELEASE_REPO="${GHIDRA_RELEASE_REPO:-adefemi-dev/ghidra-dist}"
+if [ "$GHIDRA_RELEASE_REPO" = "NationalSecurityAgency/ghidra" ]; then
+  GHIDRA_RELEASE_TAG="${GHIDRA_RELEASE_TAG:-Ghidra_${GHIDRA_VERSION}_build}"
+else
+  GHIDRA_RELEASE_TAG="${GHIDRA_RELEASE_TAG:-v${GHIDRA_VERSION}}"
+fi
+RELEASE_API="https://api.github.com/repos/${GHIDRA_RELEASE_REPO}/releases/tags/${GHIDRA_RELEASE_TAG}"
+
+# Official archive checksums. A mirror's own digest only shows the upload was
+# intact, so a mirrored archive must also match the official value.
+official_sha256() {
+  case "$1" in
+    12.1.4) printf '%s\n' ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db ;;
+    *) return 1 ;;
+  esac
+}
 
 WORK_DIR=""
 cleanup() { [ -z "$WORK_DIR" ] || rm -rf "$WORK_DIR"; }
@@ -113,21 +136,34 @@ installed_version() {
   sed -n 's/^application\.version=//p' "$props" | head -n 1
 }
 
-# Prints "<asset name> <download url> <sha256 or empty>" for the release zip.
+# GitHub API request, with GH_TOKEN as a bearer token when one is set.
+github_curl() {
+  local auth=()
+  [ -z "${GH_TOKEN:-}" ] || auth=(-H "Authorization: Bearer ${GH_TOKEN}")
+  curl -fSL --retry 3 ${auth[@]+"${auth[@]}"} "$@"
+}
+
+# Prints "<asset name> <API asset url> <sha256 or empty>" for the release zip.
+# The API asset url also serves private repositories, unlike the browser url.
 resolve_release_asset() {
   local release
-  release="$(curl -fsSL --retry 3 -H 'Accept: application/vnd.github+json' "$RELEASE_API")" || return 1
+  release="$(github_curl -s -H 'Accept: application/vnd.github+json' "$RELEASE_API")" || return 1
   printf '%s' "$release" | python3 -c '
 import json, sys
 release = json.load(sys.stdin)
-zips = [a for a in release.get("assets", []) if a.get("name", "").endswith(".zip")]
+version = sys.argv[1]
+zips = [
+    a for a in release.get("assets", [])
+    if a.get("name", "").startswith("ghidra_%s_PUBLIC" % version)
+    and a.get("name", "").endswith(".zip")
+]
 if len(zips) != 1:
-    sys.exit("expected exactly one .zip asset, found %d" % len(zips))
+    sys.exit("expected exactly one ghidra_%s_PUBLIC .zip asset, found %d" % (version, len(zips)))
 asset = zips[0]
 digest = asset.get("digest") or ""
 sha = digest.split(":", 1)[1] if digest.startswith("sha256:") else ""
-print(asset["name"], asset["browser_download_url"], sha)
-'
+print(asset["name"], asset["url"], sha)
+' "$GHIDRA_VERSION"
 }
 
 download_ghidra() {
@@ -135,13 +171,13 @@ download_ghidra() {
   asset="$(resolve_release_asset)" ||
     die "could not resolve the Ghidra ${GHIDRA_VERSION} release asset from ${RELEASE_API}"
   read -r name url api_sha <<<"$asset"
-  expected="${GHIDRA_SHA256:-$api_sha}"
-  [ -n "$expected" ] || die "no SHA-256 available for ${name}; set GHIDRA_SHA256 from the release notes"
-  if [ -n "${GHIDRA_SHA256:-}" ] && [ -n "$api_sha" ] && [ "$GHIDRA_SHA256" != "$api_sha" ]; then
-    die "GHIDRA_SHA256 does not match the digest GitHub reports for ${name}"
+  expected="${GHIDRA_SHA256:-$(official_sha256 "$GHIDRA_VERSION" || true)}"
+  [ -n "$expected" ] || die "no official SHA-256 is pinned for Ghidra ${GHIDRA_VERSION}; set GHIDRA_SHA256 from the official release notes"
+  if [ -n "$api_sha" ] && [ "$expected" != "$api_sha" ]; then
+    die "${GHIDRA_RELEASE_REPO} reports SHA-256 ${api_sha} for ${name}, not the expected ${expected}"
   fi
-  log "downloading ${name}"
-  curl -fSL --retry 3 -o "${work}/${name}" "$url"
+  log "downloading ${name} from ${GHIDRA_RELEASE_REPO} ${GHIDRA_RELEASE_TAG}"
+  github_curl -o "${work}/${name}" -H 'Accept: application/octet-stream' "$url"
   printf '%s\n' "$expected" >"${work}/expected.sha256"
   printf '%s\n' "${work}/${name}"
 }
