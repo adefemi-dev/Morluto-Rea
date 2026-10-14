@@ -88,10 +88,23 @@ rea doctor --json
 rea setup --client claude_desktop
 ```
 
-Setup shows its plan and asks before writing. It finds the configuration file
-Claude Desktop actually reads, including the private copy used by the
-Microsoft Store (MSIX) build, and records `GHIDRA_INSTALL_DIR` and
-`JAVA_HOME` in the registration. Start Claude Desktop again afterwards.
+Setup records `GHIDRA_INSTALL_DIR` and `JAVA_HOME` in the registration. Start
+Claude Desktop again afterwards.
+
+REA's documentation says setup also detects the private configuration file of
+the Microsoft Store (MSIX) build. On one Windows machine with the Store build
+(`Claude 2.37337.1.0`), setup reported success but wrote only
+`%APPDATA%\Claude\claude_desktop_config.json`, which that build ignores once
+it has saved its private copy. If Claude Desktop shows no REA tools, check
+which build you have:
+
+```powershell
+Get-AppxPackage *Claude* | Select-Object Name, Version
+Test-Path "$env:LOCALAPPDATA\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude\claude_desktop_config.json"
+```
+
+A package plus `True` means the Store build is reading its private file. Use
+the PowerShell registration below.
 
 ### 3. Manual registration (fallback)
 
@@ -122,6 +135,36 @@ for the MSIX build. Keep any existing `mcpServers` entries:
 Find the real `rea.mjs` path with `npm root --global`. Cold Ghidra imports can
 take minutes; REA's provider startup deadline is 330 seconds.
 
+For the Store build, this PowerShell block adds the entry to the private file.
+Quit Claude Desktop fully first (tray icon, then **Quit**). It backs up the
+file, keeps every other setting, replaces only `mcpServers.rea`, and writes
+UTF-8 without a byte-order mark. Replace the two paths in `env` with yours:
+
+```powershell
+$P = "$env:LOCALAPPDATA\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude\claude_desktop_config.json"
+Copy-Item $P "$P.bak-$(Get-Date -Format yyyyMMdd-HHmmss)"
+$raw = Get-Content $P -Raw
+if ($raw -and $raw.Trim()) { $cfg = $raw | ConvertFrom-Json } else { $cfg = [pscustomobject]@{} }
+if (-not $cfg.PSObject.Properties['mcpServers']) {
+  $cfg | Add-Member -NotePropertyName mcpServers -NotePropertyValue ([pscustomobject]@{})
+}
+$rea = [pscustomobject]@{
+  command = "C:\Program Files\nodejs\node.exe"
+  args    = @("$env:APPDATA\npm\node_modules\rea-agents\scripts\rea.mjs", "mcp")
+  env     = [pscustomobject]@{
+    GHIDRA_INSTALL_DIR = "C:\path\to\ghidra_12.1.4_PUBLIC"
+    JAVA_HOME          = "C:\path\to\jdk-21"
+  }
+}
+$cfg.mcpServers | Add-Member -NotePropertyName rea -NotePropertyValue $rea -Force
+[IO.File]::WriteAllText($P, ($cfg | ConvertTo-Json -Depth 32), (New-Object System.Text.UTF8Encoding $false))
+(Get-Content $P -Raw | ConvertFrom-Json).mcpServers.rea | Format-List
+```
+
+To undo it, copy the `.bak-…` file back over `claude_desktop_config.json`. The
+Store build keeps its logs in
+`%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude\logs`.
+
 ## claude.ai web and mobile
 
 The `reverse-engineer-anything` skill reaches claude.ai through your account's
@@ -137,5 +180,9 @@ analysis that needs REA's tools.
   replacement, and a blocked GitHub API. A real Ghidra download was not
   possible from the session that wrote it, because its network policy blocks
   that repository's release pages.
-- Windows: the PowerShell commands and Desktop registration were not run on
-  Windows.
+- Windows: confirmed on one Windows machine with the Store build of Claude
+  Desktop, Node.js 24.16.0, Temurin JDK 21.0.12 and Ghidra 12.1.4. After the
+  private-file registration above, a Chat tab session opened
+  `C:\Windows\System32\notepad.exe` through REA and listed 794 procedures
+  through Ghidra. Run there, `rea setup --client claude_desktop` reported
+  success without writing the private file.
