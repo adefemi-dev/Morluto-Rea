@@ -1,10 +1,18 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  CPU,
+  LC,
+  dylibCommand,
+  fatImage,
+  machoImage,
+} from "../artifacts/apple/MachoImage.fixture.js";
+import {
   AnalysisCancelledError,
   AnalysisOutputError,
 } from "../domain/analysisErrorCore.js";
 import { err, ok } from "../domain/result.js";
+import { parseMachoLayout, selectMachoSlice } from "./AppleMachoSelection.js";
 import type { NativeCommandCapture } from "./CommandRunner.js";
 import { inspectNativeMacho } from "./NativeMachoInspection.js";
 import {
@@ -45,7 +53,6 @@ const inspect = async (lipo: string, architecture: "x86" | "arm64") => {
     run: (tool, args) => {
       commands.push({ tool, args });
       if (tool === "lipo") return Promise.resolve(ok(capture(tool, lipo)));
-      if (tool === "file") return Promise.resolve(ok(capture(tool, "Mach-O")));
       return Promise.resolve(err(new AnalysisCancelledError("inspect_native")));
     },
     invocation: () => {
@@ -64,7 +71,7 @@ describe("Mach-O tool architecture selection", () => {
       _tag: "AnalysisOutputError",
       reason: "lipo did not list i386; refusing to read another slice",
     });
-    expect(commands.map(({ tool }) => tool)).toEqual(["file", "lipo"]);
+    expect(commands.map(({ tool }) => tool)).toEqual(["lipo"]);
   });
 
   it("passes the arm64e slice lipo listed for an arm64 target", async () => {
@@ -78,6 +85,62 @@ describe("Mach-O tool architecture selection", () => {
       "/fixture/app",
     ]);
   });
+
+  it.each([
+    { names: ["arm64v8", "arm64e"], selected: "arm64e" },
+    { names: ["arm64e", "arm64v8"], selected: "arm64e" },
+    { names: ["arm64v8", "arm64e", "arm64"], selected: "arm64" },
+    { names: ["arm64v8"], selected: "arm64v8" },
+    { names: ["arm64v8", "arm64e.x1"], selected: "arm64v8" },
+    { names: ["arm64e.x1", "arm64v8"], selected: "arm64v8" },
+    { names: ["arm64v8", "arm64e.v1"], selected: "arm64e.v1" },
+    { names: ["arm64e.v1", "arm64v8"], selected: "arm64e.v1" },
+  ] as const)(
+    "keeps inspection and dispatch on $selected for FAT order $names",
+    async ({ names, selected }) => {
+      const cpus = {
+        arm64: CPU.arm64,
+        arm64v8: { type: CPU.arm64.type, subtype: 1 },
+        arm64e: CPU.arm64e,
+        "arm64e.x1": { type: CPU.arm64.type, subtype: 0x8000000c },
+        "arm64e.v1": { type: CPU.arm64.type, subtype: 0x81000002 },
+      };
+      const slices = names.map((name) => {
+        const cpu = cpus[name];
+        return {
+          cpu,
+          bytes: machoImage({
+            cpu,
+            commands: [dylibCommand(LC.LOAD_DYLIB, `/fixture/${name}.dylib`)],
+          }),
+        };
+      });
+      const fat = Buffer.from(fatImage(slices));
+      const lipo = names
+        .map(
+          (name, index) =>
+            `architecture ${name}\n cputype ${cpus[name].type}\n cpusubtype ${cpus[name].subtype}\n offset ${(index + 1) * 4096}\n size ${slices[index]?.bytes.length}\n align 2^12\n`,
+        )
+        .join("");
+      const { commands } = await inspect(lipo, "arm64");
+      expect(commands.find(({ tool }) => tool === "otool")?.args).toEqual([
+        "-h",
+        "-l",
+        "-arch",
+        selected.split(".")[0],
+        "/fixture/app",
+      ]);
+      expect(commands.find(({ tool }) => tool === "dyld_info")?.args).toContain(
+        selected,
+      );
+      expect(selectMachoSlice(fat, "arm64").slice).toBe(
+        (names.findIndex((name) => name === selected) + 1) * 4096,
+      );
+      expect(parseMachoLayout(fat, "arm64").fixups.dylibs).toEqual([
+        `/fixture/${selected}.dylib`,
+      ]);
+    },
+  );
 });
 
 describe("Mach-O UUID reconciliation", () => {
@@ -200,7 +263,7 @@ describe("Mach-O slice command scheduling", () => {
     let maxInFlight = 0;
     let launched = 0;
     const run = async (tool: string, args: readonly string[]) => {
-      if (tool === "file" || tool === "lipo") return fixtures.run(tool, args);
+      if (tool === "lipo") return fixtures.run(tool, args);
       const order = launched++;
       inFlight += 1;
       maxInFlight = Math.max(maxInFlight, inFlight);
@@ -236,7 +299,7 @@ describe("Mach-O slice command scheduling", () => {
     if (!result.ok) throw result.error;
     expect(runner.maxInFlight()).toBe(SLICE_TOOLS.length + 1);
     expect(result.value.result).toMatchObject({
-      provenance: ["file", "lipo", ...SLICE_TOOLS, "vtool"].map((tool) => ({
+      provenance: ["lipo", ...SLICE_TOOLS, "vtool"].map((tool) => ({
         tool,
       })),
     });

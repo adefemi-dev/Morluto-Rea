@@ -9,6 +9,7 @@ import {
   semanticCapturePosition,
   semanticEscapeFollowsCapture,
   semanticBindingPrecedesCapture,
+  semanticReadInitializers,
 } from "./javascriptSemanticMutationInitializers.js";
 
 import { semanticSlotAtPath } from "./javascriptSemanticSlots.js";
@@ -228,6 +229,21 @@ export const evaluateSemanticProvenance = (
     memo: createEvaluationMemo(state),
   });
 
+/** Follow a namespace binding as it was read at a specific source position. */
+export const evaluateSemanticProvenanceAtRead = (
+  binding: JavaScriptSemanticBindingState,
+  read: t.Identifier,
+  state: JavaScriptSemanticAnalysisState,
+): JavaScriptBindingProvenance =>
+  provenanceForBindingAtRead(binding, read, {
+    state,
+    bindings: new Map(),
+    expressionDepth: 0,
+    primitiveBindingValues: primitiveBindingValuesFor(state),
+    dependence: { lowest: CALLER_INDEPENDENT },
+    memo: createEvaluationMemo(state),
+  });
+
 const readMemoizedEvaluation = <T>(
   entry: MemoizedEvaluation<T> | undefined,
   context: EvaluationContext,
@@ -344,6 +360,11 @@ const evaluateBinding = (
   const initializer = binding.initializers[0];
   if (initializer === undefined)
     return { status: "unknown", reason: "Missing binding initializer." };
+  if (context.state.conditionallySkippedExpressions.has(initializer.node))
+    return {
+      status: "unknown",
+      reason: `Binding ${binding.name} may remain uninitialized.`,
+    };
   const position = context.bindings.size;
   const callerDependence = context.dependence.lowest;
   context.dependence.lowest = CALLER_INDEPENDENT;
@@ -383,7 +404,10 @@ const evaluateBinding = (
       ? callerDependence
       : Math.min(callerDependence, context.dependence.lowest);
   }
-  let projected = invalidateSemanticMutationPaths(value, binding.mutatedPaths);
+  let projected = invalidateSemanticMutationPaths(
+    value,
+    binding.memberWrites.map(({ path }) => path),
+  );
   for (const escape of binding.escapedPaths) {
     // Escapes only invalidate object references; other lattice values survive.
     if (projected.status !== "object" && projected.status !== "array") break;
@@ -798,7 +822,7 @@ const provenanceForBindingUncached = (
     ({ kind }) => kind === "assignment",
   );
   const conditionallyInitialized = binding.initializers.some(({ node }) =>
-    context.state.conditionalInitializers.has(node),
+    context.state.conditionallySkippedExpressions.has(node),
   );
   if (
     provenance.status !== "module" ||
@@ -809,7 +833,7 @@ const provenanceForBindingUncached = (
     provenance.origins,
     assigned
       ? `Binding ${binding.name} may be reassigned.`
-      : `Binding ${binding.name} is conditionally initialized.`,
+      : `Binding ${binding.name} may remain uninitialized.`,
   );
 };
 
@@ -817,6 +841,13 @@ const provenanceForBindingValue = (
   binding: JavaScriptSemanticBindingState,
   context: EvaluationContext,
 ): JavaScriptBindingProvenance => {
+  if (binding.kind === "parameter" || binding.kind === "catch")
+    return semanticUnresolvedProvenance(
+      "unknown",
+      binding.kind === "parameter"
+        ? "Parameter provenance depends on caller arguments."
+        : "Catch binding provenance depends on the thrown value.",
+    );
   if (binding.directOrigins.length > 0)
     return semanticOriginsProvenance(binding.directOrigins);
   if (binding.initializers.length === 0) return semanticLocalProvenance();
@@ -890,6 +921,14 @@ const provenanceForExpression = (
   const required = semanticRequireOrigin(node, context.state);
   if (required !== undefined)
     return semanticOriginsProvenance([required.origin]);
+  if (t.isSequenceExpression(node)) {
+    const finalExpression = node.expressions.at(-1);
+    return finalExpression === undefined
+      ? semanticUnresolvedProvenance("unknown", "Empty sequence expression.")
+      : provenanceForExpression(finalExpression, nestedContext(context));
+  }
+  if (t.isAssignmentExpression(node) && node.operator === "=")
+    return provenanceForExpression(node.right, nestedContext(context));
   if (t.isIdentifier(node)) {
     const binding = resolveSemanticBindingState(context.state, node, node.name);
     return binding === undefined
@@ -897,7 +936,7 @@ const provenanceForExpression = (
           "unknown",
           `Unbound identifier ${node.name}.`,
         )
-      : provenanceForBinding(binding, nestedContext(context));
+      : provenanceForBindingAtRead(binding, node, nestedContext(context));
   }
   if (t.isMemberExpression(node) || t.isOptionalMemberExpression(node)) {
     const members: string[] = [];
@@ -961,8 +1000,58 @@ const provenanceForExpression = (
           "Conditional provenance is unresolved.",
         );
   }
-  return semanticLocalProvenance();
+  if (isLocallyCreatedValue(node)) return semanticLocalProvenance();
+  return semanticUnresolvedProvenance(
+    "unknown",
+    `Unsupported ${node.type} provenance.`,
+  );
 };
+
+/** Resolve an alias from the value visible at this read, before later rebinds. */
+const provenanceForBindingAtRead = (
+  binding: JavaScriptSemanticBindingState,
+  read: t.Identifier,
+  context: EvaluationContext,
+): JavaScriptBindingProvenance => {
+  const selected = semanticReadInitializers(
+    binding,
+    read,
+    context.state.parentsByNode,
+  );
+  if (selected.initializers === binding.initializers)
+    return provenanceForBinding(binding, context);
+  if (context.bindings.has(binding.bindingId))
+    return semanticUnresolvedProvenance(
+      "cycle",
+      `Alias cycle at ${binding.name}.`,
+    );
+  const snapshot: JavaScriptSemanticBindingState = {
+    ...binding,
+    ...selected,
+    // Assignment facts after the read cannot change the captured value.
+    definitions: binding.definitions.filter(
+      ({ kind }) => kind !== "assignment",
+    ),
+  };
+  context.bindings.set(binding.bindingId, context.bindings.size);
+  try {
+    return provenanceForBindingValue(snapshot, context);
+  } finally {
+    context.bindings.delete(binding.bindingId);
+  }
+};
+
+const isLocallyCreatedValue = (node: t.Node): boolean =>
+  readExactJavaScriptLiteral(node).found ||
+  t.isObjectExpression(node) ||
+  t.isArrayExpression(node) ||
+  t.isFunctionExpression(node) ||
+  t.isArrowFunctionExpression(node) ||
+  t.isClassExpression(node) ||
+  t.isTemplateLiteral(node) ||
+  t.isUnaryExpression(node) ||
+  t.isBinaryExpression(node) ||
+  t.isUpdateExpression(node);
 
 const mergeValues = (
   values: readonly JavaScriptSemanticValue[],

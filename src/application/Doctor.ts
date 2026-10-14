@@ -23,6 +23,7 @@ import {
 import {
   readInstalledSkillIdentity,
   type InstalledSkillIdentity,
+  type SkillPathIssue,
 } from "./SetupSkill.js";
 import { CATALOG_IDENTITY } from "../catalogIdentity.js";
 import { PRODUCT_IDENTITY, SDK_IDENTITY } from "../identity.js";
@@ -48,6 +49,7 @@ export interface DoctorCheck {
   readonly classification:
     | "healthy"
     | "missing_dependency"
+    | "runtime_failure"
     | "unsupported_host"
     | "unsupported_target"
     | "missing_analysis_engine"
@@ -65,6 +67,7 @@ export interface DoctorProviderCheck {
   readonly detail: string;
   readonly remediation: string | null;
   readonly classification: Exclude<DoctorCheck["classification"], "healthy">;
+  readonly details?: Readonly<Record<string, JsonValue>>;
 }
 
 /** Read-only provider inspection supplied by an outer composition adapter. */
@@ -97,6 +100,8 @@ export interface DoctorHost {
   brewHopperPath(): Promise<string | undefined>;
   manualHopperPaths(): Promise<readonly string[]>;
   providerInspections?(): Promise<readonly DoctorProviderInspection[]>;
+  /** Validated provider settings preserved by setup, independent of readiness. */
+  providerRegistrationEnvironment?(): Readonly<Record<string, string>>;
   installationPaths?(): Promise<readonly string[]>;
   installedSkillIdentity?(
     clientIds: readonly string[],
@@ -128,6 +133,13 @@ export interface DoctorScope {
 }
 
 /** Installed-package, skill, client, and runtime identity observations. */
+export type DoctorSkillState =
+  | "aligned"
+  | "stale"
+  | "missing"
+  | "unmanaged"
+  | "unknown";
+
 interface DoctorIdentity {
   readonly cli_package_version: string;
   readonly expected_skill_version: string;
@@ -144,7 +156,8 @@ interface DoctorIdentity {
   readonly skill: {
     readonly installed_version: string | null;
     readonly installed_tool_count: number | null;
-    readonly state: "aligned" | "stale" | "missing";
+    readonly state: DoctorSkillState;
+    readonly issues?: readonly SkillPathIssue[];
     readonly remediation: string | null;
   };
   readonly registrations: readonly ClientRegistrationStatus[];
@@ -307,15 +320,13 @@ const collectDoctorIdentity = async (
       skill: {
         installed_version: installedSkillIdentity?.version ?? null,
         installed_tool_count: installedSkillIdentity?.toolCount ?? null,
-        state:
-          installedSkillIdentity === undefined
-            ? "missing"
-            : skillAligned
-              ? "aligned"
-              : "stale",
+        state: skillIdentityState(installedSkillIdentity),
+        ...(installedSkillIdentity?.issues === undefined
+          ? {}
+          : { issues: installedSkillIdentity.issues }),
         remediation: skillAligned
           ? null
-          : "Run rea setup to update the installed REA skill.",
+          : skillIdentityRemediation(installedSkillIdentity),
       },
       registrations,
     },
@@ -329,18 +340,45 @@ const skillIdentityAligned = (
   identity.toolCount === CATALOG_IDENTITY.counts.mcp_tools &&
   identity.canonical;
 
+const skillIdentityState = (
+  identity: InstalledSkillIdentity | undefined,
+): DoctorSkillState => {
+  if (identity?.issues?.some(({ kind }) => kind === "unreadable"))
+    return "unknown";
+  if ((identity?.issues?.length ?? 0) > 0) return "unmanaged";
+  return identity === undefined
+    ? "missing"
+    : skillIdentityAligned(identity)
+      ? "aligned"
+      : "stale";
+};
+
+const skillIdentityRemediation = (
+  identity: InstalledSkillIdentity | undefined,
+): string => {
+  const issues = identity?.issues;
+  if (issues !== undefined && issues.length > 0)
+    return `${issues.map(({ path, detail }) => `${detail} (${path})`).join(" ")} Verify the reported paths and use regular skill directories, or run rea setup with --skill=false to configure the client without installing the skill.`;
+  return "Run rea setup to update the installed REA skill.";
+};
+
 const skillIdentityCheck = (
   identity: InstalledSkillIdentity | undefined,
-): DoctorCheck => ({
-  name: "skill:identity",
-  ok: false,
-  classification: "config_drift",
-  detail:
-    identity === undefined
-      ? "Installed REA skill identity is missing."
-      : "Installed REA skill identity is stale.",
-  remediation: "Run rea setup to update the installed REA skill.",
-});
+): DoctorCheck => {
+  const issues = identity?.issues;
+  return {
+    name: "skill:identity",
+    ok: false,
+    classification: "config_drift",
+    detail:
+      issues !== undefined && issues.length > 0
+        ? `Selected skill identity is ${skillIdentityState(identity)}: ${issues.map(({ path }) => path).join(", ")}.`
+        : identity === undefined
+          ? "Installed REA skill identity is missing."
+          : "Installed REA skill identity is stale.",
+    remediation: skillIdentityRemediation(identity),
+  };
+};
 
 const registrationCheck = (
   registration: UnhealthyClientRegistrationStatus,
@@ -365,6 +403,9 @@ export interface SystemDoctorHostOptions {
   readonly execFileOutput?: typeof execFileOutput;
   readonly providerInspections?: () => Promise<
     readonly DoctorProviderInspection[]
+  >;
+  readonly providerRegistrationEnvironment?: () => Readonly<
+    Record<string, string>
   >;
   readonly linuxDemoRuntimeCheck?: () => Promise<DoctorCheck>;
 }
@@ -476,6 +517,12 @@ export const systemDoctorHost = (
     ...(options.providerInspections === undefined
       ? {}
       : { providerInspections: options.providerInspections }),
+    ...(options.providerRegistrationEnvironment === undefined
+      ? {}
+      : {
+          providerRegistrationEnvironment:
+            options.providerRegistrationEnvironment,
+        }),
     async ilspyCmdVersion(path) {
       try {
         await access(path, constants.X_OK);

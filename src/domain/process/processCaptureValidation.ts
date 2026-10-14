@@ -17,12 +17,10 @@ type RequireInvariant = (
   message: string,
 ) => void;
 
-const orderedTimestamps = (
-  values: readonly { readonly at_ms: number }[],
-): boolean =>
+const orderedTimestamps = (values: readonly number[]): boolean =>
   values.every((value, index) => {
     const previous = values[index - 1];
-    return previous === undefined || value.at_ms >= previous.at_ms;
+    return previous === undefined || value >= previous;
   });
 
 const validateCommitments = (
@@ -47,10 +45,6 @@ const validateCommitments = (
       digestProcessCommitment(
         value,
       ), `manifest.${field}`, "commitment does not match its canonical value");
-  require(Date.parse(manifest.started_at) <=
-    Date.parse(
-      manifest.completed_at,
-    ), "manifest.completed_at", "completion precedes start");
 };
 
 const validateOrdering = (
@@ -70,7 +64,14 @@ const validateOrdering = (
     ["rendered_frames", capture.rendered_frames],
     ["process_samples", capture.process_samples],
   ] as const)
-    require(orderedTimestamps(values), name, "timestamps must be ordered");
+    require(orderedTimestamps(
+      values.map(({ at_ms }) => at_ms),
+    ), name, "timestamps must be ordered");
+  // Interactions are dispatched in sequence, so their recorded dispatch
+  // times cannot decrease; comparison ranks a changed interaction by it.
+  require(orderedTimestamps(
+    capture.interaction_events.map(({ dispatched_at_ms }) => dispatched_at_ms),
+  ), "interaction_events", "dispatch timestamps must be ordered");
 };
 
 const validateEventJournal = (
@@ -246,7 +247,7 @@ const validateLifecycle = (
   require(capture.filesystem_checkpoints.map(({ name }) => name).join(",") ===
     "before,after_settlement", "filesystem_checkpoints", "capture must include initial and final filesystem snapshots");
   require(orderedTimestamps(
-    capture.filesystem_checkpoints,
+    capture.filesystem_checkpoints.map(({ at_ms }) => at_ms),
   ), "filesystem_checkpoints", "filesystem snapshot times must be ordered");
   require(!capture.filesystem_checkpoints.some(({ truncated }) => truncated) ||
     capture.truncated, "truncated", "filesystem snapshot truncation must propagate to the capture");
@@ -333,6 +334,9 @@ const validateCoverage = (
         .filter((file) => file.type === "file" && file.sha256 === null)
         .map((file) => [file.path, file]),
     );
+    const directories = new Set(
+      files.filter((file) => file.type === "directory").map(({ path }) => path),
+    );
     require(coverage.hash_omissions.length === unhashedFiles.size &&
       new Set(coverage.hash_omissions.map(({ path }) => path)).size ===
         unhashedFiles.size &&
@@ -344,6 +348,14 @@ const validateCoverage = (
             ? omission.system_code !== null
             : omission.system_code === null),
       ), `truncation_details.${name}.hash_omissions`, "every retained regular file without a digest must have one matching omission reason");
+    require(new Set(coverage.enumeration_omissions.map(({ path }) => path))
+      .size === coverage.enumeration_omissions.length &&
+      (coverage.enumeration_omissions.length === 0 ||
+        coverage.enumeration_reasons.includes("directory_unavailable")) &&
+      coverage.enumeration_omissions.every(
+        (omission) =>
+          directories.has(omission.path) && omission.system_code !== null,
+      ), `truncation_details.${name}.enumeration_omissions`, "every directory enumeration omission must identify one retained directory and its system error");
     require(coverage.hashed_bytes ===
       files
         .filter((file) => file.type === "file" && file.sha256 !== null)
@@ -355,6 +367,7 @@ const validateCoverage = (
       coverage.enumeration_reasons.length > 0 &&
       checkpoint?.truncated ===
         (coverage.enumeration_truncated ||
+          coverage.enumeration_omissions.length > 0 ||
           coverage.hash_omissions.length >
             0), `truncation_details.${name}`, "filesystem checkpoint truncation must match enumeration and digest coverage");
   }

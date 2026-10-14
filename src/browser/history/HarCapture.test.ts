@@ -162,6 +162,19 @@ it("rejects identical duplicate core fields before schema validation", () => {
   expect(() => decodeHarCapture(text, [])).toThrow("duplicate");
 });
 
+it("names the violated HAR schema constraint without restating capture values", () => {
+  expect(() =>
+    decodeHarCapture(
+      JSON.stringify({
+        log: { creator: { name: "x", version: "1" }, entries: [] },
+      }),
+      [],
+    ),
+  ).toThrow(
+    "HAR schema validation failed: required (must have required property 'version').",
+  );
+});
+
 it("preserves prototype-named producer members through the capture boundary", () => {
   const text = JSON.stringify(historicalHar()).replace(
     '"cache":{}',
@@ -241,6 +254,39 @@ it.each(["9007199254740993", "4740993", "99"])(
         response: { bodySize: null },
       });
     else expect(result.records[0]?.reported).toMatchObject({ _big: null });
+  },
+);
+
+it.each([
+  { encoded: "1e3", sensitive: "1000" },
+  { encoded: "123.4500", sensitive: "123.45" },
+  { encoded: "0.0000001", sensitive: "1e-7" },
+])(
+  "excludes sensitive numbers introduced by JSON normalization: $encoded",
+  ({ encoded, sensitive }) => {
+    const text = JSON.stringify(historicalHar())
+      .replace('"log":{', `"_number":${encoded},"log":{`)
+      .replace('"cache":{}', `"cache":{},"_number":${encoded}`);
+    const result = decodeHarCapture(text, [sensitive]);
+    for (const projection of [result.container, ...result.records]) {
+      expect(projection.reported).toMatchObject({ _number: null });
+      expect(projection.numeric_literals).not.toContainEqual(
+        expect.objectContaining({ pointer: "/_number" }),
+      );
+      expect(projection.redactions).toContainEqual({
+        pointer: "/_number",
+        reason: "explicit-sensitive-value",
+      });
+    }
+    const unmarked = decodeHarCapture(text, []);
+    for (const projection of [unmarked.container, ...unmarked.records]) {
+      expect(projection.reported).toMatchObject({ _number: Number(encoded) });
+      expect(projection.numeric_literals).toContainEqual({
+        pointer: "/_number",
+        producer_type: "json-number",
+        literal: encoded,
+      });
+    }
   },
 );
 

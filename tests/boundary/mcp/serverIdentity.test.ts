@@ -139,6 +139,20 @@ describe("server and catalog identity", () => {
     );
   });
 
+  it("changes catalog identity when advertised input examples change", () => {
+    const contract = TOOL_CONTRACTS.find((item) => item.examples.length > 0);
+    if (contract === undefined) throw new Error("expected an input example");
+    const original = createCatalogDigests();
+    const withoutExamples = createCatalogDigests(
+      TOOL_CONTRACTS.map((item) =>
+        item === contract ? { ...item, examples: [] } : item,
+      ),
+    );
+    expect(withoutExamples.tools_sha256).not.toBe(original.tools_sha256);
+    expect(withoutExamples.combined_sha256).not.toBe(original.combined_sha256);
+    expect(withoutExamples.prompts_sha256).toBe(original.prompts_sha256);
+  });
+
   it("reports unknown without a live comparison and distinguishes aligned from stale", () => {
     const unknown = createServerIdentity({
       startedAt: "2026-07-13T00:00:00.000Z",
@@ -226,6 +240,26 @@ describe("server and catalog identity", () => {
         reason: "unsupported_host",
       }),
     );
+  });
+});
+
+describe("guided prompt catalog identity", () => {
+  it("covers each guided prompt's objective in the catalog digest", () => {
+    const [first] = PROMPT_CONTRACTS;
+    if (first === undefined) throw new Error("expected a prompt contract");
+    const changed = PROMPT_CONTRACTS.map((contract) =>
+      contract === first
+        ? { ...contract, objective: `${contract.objective} changed` }
+        : contract,
+    );
+    const digests = createCatalogDigests(TOOL_CONTRACTS, changed);
+    expect(digests.prompts_sha256).not.toBe(
+      CATALOG_IDENTITY.digests.prompts_sha256,
+    );
+    expect(digests.combined_sha256).not.toBe(
+      CATALOG_IDENTITY.digests.combined_sha256,
+    );
+    expect(digests.tools_sha256).toBe(CATALOG_IDENTITY.digests.tools_sha256);
   });
 });
 

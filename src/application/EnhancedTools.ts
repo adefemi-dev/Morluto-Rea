@@ -21,8 +21,8 @@ import {
   parseFunctionDossier,
   parseListCount,
   parseRelatedAddresses,
-  parseSegmentImageBase,
   parseSegments,
+  parseSegmentImageBase,
 } from "../domain/hopperValues.js";
 import { err, ok, type Result } from "../domain/result.js";
 import {
@@ -46,6 +46,7 @@ import { traceCallPath } from "./CallPathTracing.js";
 import { resolveProcedureAddress } from "./ProcedureAddressResolution.js";
 import { traceLiteralFeature } from "./EnhancedLiteralTracing.js";
 import { projectNativeApiInspection } from "./native/NativeApiInspection.js";
+
 /**
  * Composes direct provider operations into bounded reverse-engineering tools.
  * Direct callers use `execute`; adapters that own validation use
@@ -162,6 +163,8 @@ export class EnhancedTools {
         return traceLiteralFeature(
           (name, arguments_, operationSignal) =>
             this.#call(name, arguments_, operationSignal),
+          (name, arguments_, operationSignal) =>
+            this.#observe(name, arguments_, operationSignal),
           call.input,
           signal,
         );
@@ -522,30 +525,49 @@ export class EnhancedTools {
         this.#call("list_strings", {}, signal),
       ],
     );
-    if (!segmentsResult.ok) return segmentsResult;
+    if (
+      !segmentsResult.ok &&
+      !(segmentsResult.error instanceof AnalysisCapabilityUnavailableError)
+    )
+      return segmentsResult;
     if (!proceduresResult.ok) return proceduresResult;
     if (!stringsResult.ok) return stringsResult;
 
-    const segments = parseSegments(segmentsResult.value);
-    if (!segments.ok) return segments;
-    const imageBase = parseSegmentImageBase(segmentsResult.value);
+    const segments = segmentsResult.ok
+      ? parseSegments(segmentsResult.value)
+      : undefined;
+    if (segments !== undefined && !segments.ok) return segments;
     const procedureCount = parseListCount(proceduresResult.value, "procedures");
     if (!procedureCount.ok) return procedureCount;
     const stringCount = parseListCount(stringsResult.value, "strings");
     if (!stringCount.ok) return stringCount;
 
+    const observedSegments = segments?.ok ? segments.value : undefined;
+    const imageBase =
+      observedSegments === undefined
+        ? undefined
+        : parseSegmentImageBase(observedSegments);
+
     return ok({
       document: document.value,
-      segments: segments.value.map(({ name, start, end }) => ({
-        name,
-        start,
-        end,
-        length: addressDistance(start, end),
-      })),
-      segment_count: segments.value.length,
+      ...(imageBase === undefined ? {} : { image_base: imageBase }),
+      ...(observedSegments === undefined
+        ? {}
+        : {
+            segments: observedSegments.map(
+              ({ name, start, end, image_base, address_space }) => ({
+                name,
+                start,
+                end,
+                length: addressDistance(start, end),
+                ...(image_base === undefined ? {} : { image_base }),
+                ...(address_space === undefined ? {} : { address_space }),
+              }),
+            ),
+            segment_count: observedSegments.length,
+          }),
       procedure_count: procedureCount.value,
       string_count: stringCount.value,
-      ...(imageBase === undefined ? {} : { image_base: imageBase }),
     });
   }
 

@@ -7,7 +7,10 @@ import { artifactComparisonResultSchema } from "./artifactComparison.js";
 import { artifactInventoryResultSchema } from "./artifactGraph.js";
 import { uniqueSorted } from "./canonicalOrdering.js";
 import { compareUnicodeCodePoints } from "./unicodeCodePointOrder.js";
-import { comparisonSourceEvidenceSides } from "./comparisonSourceEvidence.js";
+import {
+  comparisonSourceEvidenceSides,
+  assertComparisonFindingLinks,
+} from "./comparisonSourceEvidence.js";
 import { parseEvidence, type Evidence } from "./evidence.js";
 import { parseEvidenceBundle } from "./evidenceBundle.js";
 import { functionComparisonResultSchema } from "./functionComparisonSchemas.js";
@@ -144,10 +147,15 @@ const evaluateClaim = (
     return source;
   });
   const functionSourceFacts = readValidatedSourceFacts(claim, sources);
-  const observed = observedStatus(claim, comparison);
+  const observation = comparisonObservation(claim, comparison);
+  const observed = observation.status;
   const limitations = [
     ...authorityLimitations(claim, sources, sides),
-    ...sourceCallCoverageLimitations(claim, functionSourceFacts, observed),
+    ...sourceCallCoverageLimitations(
+      claim,
+      functionSourceFacts,
+      observation.hasIndependentFunctionChange === true,
+    ),
   ];
   const relatedUnknowns = reconstructionClaimUnknowns(
     heads,
@@ -171,6 +179,7 @@ const evaluateClaim = (
     unknown_ids: displayedUnknowns.map(({ unknown_id: id }) => id),
     limitations: uniqueSorted([
       ...comparison.limitations,
+      ...observation.limitations,
       ...limitations,
       ...displayedUnknowns.map(
         ({ question }) => `Residual unknown: ${question}`,
@@ -235,48 +244,66 @@ const validateComparisonIdentity = (claim: Claim, evidence: Evidence): void => {
     throw new TypeError("Comparison Evidence identity or authority disagrees");
 };
 
-const observedStatus = (claim: Claim, evidence: Evidence): ObservedStatus => {
+const comparisonObservation = (
+  claim: Claim,
+  evidence: Evidence,
+): {
+  readonly status: ObservedStatus;
+  readonly limitations: readonly string[];
+  readonly hasIndependentFunctionChange?: boolean;
+} => {
   if (claim.kind === "behavioral") {
     const result = processCaptureComparisonSchema.parse(
       evidence.normalized_result,
     );
     validateProcessStatus(result);
-    return claim.dimension === "overall"
-      ? result.status
-      : result[claim.dimension];
+    return {
+      status:
+        claim.dimension === "overall" ? result.status : result[claim.dimension],
+      limitations: [],
+    };
   }
   if (claim.kind === "structural-function") {
     const result = functionComparisonResultSchema.parse(
       evidence.normalized_result,
     );
-    if (claim.dimension === "overall") return result.status;
+    assertComparisonFindingLinks(
+      evidence,
+      result.dimensions.flatMap(({ evidence_links }) => evidence_links),
+    );
+    if (claim.dimension === "overall")
+      return {
+        status: result.status,
+        limitations: result.dimensions.flatMap(
+          ({ limitations }) => limitations,
+        ),
+        // Historical overall changes can be caused only by incomplete call
+        // sets. Ignore that aggregate change when independently checking the
+        // source call-coverage limitations.
+        hasIndependentFunctionChange:
+          result.function_match.status === "mismatched" ||
+          (result.function_match.status === "matched" &&
+            result.dimensions.some(
+              (dimension) =>
+                dimension.dimension !== "calls" &&
+                dimension.status === "changed",
+            )),
+      };
     const dimension = result.dimensions.find(
       (item) => item.dimension === claim.dimension,
     );
     if (dimension === undefined)
       throw new TypeError("Function comparison dimension missing");
-    if (
-      dimension.evidence_links.some(
-        (id) => !evidence.evidence_links.includes(id),
-      )
-    )
-      throw new TypeError(
-        "Function dimension cites Evidence outside comparison closure",
-      );
-    return dimension.status;
+    return { status: dimension.status, limitations: dimension.limitations };
   }
   const result = artifactComparisonResultSchema.parse(
     evidence.normalized_result,
   );
-  if (
-    result.changes.some((item) =>
-      item.evidence_links.some((id) => !evidence.evidence_links.includes(id)),
-    )
-  )
-    throw new TypeError(
-      "Artifact change cites Evidence outside comparison closure",
-    );
-  return result.status;
+  assertComparisonFindingLinks(
+    evidence,
+    result.changes.flatMap(({ evidence_links }) => evidence_links),
+  );
+  return { status: result.status, limitations: [] };
 };
 
 const validateProcessStatus = (
@@ -322,13 +349,15 @@ const authorityLimitations = (
   )
     limitations.push("Structural source artifact identity is unavailable.");
   if (claim.kind === "behavioral") {
-    const byId = new Map(sources.map((source) => [source.evidence_id, source]));
-    const left = byId.get(sides.left[0] ?? "");
-    const right = byId.get(sides.right[0] ?? "");
+    const referenceEnvironment = sources[0]?.environment;
     if (
-      left?.environment === null ||
-      right?.environment === null ||
-      JSON.stringify(left?.environment) !== JSON.stringify(right?.environment)
+      referenceEnvironment === null ||
+      referenceEnvironment === undefined ||
+      sources.some(
+        ({ environment }) =>
+          environment === null ||
+          JSON.stringify(environment) !== JSON.stringify(referenceEnvironment),
+      )
     )
       limitations.push(
         "Controlled replay environments are unavailable or incompatible.",
@@ -340,12 +369,12 @@ const authorityLimitations = (
 const sourceCallCoverageLimitations = (
   claim: Claim,
   functionSources: readonly FunctionSourceFacts[],
-  observed: ObservedStatus,
+  hasIndependentFunctionChange: boolean,
 ): string[] => {
   if (
     claim.kind !== "structural-function" ||
     (claim.dimension !== "calls" &&
-      !(claim.dimension === "overall" && observed !== "changed"))
+      !(claim.dimension === "overall" && !hasIndependentFunctionChange))
   )
     return [];
   return functionSources.flatMap(({ evidence_id, callCoverageLimitations }) =>

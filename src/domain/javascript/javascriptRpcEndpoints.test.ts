@@ -13,6 +13,50 @@ const rpcEndpoints = (source: string) =>
       mechanism.startsWith("trpc:") || mechanism.startsWith("graphql:"),
   );
 
+describe("RPC object property ownership", () => {
+  it.each([
+    ['url: "/trpc/old", url: "/trpc/live"', "/trpc/live"],
+    ['url: "/trpc/old", url: runtimeUrl', null],
+    ['url: "/trpc/old", ...options', null],
+    ['url: "/trpc/old", [key]: runtimeUrl', null],
+    ['url: "/trpc/old", get url() { return runtimeUrl; }', null],
+    ['url: "/trpc/old", url() {}', null],
+    ['...options, url: "/trpc/live", headers: {}', "/trpc/live"],
+    ['[key]: runtimeUrl, url: "/trpc/live"', "/trpc/live"],
+    ['url: "/trpc/old", ["url"]: "/trpc/live"', "/trpc/live"],
+  ] as const)(
+    "reads only the final known link URL from {%s}",
+    (options, value) => {
+      expect(rpcEndpoints(`httpBatchLink({ ${options} });`)).toEqual(
+        value === null
+          ? []
+          : [{ kind: "network", value, mechanism: "trpc:link:httpBatchLink" }],
+      );
+    },
+  );
+
+  it.each([
+    ['operation: "mutation"', "Old", "graphql:mutation"],
+    ['name: { kind: "Name", value: "Current" }', "Current", "graphql:query"],
+    ['kind: "FragmentDefinition"', null, null],
+    ["name: runtimeName", null, null],
+    ["get name() { return runtimeName; }", null, null],
+    ["...options", null, null],
+    ["[key]: runtimeValue", null, null],
+  ] as const)(
+    "honors final GraphQL document properties: %s",
+    (override, value, mechanism) => {
+      const source = `const doc = {
+      kind: "OperationDefinition", operation: "query",
+      name: { kind: "Name", value: "Old" }, ${override}
+    };`;
+      expect(rpcEndpoints(source)).toEqual(
+        value === null ? [] : [{ kind: "network", value, mechanism }],
+      );
+    },
+  );
+});
+
 describe("tRPC procedure recognition", () => {
   it("recognizes React hook procedures on a renamed proxy root", () => {
     expect(
@@ -276,6 +320,63 @@ describe("GraphQL operation recognition", () => {
         mechanism: "graphql:subscription",
       },
     ]);
+  });
+
+  it("recognizes operations after leading fragment interpolations only when prior quasis are ignored", () => {
+    expect(
+      rpcEndpoints(`
+        const one = gql\`  \${CORE_FIELDS}
+          query CommentsForPost($postId: ID!) { comments { id } }\`;
+        const two = gql\`\${CORE_FIELDS}
+          # another fragment
+          ,\${MORE_FIELDS}
+          mutation UpdatePost($id: ID!) { updatePost(id: $id) { id } }\`;
+        const prose = gql\`fragment prose before interpolation
+          \${CORE_FIELDS}
+          query NotAnOperation { viewer { id } }\`;
+      `),
+    ).toEqual([
+      { kind: "network", value: "CommentsForPost", mechanism: "graphql:query" },
+      { kind: "network", value: "UpdatePost", mechanism: "graphql:mutation" },
+    ]);
+  });
+
+  it.each([
+    ["query", "query # header\nGetUser { user }"],
+    ["mutation", "mutation,# header\r\nGetUser { user }"],
+    ["subscription", "subscription# header\rGetUser { user }"],
+    ["query", "query GetUser # selection\n{ user }"],
+    ["query", "query GetUser { # field\nuser }"],
+    ["query", "query GetUser( # variable\n$id: ID!) { user }"],
+    ["query", "query GetUser # directive\n@skip(if: false) { user }"],
+    ["query", "query GetUser @ # directive name\nkeep { user }"],
+    [
+      "query",
+      "# prefix\nquery # one\n, # two\nGetUser # three\n{ # four\nuser }",
+    ],
+  ])("recognizes %s header comments in %s", (type, text) => {
+    const expected = [
+      { kind: "network", value: "GetUser", mechanism: `graphql:${type}` },
+    ];
+    expect(rpcEndpoints(`const doc = ${JSON.stringify(text)};`)).toEqual(
+      expected,
+    );
+    expect(rpcEndpoints("const doc = gql`" + text + "`; ")).toEqual(expected);
+  });
+
+  it.each([
+    "query # GetUser { user }",
+    "query GetUser # { user }",
+    "query GetUser { # user }",
+    "query # anonymous\n{ user }",
+    "query GetUser # prose\nparameters",
+    "query Get# split name\nUser { user }",
+    "query GetUser @ # missing directive name",
+    "query GetUser { # fragment\n...UserFields }",
+    "query\u00a0GetUser { user }",
+    "query\vGetUser { user }",
+  ])("keeps incomplete or unsupported header text unknown: %s", (text) => {
+    expect(rpcEndpoints(`const doc = ${JSON.stringify(text)};`)).toEqual([]);
   });
 
   it("retains operations after long ignored prefixes and long headers", () => {

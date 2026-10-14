@@ -147,7 +147,9 @@ describe("wrapped contextBridge exposure methods", () => {
         `const worldId = selectWorld(); electron.contextBridge.exposeInIsolatedWorld(worldId, "isolatedApi", {ping: true});`,
       ),
     );
-    expect(result.electron.context_bridge_apis).toContainEqual(
+    // The proven Webpack bootstrap resolves `load(2)` directly, so the complete
+    // direct observation is retained instead of a wrapper substitution.
+    expect(result.electron.context_bridge_apis).toEqual([
       expect.objectContaining({
         world: "isolated",
         world_id: {
@@ -156,9 +158,15 @@ describe("wrapped contextBridge exposure methods", () => {
           expression: "worldId",
         },
         api_key: "isolatedApi",
+        api_status: "object-literal",
         members: ["ping"],
-        resolution_basis: "wrapper-substitution",
+        unknown_members: 0,
+        module_key: "9",
+        module_runtime: "webpack-bootstrap@0",
       }),
+    ]);
+    expect(result.electron.context_bridge_apis[0]).not.toHaveProperty(
+      "resolution_basis",
     );
     expect(result.parse_status).toBe("partial");
   });
@@ -356,6 +364,83 @@ it("preserves guarded alternatives in direct exposed object literals", () => {
       }),
     ]),
   );
+});
+it("preserves bridge member segments and excludes prototype setters", () => {
+  const result = analyzeJavaScriptStaticSource(`
+    const e=require("electron");
+    const write=()=>e.ipcRenderer.send("write");
+    e.contextBridge.exposeInMainWorld("desktop", {
+      "nested.write": write,
+      nested: { write },
+      __proto__: { inherited: write },
+      ["__proto__"]: { own: write },
+    });
+  `);
+  expect(result.electron.call_paths).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        entry: "desktop.nested.write",
+        entry_path: ["desktop", "nested.write"],
+      }),
+      expect.objectContaining({
+        entry: "desktop.nested.write",
+        entry_path: ["desktop", "nested", "write"],
+      }),
+      expect.objectContaining({
+        entry: "desktop.__proto__.own",
+        entry_path: ["desktop", "__proto__", "own"],
+      }),
+    ]),
+  );
+  expect(result.electron.call_paths).not.toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        entry_path: ["desktop", "__proto__", "inherited"],
+      }),
+    ]),
+  );
+});
+it("follows an explicit object-literal prototype lookup in a bridge wrapper", () => {
+  const result = analyzeJavaScriptStaticSource(`
+    const e=require("electron");
+    const prototype={send:()=>e.ipcRenderer.send("through-prototype")};
+    const object={__proto__:prototype};
+    e.contextBridge.exposeInMainWorld("desktop", {
+      action:()=>object.__proto__.send(),
+    });
+  `);
+  expect(result.electron.call_paths).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        entry_path: ["desktop", "action"],
+        channel: "through-prototype",
+      }),
+    ]),
+  );
+});
+it("does not spread a large nested bridge member list into function arguments", () => {
+  const members = Array.from(
+    { length: 125_000 },
+    (_, index) => `m${index}(){}`,
+  ).join(",");
+  const source = `const e=require("electron");e.contextBridge.exposeInMainWorld("desktop",{nested:{${members}}});`;
+  expect(() => analyzeJavaScriptStaticSource(source)).not.toThrow();
+});
+it("reports nested bridge depth truncation while retaining shallow paths", () => {
+  const nested =
+    Array.from({ length: 130 }, (_, index) => `level${index}:{`).join("") +
+    `deep:()=>e.ipcRenderer.send("deep")` +
+    "}".repeat(130);
+  const result = analyzeJavaScriptStaticSource(`
+    const e=require("electron");
+    e.contextBridge.exposeInMainWorld("desktop", {
+      shallow:()=>e.ipcRenderer.send("shallow"), ${nested}
+    });
+  `);
+  expect(result.electron.call_paths).toContainEqual(
+    expect.objectContaining({ entry: "desktop.shallow", channel: "shallow" }),
+  );
+  expect(result.limitations.join(" ")).toContain("depth 128");
 });
 it("preserves conditions when a wrapper dispatches through conditional external methods", () => {
   const result = analyzeJavaScriptStaticSource(`

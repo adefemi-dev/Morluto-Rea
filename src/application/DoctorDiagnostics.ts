@@ -2,7 +2,11 @@ import {
   SUPPORTED_NODE_VERSION_PROSE,
   supportsNodeVersion,
 } from "../domain/runtimeVersion.js";
-import { linuxHopperLauncherPath } from "./LinuxHopper.js";
+import {
+  linuxHopperLauncherCandidates,
+  systemLinuxHopperLauncherCandidates,
+  supportsReaHost,
+} from "./LinuxHopper.js";
 import type {
   DoctorCheck,
   DoctorHost,
@@ -11,7 +15,6 @@ import type {
 
 const DEFAULT_HOPPER =
   "/Applications/Hopper Disassembler.app/Contents/MacOS/hopper";
-const SYSTEM_LINUX_HOPPER = "/opt/hopper/bin/Hopper";
 
 /** Ordered environment diagnostics consumed by the Doctor report assembler. */
 export interface DoctorDiagnostics {
@@ -129,7 +132,7 @@ const hostCheck = async (host: DoctorHost): Promise<DoctorCheck> => {
     host.platform === "linux" ? await host.linuxDistribution() : undefined;
   const supported =
     (host.platform === "darwin" && parseMajor(macosVersion) >= 12) ||
-    (host.platform === "linux" && linuxDistribution?.supported === true) ||
+    (host.platform === "linux" && supportsReaHost(linuxDistribution)) ||
     (host.platform === "win32" && host.architecture === "x64");
   const detail =
     macosVersion ??
@@ -138,7 +141,7 @@ const hostCheck = async (host: DoctorHost): Promise<DoctorCheck> => {
       : `${linuxDistribution.id} ${linuxDistribution.versionId ?? "unknown"}`);
   return check("host", supported, detail, {
     remediation:
-      "REA supports macOS 12+, Ubuntu 24.04+, Fedora 41+, Nobara 44+, 64-bit Arch Linux, CachyOS, Omarchy, and the experimental Windows x64 Ghidra P0 boundary.",
+      "REA supports macOS 12+, Linux distributions with a recognized apt, dnf, or pacman package family, and the experimental Windows x64 Ghidra P0 boundary; automated Hopper setup additionally requires Ubuntu 24.04+, Fedora 41+, Nobara 44+, 64-bit Arch Linux, CachyOS, or Omarchy.",
     classification: "unsupported_host",
   });
 };
@@ -148,8 +151,9 @@ const findHopper = async (host: DoctorHost): Promise<string | undefined> => {
     host.configuredHopperPath === undefined
       ? [
           DEFAULT_HOPPER,
-          SYSTEM_LINUX_HOPPER,
-          linuxHopperLauncherPath(host.homeDirectory),
+          ...(host.platform === "linux"
+            ? linuxHopperLauncherCandidates(host.homeDirectory)
+            : [...systemLinuxHopperLauncherCandidates]),
           ...(await host.manualHopperPaths()),
         ]
       : [host.configuredHopperPath];
@@ -280,6 +284,7 @@ const providerDoctorChecks = (
     ...(candidate.remediation === null
       ? {}
       : { remediation: candidate.remediation }),
+    ...(candidate.details === undefined ? {} : { details: candidate.details }),
   }));
 
 const unsupportedHopperRemediation = (configured: boolean): string =>

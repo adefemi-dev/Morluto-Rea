@@ -240,11 +240,12 @@ const shellStub = (
 ): ((root: string) => string) => {
   const cases = Object.entries(dispatch)
     .map(([key, output]) => {
-      const [first, second] = key.split(":");
-      const guard =
-        second === undefined
-          ? `[ "$4" = "${first}" ]`
-          : `[ "$4" = "${first}" ] && [ "$5" = "${second}" ]`;
+      const [first, second, third] = key.split(":");
+      const guard = [
+        `[ "$4" = "${first}" ]`,
+        ...(second === undefined ? [] : [`[ "$5" = "${second}" ]`]),
+        ...(third === undefined ? [] : [`[ "$6" = "${third}" ]`]),
+      ].join(" && ");
       return `  if ${guard}; then printf '%b' '${output.replaceAll("\\", "\\\\").replaceAll("\0", "\\000").replace(/'/gu, "'\\''")}'; exit 0; fi`;
     })
     .join("\n");
@@ -379,6 +380,30 @@ exit 1`,
   expect(result.error.capturedOutput?.stdout).toContain(
     pmOutput.split("\n")[0],
   );
+  const projected = projectAnalysisError(result.error);
+  const duplicate = pmOutput.includes("\n");
+  expect(projected).toMatchObject({
+    code: "unreadable_output",
+    message: expect.stringContaining("pm path for com.example"),
+    remediation: { action: expect.stringContaining("details.diagnostics") },
+    details: {
+      reason: duplicate ? "duplicate_local_destination" : "unsafe_device_path",
+      diagnostics: {
+        package_name: "com.example",
+        ...(duplicate
+          ? { device_paths: ["/data/app/x/base.apk", "/data/app/y/base.apk"] }
+          : {
+              rejected_paths: [
+                {
+                  device_path: "/data/app/x/",
+                  reason: "empty_file_name",
+                },
+              ],
+            }),
+      },
+      captured_output: { stdout: expect.stringContaining("package:") },
+    },
+  });
   await expect(readFile(join(root, "pull-ran"))).rejects.toThrow();
   await expect(lstat(output)).rejects.toMatchObject({ code: "ENOENT" });
 });
@@ -410,7 +435,15 @@ it.each([
     if (aliases) {
       expect(result.ok).toBe(false);
       if (result.ok) return;
-      expect(result.error.message).toContain("unique local destinations");
+      expect(projectAnalysisError(result.error)).toMatchObject({
+        message: expect.stringContaining("unique local destination"),
+        details: {
+          reason: "local_destination_unavailable",
+          diagnostics: {
+            device_path: `/data/app/y/${secondName}`,
+          },
+        },
+      });
       await expect(readFile(pullLog)).rejects.toThrow();
       await expect(lstat(packageDirectory)).rejects.toThrow();
       return;
@@ -810,6 +843,36 @@ exit 1`,
   expect(result.error.message).toContain("overwrite");
 });
 
+it.each([
+  ["offline", false, "error: device offline"],
+  ["unauthorized", false, "error: device unauthorized"],
+  ["offline", true, "error: device offline"],
+] as const)(
+  "reports the %s device state when the push existence probe cannot run (overwrite %s)",
+  async (state, overwrite, stderr) => {
+    const { binary, root } = await writeAdbStub(
+      (stubRoot) => `if [ "$1" = "version" ]; then ${VERSION_BLOCK}; exit 0; fi
+if [ "$1" = "-s" ]; then printf '%s\\n' "$3" >> "${stubRoot}/calls"; printf '%s\\n' "${stderr}" >&2; exit 1; fi`,
+    );
+    const localFile = join(root, "payload.bin");
+    await writeFile(localFile, "x");
+    const projected = await refusedBy(providerOver(binary), {
+      operation: "push_adb_file",
+      input: {
+        serial: "emulator-5554",
+        local_path: localFile,
+        device_path: "/data/local/tmp/payload.bin",
+        overwrite,
+      },
+    });
+    // Existence is unknown, so nothing is claimed about the path and no push runs.
+    expect(projected).toMatchObject({ code: "unsupported_target" });
+    expect(projected.message).toContain(state);
+    expect(projected.message).not.toContain("already exists");
+    expect(await readFile(join(root, "calls"), "utf8")).toBe("shell\n");
+  },
+);
+
 it("reports a local push source that does not exist", async () => {
   const { binary } = await writeAdbStub(
     () => `if [ "$1" = "version" ]; then ${VERSION_BLOCK}; exit 0; fi
@@ -985,6 +1048,60 @@ it("inspects the display and window focus", async () => {
   );
 });
 
+it("reads Android 16 focus declarations from displays when windows omits them", async () => {
+  const { binary } = await writeAdbStub(
+    shellStub({
+      "dumpsys:window:windows": "Window state has no focus fields\\n",
+      "dumpsys:window:displays":
+        "mCurrentFocus=Window{abc u0 com.example/.Main}\nmFocusedApp=ActivityRecord{def u0 com.example/.Main t1}\n",
+    }),
+  );
+  const result = await evidenceResult(providerOver(binary), {
+    operation: "inspect_adb_window",
+    input: { serial: "emulator-5554" },
+  });
+  expect(result).toMatchObject({
+    focused_window: "Window{abc u0 com.example/.Main}",
+    focused_app: "ActivityRecord{def u0 com.example/.Main t1}",
+    observed_lines: [
+      "Window{abc u0 com.example/.Main}",
+      "ActivityRecord{def u0 com.example/.Main t1}",
+    ],
+  });
+  const execution = await providerOver(binary).execute({
+    operation: "inspect_adb_window",
+    input: { serial: "emulator-5554" },
+  });
+  expect(execution.ok).toBe(true);
+  if (!execution.ok) throw execution.error;
+  expect(execution.value.limitations).toContainEqual(
+    expect.stringContaining("dumpsys window displays"),
+  );
+});
+
+it("describes missing window focus as unknown after both sections omit declarations", async () => {
+  const { binary } = await writeAdbStub(
+    shellStub({
+      "dumpsys:window:windows": "no focus\\n",
+      "dumpsys:window:displays": "no focus\\n",
+    }),
+  );
+  const result = await evidenceResult(providerOver(binary), {
+    operation: "inspect_adb_window",
+    input: { serial: "emulator-5554" },
+  });
+  expect(result).toMatchObject({ focused_window: null, focused_app: null });
+  const execution = await providerOver(binary).execute({
+    operation: "inspect_adb_window",
+    input: { serial: "emulator-5554" },
+  });
+  expect(execution.ok).toBe(true);
+  if (!execution.ok) throw execution.error;
+  expect(execution.value.limitations).toContainEqual(
+    expect.stringContaining("focus is unknown"),
+  );
+});
+
 it("reads one settings value and reports device-side nulls", async () => {
   const { binary } = await writeAdbStub(shellStub({ "settings:get": "1\n" }));
   const enabled = await evidenceResult(providerOver(binary), {
@@ -1095,6 +1212,68 @@ exit 1`,
   });
   expect(projected).toMatchObject({ code: "unsupported_target" });
   expect(projected.message).toContain("not installed for 0");
+});
+
+// adb exits 1 on a refused package change: `adb install` after printing the
+// status line to stderr, `cmd package uninstall` after printing it to stdout.
+it("preserves the device's install refusal when adb exits nonzero", async () => {
+  const { binary, root } = await writeAdbStub(
+    () => `if [ "$1" = "version" ]; then ${VERSION_BLOCK}; exit 0; fi
+if [ "$1" = "-s" ] && [ "$3" = "install" ]; then
+  printf 'Performing Streamed Install\\n'
+  printf 'adb: failed to install app.apk: Failure [INSTALL_FAILED_ALREADY_EXISTS: Attempt to re-install com.example without first uninstalling.]\\n' >&2
+  exit 1
+fi
+exit 1`,
+  );
+  const apk = join(root, "app.apk");
+  await writeFile(apk, "apk");
+  const projected = await refusedBy(providerOver(binary), {
+    operation: "install_adb_package",
+    input: { serial: "emulator-5554", apk_path: apk, replace: false },
+  });
+  expect(projected).toMatchObject({
+    code: "unsupported_target",
+    details: {
+      reason:
+        "INSTALL_FAILED_ALREADY_EXISTS: Attempt to re-install com.example without first uninstalling.",
+    },
+  });
+  expect(projected.message).toContain(
+    "INSTALL_FAILED_ALREADY_EXISTS: Attempt to re-install com.example without first uninstalling.",
+  );
+});
+
+it("preserves the device's uninstall refusal when adb exits nonzero", async () => {
+  const { binary } = await writeAdbStub(
+    () => `if [ "$1" = "version" ]; then ${VERSION_BLOCK}; exit 0; fi
+if [ "$1" = "-s" ] && [ "$3" = "uninstall" ]; then printf 'Failure [not installed for 0]\\n'; exit 1; fi
+exit 1`,
+  );
+  const projected = await refusedBy(providerOver(binary), {
+    operation: "uninstall_adb_package",
+    input: { serial: "emulator-5554", package: "com.absent" },
+  });
+  expect(projected).toMatchObject({
+    code: "unsupported_target",
+    details: { reason: "not installed for 0" },
+  });
+  expect(projected.message).toContain("not installed for 0");
+});
+
+it("keeps a nonzero install without a device verdict as an unreadable result", async () => {
+  const { binary, root } = await writeAdbStub(
+    () => `if [ "$1" = "version" ]; then ${VERSION_BLOCK}; exit 0; fi
+if [ "$1" = "-s" ] && [ "$3" = "install" ]; then printf 'adb: failed to install app.apk: closed\\n' >&2; exit 1; fi
+exit 1`,
+  );
+  const apk = join(root, "app.apk");
+  await writeFile(apk, "apk");
+  const projected = await refusedBy(providerOver(binary), {
+    operation: "install_adb_package",
+    input: { serial: "emulator-5554", apk_path: apk, replace: false },
+  });
+  expect(projected).toMatchObject({ code: "unreadable_output" });
 });
 
 it("starts an app through resolved launcher component and force-stops it", async () => {

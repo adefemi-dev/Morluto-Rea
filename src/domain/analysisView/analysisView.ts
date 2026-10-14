@@ -3,9 +3,12 @@ import { javaScriptSourceSelectionSchema } from "../javascript/javascriptSourceS
 
 import {
   AnalysisInputError,
-  type AnalysisInputIssue,
   AnalysisUnsupportedTargetError,
 } from "../analysisErrorCore.js";
+import {
+  INSPECT_ANALYSIS_VIEW_OPERATION,
+  analysisViewInputError,
+} from "./analysisViewErrors.js";
 import { digestCanonicalValue } from "../canonicalDigest.js";
 import { digestSchema, prefixedDigestSchema } from "../digests.js";
 import { evidenceSchema, type Evidence } from "../evidence.js";
@@ -50,11 +53,32 @@ import {
   managedViewContextSchema,
 } from "./managedArtifactView.js";
 import {
+  projectManagedMemberView,
+  managedMembersViewRequestSchema,
+  managedMembersViewPageSchema,
+  managedMemberSummarySchema,
+  managedMembersViewContextSchema,
+} from "./managedMemberView.js";
+import {
   projectWasmArtifactView,
   wasmViewRequestSchema,
   wasmViewItemSchema,
   wasmSummarySchema,
 } from "./wasmArtifactView.js";
+import {
+  machoSummarySchema,
+  machoViewContextSchema,
+  machoViewItemSchema,
+  machoViewRequestSchema,
+  projectMachoView,
+} from "./machoView.js";
+import {
+  interfaceBuilderSummarySchema,
+  interfaceBuilderViewContextSchema,
+  interfaceBuilderViewItemsSchema,
+  interfaceBuilderViewRequestSchema,
+  projectInterfaceBuilderView,
+} from "./interfaceBuilderView.js";
 import {
   projectWebNetworkCaptureView,
   captureViewRequestSchema,
@@ -85,9 +109,6 @@ import {
   dartAotViewRequestSchema,
   dartAotViewContextSchema,
 } from "./dartAotView.js";
-
-/** Public name of the selected-view workflow. */
-export const INSPECT_ANALYSIS_VIEW_OPERATION = "inspect_analysis_view" as const;
 
 const summaryViewSchema = z.strictObject({ kind: z.literal("summary") });
 const facetViewSchema = z.strictObject({
@@ -153,6 +174,8 @@ const nativeViewSchema = z.strictObject({
     "unresolved_calls",
     "referenced_strings",
     "referenced_names",
+    "swift_string_literals",
+    "swift_string_literal_omissions",
     "native_api",
     "value_flow_summary",
     "value_flow_operations",
@@ -196,8 +219,11 @@ export const analysisViewRequestSchema = z.discriminatedUnion("kind", [
   nativeViewSchema,
   inventoryViewSchema,
   wasmViewRequestSchema,
+  machoViewRequestSchema,
+  interfaceBuilderViewRequestSchema,
   evmViewRequestSchema,
   managedViewRequestSchema,
+  managedMembersViewRequestSchema,
   androidViewRequestSchema,
   apiSurfaceViewSchema,
   captureViewRequestSchema,
@@ -315,8 +341,11 @@ const viewResultBase = {
     "inspect_artifact",
     "inventory_artifact",
     "inspect_wasm_artifact",
+    "inspect_macho",
+    "decode_interface_builder",
     "inspect_evm_interface",
     "inspect_managed_artifact",
+    "inspect_managed_members",
     "inspect_web_network_capture",
     "inspect_android_package",
     "inspect_pcap_capture",
@@ -364,6 +393,20 @@ export const wasmArtifactSummaryViewResultSchema = z.strictObject({
   summary: wasmSummarySchema,
 });
 
+/** Exact slice identity and collection counts for Mach-O's selected delivery. */
+export const machoSummaryViewResultSchema = z.strictObject({
+  ...summaryViewResultBase,
+  parent_operation: z.literal("inspect_macho"),
+  summary: machoSummarySchema,
+});
+
+/** Decoded documents and graph counts for Interface Builder's selected delivery. */
+export const interfaceBuilderSummaryViewResultSchema = z.strictObject({
+  ...summaryViewResultBase,
+  parent_operation: z.literal("decode_interface_builder"),
+  summary: interfaceBuilderSummarySchema,
+});
+
 /** Exact inferred-interface summary for EVM's caller-selected delivery. */
 export const evmInterfaceSummaryViewResultSchema = z.strictObject({
   ...summaryViewResultBase,
@@ -376,6 +419,13 @@ export const managedArtifactSummaryViewResultSchema = z.strictObject({
   ...summaryViewResultBase,
   parent_operation: z.literal("inspect_managed_artifact"),
   summary: managedSummarySchema,
+});
+
+/** Exact member selection, coverage and counts for the selected delivery. */
+export const managedMemberSummaryViewResultSchema = z.strictObject({
+  ...summaryViewResultBase,
+  parent_operation: z.literal("inspect_managed_members"),
+  summary: managedMemberSummarySchema,
 });
 
 /** Exact historical capture summary, with no body or member-inventory payload. */
@@ -425,8 +475,11 @@ export const analysisViewResultSchema = z.discriminatedUnion("kind", [
       javascriptSummarySchema,
       inventorySummarySchema,
       wasmSummarySchema,
+      machoSummarySchema,
+      interfaceBuilderSummarySchema,
       evmSummarySchema,
       managedSummarySchema,
+      managedMemberSummarySchema,
       captureSummarySchema,
       androidPackageSummarySchema,
       pcapSummarySchema,
@@ -488,6 +541,22 @@ export const analysisViewResultSchema = z.discriminatedUnion("kind", [
     ...viewResultBase,
   }),
   z.strictObject({
+    kind: z.literal("macho"),
+    view: machoViewRequestSchema,
+    item: machoViewItemSchema,
+    ...viewResultBase,
+    ...machoViewContextSchema.shape,
+    parent_operation: z.literal("inspect_macho"),
+  }),
+  z.strictObject({
+    kind: z.literal("interface-builder"),
+    view: interfaceBuilderViewRequestSchema,
+    items: interfaceBuilderViewItemsSchema,
+    ...viewResultBase,
+    ...interfaceBuilderViewContextSchema.shape,
+    parent_operation: z.literal("decode_interface_builder"),
+  }),
+  z.strictObject({
     kind: z.literal("evm"),
     view: evmViewRequestSchema,
     item: evmViewItemSchema,
@@ -501,6 +570,14 @@ export const analysisViewResultSchema = z.discriminatedUnion("kind", [
     ...viewResultBase,
     ...managedViewContextSchema.shape,
     parent_operation: z.literal("inspect_managed_artifact"),
+  }),
+  z.strictObject({
+    kind: z.literal("managed-members"),
+    view: managedMembersViewRequestSchema,
+    page: managedMembersViewPageSchema,
+    ...viewResultBase,
+    ...managedMembersViewContextSchema.shape,
+    parent_operation: z.literal("inspect_managed_members"),
   }),
   z.strictObject({
     kind: z.literal("android"),
@@ -547,6 +624,8 @@ export interface AnalysisViewParent {
   readonly evidenceId: string;
   readonly operation: string;
   readonly normalizedResult: unknown;
+  /** The owner proved normalizedResult belongs to a sealed, deep-frozen Evidence snapshot. */
+  readonly sealedResult?: boolean;
   /** Preserve the authenticated source identity, including explicit absence. */
   readonly subject?: Evidence["subject"];
   readonly limitations: readonly string[];
@@ -554,12 +633,6 @@ export interface AnalysisViewParent {
   /** Parent Evidence parameters, when the parent operation records them. */
   readonly parameters?: unknown;
 }
-
-/** Construct a typed input failure for one selected-view constraint. */
-export const analysisViewInputError = (
-  issues: readonly AnalysisInputIssue[],
-): AnalysisInputError =>
-  new AnalysisInputError(INSPECT_ANALYSIS_VIEW_OPERATION, undefined, issues);
 
 /** View payload before the content digest is attached. */
 export type UnsignedAnalysisView =
@@ -583,6 +656,11 @@ export type UnsignedAnalysisView =
       "view_digest"
     >
   | Omit<Extract<AnalysisViewResult, { readonly kind: "wasm" }>, "view_digest">
+  | Omit<Extract<AnalysisViewResult, { readonly kind: "macho" }>, "view_digest">
+  | Omit<
+      Extract<AnalysisViewResult, { readonly kind: "interface-builder" }>,
+      "view_digest"
+    >
   | Omit<Extract<AnalysisViewResult, { readonly kind: "evm" }>, "view_digest">
   | Omit<Extract<AnalysisViewResult, { readonly kind: "qlog" }>, "view_digest">
   | Omit<Extract<AnalysisViewResult, { readonly kind: "pcap" }>, "view_digest">
@@ -592,6 +670,10 @@ export type UnsignedAnalysisView =
     >
   | Omit<
       Extract<AnalysisViewResult, { readonly kind: "managed" }>,
+      "view_digest"
+    >
+  | Omit<
+      Extract<AnalysisViewResult, { readonly kind: "managed-members" }>,
       "view_digest"
     >
   | Omit<
@@ -646,7 +728,7 @@ const unsupportedParent = (
   new AnalysisUnsupportedTargetError(
     INSPECT_ANALYSIS_VIEW_OPERATION,
     parentArtifactPath(parent),
-    `Parent Evidence operation ${JSON.stringify(parent.operation)} does not support analysis views. Use completed binary layout, JavaScript application, native function, artifact inventory/inspection, WASM, EVM, managed artifact, Android package, Dart AOT, or web network capture Evidence.`,
+    `Parent Evidence operation ${JSON.stringify(parent.operation)} does not support analysis views. Use completed binary layout, JavaScript application, native function, artifact inventory/inspection, WASM, Mach-O, Interface Builder, EVM, managed artifact or member, Android package, Dart AOT, or web network capture Evidence.`,
   );
 
 const parentArtifactPath = (parent: AnalysisViewParent): string => {
@@ -673,8 +755,11 @@ const parentArtifactPath = (parent: AnalysisViewParent): string => {
 /** Named source owners for views that need no extra decoder or accumulator. */
 const retainedViewProjectors = new Map<string, typeof projectWasmArtifactView>([
   ["inspect_wasm_artifact", projectWasmArtifactView],
+  ["inspect_macho", projectMachoView],
+  ["decode_interface_builder", projectInterfaceBuilderView],
   ["inspect_evm_interface", projectEvmInterfaceView],
   ["inspect_managed_artifact", projectManagedArtifactView],
+  ["inspect_managed_members", projectManagedMemberView],
   ["inspect_android_package", projectAndroidPackageView],
   ["inspect_dart_aot", projectDartAotView],
   ["inspect_artifact", projectArtifactInventoryView],

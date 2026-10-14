@@ -123,9 +123,7 @@ export const resolveSemanticModuleCallables = (
         : undefined;
     return {
       ...link,
-      ...(resolutionMode === "import" || resolutionMode === "require"
-        ? { resolutionMode }
-        : {}),
+      ...(resolutionMode !== undefined ? { resolutionMode } : {}),
       callableId: resolved.length === 1 ? (resolved[0] ?? null) : null,
     };
   });
@@ -157,7 +155,7 @@ const callableIdsForBinding = (
   if (
     initializer === undefined ||
     initializer.projection.length > 0 ||
-    state.conditionalInitializers.has(initializer.node)
+    state.conditionallySkippedExpressions.has(initializer.node)
   )
     return [];
   return callableIdsForNode(

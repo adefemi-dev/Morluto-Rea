@@ -24,6 +24,48 @@ costs change.
 
 When adding or changing an MCP tool, follow the [tool design guide](docs/tool-design.md) and preserve the canonical contracts and generated catalog.
 
+## Pull request ownership and readiness
+
+AI-assisted contributions are welcome. Every PR must have a human owner who
+takes responsibility for the complete change, including code, tests,
+documentation, and claims produced with AI assistance. The PR author is the
+owner unless another human is named in the PR and explicitly accepts ownership.
+These requirements also apply to maintainer-authored PRs.
+
+Before requesting maintainer review, the human owner must:
+
+- Review the final diff and relevant existing code. Be able to explain the
+  problem, the chosen approach, how it fits REA, and meaningful edge cases.
+- Provide evidence that the change works. Summarize what was checked, the
+  observed results, and meaningful gaps in the PR body. Use focused tests,
+  representative CLI/MCP output, CI artifacts, screenshots, or other checks
+  appropriate to the change. For fixes, show the original failure and why the
+  regression coverage catches it when practical. Documentation-only changes
+  can use source, link, or rendered-document checks. Label source-derived
+  conclusions and proposed checks accurately; never report an unrun check as
+  passing. Follow the [verification requirements](#development-feedback-and-pr-verification)
+  for required checks and real-provider coverage.
+- Complete the **Author readiness** declaration in the PR template, explicitly
+  stating that the current revision is ready for review.
+
+Keep the PR description concise and current. Explain the problem, observable
+outcome, approach, and useful evidence; link long logs or put them in optional
+details. Address actionable automated review findings and explain disagreements.
+Human ownership and review remain required when CI or an automated reviewer
+reports success. Readiness requests maintainer review; it does not grant scope
+approval or permission to merge.
+
+Draft PRs may request early feedback with open questions and incomplete checks.
+Leave the readiness declaration unchecked until the human owner has completed
+it. After further changes, clear the ready-for-review checkbox until the owner
+reviews the updated diff, refreshes affected validation and the PR description,
+and renews the declaration. AI agents must leave human declarations to the human
+owner and must not attest to a human review on their behalf.
+
+Maintainers may return a PR to the author or close it when the problem is
+unsupported, validation is missing, or the owner cannot explain the change.
+Contributors are responsible for completing this work before requesting review.
+
 ## Contribution scope
 
 REA focuses on software structure, runtime behavior, and evidence through
@@ -142,6 +184,21 @@ caches deterministic builds and static checks across Git worktrees. After a pack
 Repository invariants live in [AGENTS.md](AGENTS.md). Keep provider-specific
 protocols in adapters and shared CLI/MCP workflows in the application layer.
 
+### Windows source checkouts
+
+The published npm package includes the Windows x64 native addon and its
+manifest. A source checkout does not: `native/windows/build/` is ignored by
+Git, and neither `npm ci` nor `npm run build:cached` (or `npm run build`)
+produces `rea-windows-x64.node` or `manifest.json` in that directory.
+Windows workflows and tests that require native controls need these artifacts;
+without them, those controls are unavailable even after a successful runtime build.
+
+Follow the [Windows native build guide](native/windows/README.md#build) before
+running those workflows from source. The artifact build requires Linux,
+MinGW-w64, and `tar`; the build script does not run on Windows. See that guide
+for the build and artifact-verification commands and the separate real Windows
+verification prerequisites. Keep the generated addon and manifest uncommitted.
+
 ## Documentation website
 
 The VitePress site uses the Markdown files in `docs/`. Run `npm run docs:dev`
@@ -166,6 +223,10 @@ The separate GitHub Pages host uses only the manual
 
 ## Development feedback and PR verification
 
+For routine merges, wait for the required checks to pass for the current PR
+revision. Administrators retain an override for deliberate maintainer recovery.
+If `main` is broken, prioritize a focused repair before updating affected PRs.
+
 Select checks for the behavior changed. For a source edit:
 
 ```bash
@@ -186,6 +247,10 @@ coverage. `npm run check:pr` is an optional full local gate for broad changes or
 CI diagnosis. Packaging/setup/distribution changes additionally require
 `npm run verify:package` and `npm pack --dry-run`; provider changes require the
 matching real-provider lane. State which host/provider workflows ran.
+
+For CI/test correctness, drift, or performance investigations, use the
+[`rea-ci-tests-audit` contributor skill](.agents/skills/rea-ci-tests-audit/SKILL.md).
+It guides reproduction and comparable measurements before changing checks.
 
 `check:pr` reuses build and static-check outputs while executing the test suite
 fresh, including the fast Python producer checks. `docs:check` also runs the
