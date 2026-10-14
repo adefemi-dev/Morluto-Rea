@@ -2,7 +2,7 @@
   "mcpServers": {
     "rea": {
       "command": "npx",
-      "args": ["-y", "rea-agents@6.4.0", "mcp"]
+      "args": ["-y", "--prefix=/", "rea-agents@6.4.0", "mcp"]
     }
   }
 }
