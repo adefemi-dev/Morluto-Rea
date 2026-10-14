@@ -2,7 +2,6 @@ import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { validateBuildCache } from "./build-cache.mjs";
 import { ensureGeneratedFile } from "./lib/generated-file.mjs";
 
 const arguments_ = new Set(process.argv.slice(2));
@@ -18,7 +17,7 @@ const lock = JSON.parse(
   await readFile(join(root, "package-lock.json"), "utf8"),
 );
 const skill = await readFile(
-  join(root, "skills/reverse-engineer-anything/SKILL.md"),
+  join(root, ".agents/skills/reverse-engineer-anything/SKILL.md"),
   "utf8",
 );
 const skillVersion = /^\s{2}version:\s*"([^"]+)"\s*$/mu.exec(skill)?.[1];
@@ -33,7 +32,7 @@ const versionOf = (name) => {
 const source = `/** Generated from package.json and package-lock.json; do not edit. */
 export const PACKAGE_METADATA = {
   name: ${JSON.stringify(packageJson.name)},
-  version: ${JSON.stringify(packageJson.version)},
+  version: ${JSON.stringify(packageJson.version)}, // x-release-please-version
   serverSdkVersion: ${JSON.stringify(versionOf("@modelcontextprotocol/server"))},
   clientSdkVersion: ${JSON.stringify(versionOf("@modelcontextprotocol/client"))},
   coreSdkVersion: ${JSON.stringify(versionOf("@modelcontextprotocol/core"))},
@@ -45,6 +44,5 @@ await ensureGeneratedFile({
   path: outputPath,
   source,
   check: arguments_.has("--check"),
-  generateCommand: "npm run build",
+  generateCommand: "npm run metadata:generate",
 });
-await validateBuildCache(root);

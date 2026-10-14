@@ -1,15 +1,26 @@
 import { z } from "zod";
+import { nativeLoadImageObservationSchema } from "../domain/native/nativeLoadImage.js";
 
-import { AnalysisInputError, AnalysisOutputError } from "../domain/errors.js";
 import {
-  jsonObjectSchema,
-  jsonValueSchema,
-  type JsonValue,
-} from "../domain/jsonValue.js";
+  type AnalysisInputError,
+  AnalysisOutputError,
+} from "../domain/analysisErrorCore.js";
+import {
+  functionBodySchema,
+  functionBodyEntryAgrees,
+} from "../domain/hopperValues.js";
+import { jsonValueSchema, type JsonValue } from "../domain/jsonValue.js";
 import { err, ok, type Result } from "../domain/result.js";
+import { analysisInputErrorFromIssues } from "../domain/inputIssueProjection.js";
 
-/** Read-only direct operations admitted by the Ghidra v1 adapter. */
+/**
+ * Direct inventory operations admitted by the Ghidra adapter. All are reads
+ * except the naming operations, which edit the ephemeral session database.
+ */
 export const GHIDRA_INVENTORY_OPERATIONS = [
+  "inspect_native_load_image",
+  "read_bytes",
+  "address_to_file_offset",
   "address_name",
   "list_documents",
   "list_names",
@@ -20,7 +31,15 @@ export const GHIDRA_INVENTORY_OPERATIONS = [
   "resolve_containing_procedure",
   "search_procedures",
   "search_strings",
+  "set_address_name",
+  "set_addresses_names",
 ] as const;
+
+/** Inventory operations that write analyst names into the session database. */
+export const GHIDRA_NAMING_OPERATIONS = [
+  "set_address_name",
+  "set_addresses_names",
+] as const satisfies readonly GhidraInventoryOperation[];
 
 /** One direct inventory operation implemented by the packaged Java bridge. */
 export type GhidraInventoryOperation =
@@ -33,43 +52,61 @@ export const isGhidraInventoryOperation = (
   operation: string,
 ): operation is GhidraInventoryOperation => operationSet.has(operation);
 
-export const ghidraBoundedIdentifierSchema = z.string().min(1).max(4096);
-const boundedIdentifier = ghidraBoundedIdentifierSchema;
-const document = boundedIdentifier.nullable().default(null);
-const explicitAddress = boundedIdentifier;
+export const ghidraIdentifierSchema = z.string().min(1);
+const identifier = ghidraIdentifierSchema;
+const document = identifier.nullable().default(null);
+/** Caller address spelling; the bridge resolves its space and emits canonical output. */
+export const ghidraInputAddressSchema = z
+  .string()
+  .regex(
+    /^(?:(?:0[xX])?[0-9a-fA-F]+|(?:[A-Za-z0-9._~-]|%[0-9a-fA-F]{2})+:0[xX][0-9a-fA-F]+)$/u,
+    "Use hexadecimal digits, optionally prefixed with 0x, or an encoded address-space name followed by :0x and hexadecimal digits",
+  );
+const explicitAddress = ghidraInputAddressSchema;
 const filteredAddress = explicitAddress.nullable().default(null);
-const pagination = {
-  offset: z.number().int().min(0).default(0),
-  limit: z.number().int().min(1).max(500).default(100),
-};
 const searchInput = {
-  pattern: z.string().min(1).max(256),
+  pattern: z.string().min(1),
   mode: z.enum(["literal", "regex"]).default("literal"),
   case_sensitive: z.boolean().default(false),
-  offset: z.number().int().min(0).default(0),
-  limit: z.number().int().min(1).max(100).default(100),
   document,
 };
 
 const inputSchemas = {
+  inspect_native_load_image: z.strictObject({}),
+  read_bytes: z.strictObject({
+    document,
+    address: explicitAddress,
+    length: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).default(256),
+  }),
+  address_to_file_offset: z.strictObject({
+    document,
+    address: explicitAddress,
+  }),
   address_name: z.object({ document, address: explicitAddress }).strict(),
   list_documents: z.object({}).strict(),
-  list_names: z
-    .object({ document, address: filteredAddress, ...pagination })
-    .strict(),
-  list_procedures: z.object({ document, ...pagination }).strict(),
+  list_names: z.object({ document, address: filteredAddress }).strict(),
+  list_procedures: z.object({ document }).strict(),
   list_segments: z.object({ document }).strict(),
-  list_strings: z
-    .object({ document, address: filteredAddress, ...pagination })
-    .strict(),
-  procedure_address: z
-    .object({ document, procedure: boundedIdentifier })
-    .strict(),
+  list_strings: z.object({ document, address: filteredAddress }).strict(),
+  procedure_address: z.object({ document, procedure: identifier }).strict(),
   resolve_containing_procedure: z
     .object({ document, address: explicitAddress })
     .strict(),
   search_procedures: z.object(searchInput).strict(),
   search_strings: z.object(searchInput).strict(),
+  set_address_name: z
+    .object({ document, address: explicitAddress, name: z.string().min(1) })
+    .strict(),
+  set_addresses_names: z
+    .object({
+      document,
+      names: z.record(explicitAddress, z.string().min(1)),
+    })
+    .strict()
+    .refine(
+      (value) => Object.keys(value.names).length > 0,
+      "Supply at least one address name",
+    ),
 } satisfies Readonly<Record<GhidraInventoryOperation, z.ZodType>>;
 
 /** Validate and default one provider request before it crosses the socket. */
@@ -79,15 +116,18 @@ export const parseGhidraInventoryInput = (
 ): Result<Readonly<Record<string, JsonValue>>, AnalysisInputError> => {
   const parsed = inputSchemas[operation].safeParse(value);
   if (!parsed.success)
-    return err(new AnalysisInputError(operation, { cause: parsed.error }));
-  return ok(jsonObjectSchema.parse(parsed.data));
+    return err(
+      analysisInputErrorFromIssues(operation, parsed.error.issues, value, {
+        cause: parsed.error,
+      }),
+    );
+  return ok(parsed.data);
 };
 
 export const ghidraCanonicalAddressSchema = z
   .string()
   .regex(/^(?:0x[0-9a-f]+|(?:[A-Za-z0-9._~-]|%[0-9A-F]{2})+:0x[0-9a-f]+)$/u);
 const canonicalAddress = ghidraCanonicalAddressSchema;
-const valueTruncation = { value_truncated: z.boolean() };
 const symbolFacts = z
   .object({
     primary: z.boolean(),
@@ -104,9 +144,52 @@ const procedureFacts = z
     thunk_target: canonicalAddress.nullable(),
   })
   .strict();
-const functionClassification = procedureFacts
+/** Ghidra FunctionManager classification, independent of body ownership inference. */
+export const ghidraFunctionClassificationSchema = procedureFacts
   .extend({ provenance: z.literal("ghidra-function-manager") })
   .strict();
+/** Require complete canonical AddressSet evidence on every Ghidra function identity. */
+export const ghidraFunctionBodySchema = functionBodySchema.superRefine(
+  (body, context) => {
+    if (
+      !body.available ||
+      body.provenance !== "ghidra-function-body-address-set" ||
+      body.ranges.some(
+        ({ start, end }) =>
+          !ghidraCanonicalAddressSchema.safeParse(start).success ||
+          !ghidraCanonicalAddressSchema.safeParse(end).success,
+      )
+    )
+      context.addIssue({
+        code: "custom",
+        message:
+          "Ghidra omitted complete canonical function-body AddressSet evidence",
+      });
+  },
+);
+
+/** Strict provider identity shared by inventory and function-analysis results. */
+export const ghidraProcedureIdentitySchema = z
+  .object({
+    address: ghidraCanonicalAddressSchema,
+    name: z.string().min(1),
+    classification: ghidraFunctionClassificationSchema,
+    body: ghidraFunctionBodySchema,
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (
+      !functionBodyEntryAgrees(value.body, value.address) ||
+      (value.body.available &&
+        !value.classification.external &&
+        !value.body.contains_entry)
+    )
+      context.addIssue({
+        code: "custom",
+        message: "Ghidra function body disagrees with its entry point",
+      });
+  });
+
 const stringFacts = z
   .object({
     encoding: z.string().min(1),
@@ -117,7 +200,6 @@ const stringFacts = z
 const baseItem = {
   address: canonicalAddress,
   value: z.string(),
-  ...valueTruncation,
 };
 const symbolItem = z.object({ ...baseItem, symbol: symbolFacts }).strict();
 const procedureItem = z
@@ -125,52 +207,6 @@ const procedureItem = z
   .strict();
 const stringItem = z.object({ ...baseItem, string: stringFacts }).strict();
 const searchItem = z.object(baseItem).strict();
-
-const pageSchema = <Item extends z.ZodType>(item: Item, maximumLimit: number) =>
-  z
-    .object({
-      items: z.array(item),
-      offset: z.number().int().min(0),
-      limit: z.number().int().min(1).max(maximumLimit),
-      total: z.number().int().min(0),
-      next_offset: z.number().int().min(0).nullable(),
-      has_more: z.boolean(),
-    })
-    .strict()
-    .superRefine((page, context) => {
-      const next = page.offset + page.items.length;
-      const hasMore = next < page.total;
-      if (page.items.length > page.limit)
-        context.addIssue({
-          code: "custom",
-          path: ["items"],
-          message: "page exceeds its declared limit",
-        });
-      if (page.items.length > 0 && next > page.total)
-        context.addIssue({
-          code: "custom",
-          path: ["total"],
-          message: "page items exceed its exact total",
-        });
-      if (hasMore && page.items.length === 0)
-        context.addIssue({
-          code: "custom",
-          path: ["items"],
-          message: "page continuation must advance its offset",
-        });
-      if (page.has_more !== hasMore)
-        context.addIssue({
-          code: "custom",
-          path: ["has_more"],
-          message: "page continuation does not match its exact total",
-        });
-      if (page.next_offset !== (hasMore ? next : null))
-        context.addIssue({
-          code: "custom",
-          path: ["next_offset"],
-          message: "page continuation offset is inconsistent",
-        });
-    });
 
 const availablePermissions = z
   .object({
@@ -202,15 +238,28 @@ const containingProcedure = z.discriminatedUnion("found", [
     .object({
       query_address: canonicalAddress,
       found: z.literal(true),
-      procedure: z
-        .object({
-          address: canonicalAddress,
-          name: z.string().min(1),
-          classification: functionClassification,
-        })
-        .strict(),
+      procedure: ghidraProcedureIdentitySchema,
     })
-    .strict(),
+    .strict()
+    .superRefine((value, context) => {
+      const body = value.procedure.body;
+      const exactExternalEntry =
+        value.procedure.classification.external &&
+        value.query_address === value.procedure.address;
+      if (
+        !exactExternalEntry &&
+        body.available &&
+        !functionBodyEntryAgrees(
+          { ...body, contains_entry: true },
+          value.query_address,
+        )
+      )
+        context.addIssue({
+          code: "custom",
+          message:
+            "Found containing procedure body does not contain the query address",
+        });
+    }),
   z
     .object({
       query_address: canonicalAddress,
@@ -222,19 +271,45 @@ const containingProcedure = z.discriminatedUnion("found", [
 ]);
 
 const resultSchemas = {
+  inspect_native_load_image: nativeLoadImageObservationSchema,
+  read_bytes: z
+    .strictObject({
+      address: canonicalAddress,
+      requested_bytes: z.number().int().min(1),
+      returned_bytes: z.number().int().min(0),
+      bytes_hex: z.string().regex(/^(?:[a-f0-9]{2})*$/u),
+      complete: z.boolean(),
+    })
+    .superRefine((value, context) => {
+      if (
+        value.returned_bytes * 2 !== value.bytes_hex.length ||
+        value.returned_bytes > value.requested_bytes ||
+        value.complete !== (value.returned_bytes === value.requested_bytes)
+      )
+        context.addIssue({
+          code: "custom",
+          message: "Read-byte length and completeness disagree",
+        });
+    }),
+  address_to_file_offset: z.strictObject({
+    address: canonicalAddress,
+    file_offset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  }),
   address_name: z.string().nullable(),
   list_documents: z.array(z.string().min(1)).length(1),
-  list_names: pageSchema(symbolItem, 500),
-  list_procedures: pageSchema(procedureItem, 500),
+  list_names: z.array(symbolItem),
+  list_procedures: z.array(procedureItem),
   list_segments: z.array(segment),
-  list_strings: pageSchema(stringItem, 500),
+  list_strings: z.array(stringItem),
   procedure_address: canonicalAddress,
   resolve_containing_procedure: containingProcedure,
-  search_procedures: pageSchema(searchItem, 100),
-  search_strings: pageSchema(searchItem, 100),
+  search_procedures: z.array(searchItem),
+  search_strings: z.array(searchItem),
+  set_address_name: z.boolean(),
+  set_addresses_names: z.record(z.string(), z.boolean()),
 } satisfies Readonly<Record<GhidraInventoryOperation, z.ZodType>>;
 
-/** Require exact, bounded Java-bridge output before creating Evidence. */
+/** Validate exact Java-bridge output before creating Evidence. */
 export const parseGhidraInventoryResult = (
   operation: GhidraInventoryOperation,
   value: JsonValue,

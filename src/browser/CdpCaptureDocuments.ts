@@ -1,122 +1,132 @@
-import type {
-  InspectWebPageInput,
-  WebPageInspection,
-} from "../domain/browserObservation.js";
+import type { InspectWebPageInput } from "../domain/browserObservation.js";
+import type { WebPageInspection } from "../domain/browserObservationSchemas.js";
 import {
   allowedSanitizedUrl,
-  boundedText,
   numberValue,
   recordValue,
   recordsValue,
   requiredRecord,
-  stringValue,
+  cdpStringValue,
   type UnknownRecord,
 } from "./CdpCaptureValues.js";
 import { exclusionReasonForUrl } from "./CdpCaptureEventHelpers.js";
 import type { CdpCaptureCompleteness } from "./CdpCaptureCompleteness.js";
+import { createDocumentSvgAncestry, domSvgLink } from "./CdpCaptureDomSvg.js";
+import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 
 export type CapturedResource = Omit<
   WebPageInspection["resources"][number],
   "resource_key"
 > & { readonly rawUrl: string };
 
-/** Normalize allowed frames while retaining a bounded prefix and total count. */
+/** Normalize every allowed frame, optionally selecting a leading frame. */
 export const captureFrames = (
   result: unknown,
   allowedOrigins: ReadonlySet<string>,
-  maximum: number,
+  maximum?: number,
   completeness?: CdpCaptureCompleteness,
 ): {
-  readonly total: number;
   readonly items: WebPageInspection["frames"];
 } => {
-  const root = recordValue(requiredRecord(result).frameTree);
-  if (root === undefined) return { total: 0, items: [] };
+  const root = recordValue(recordValue(result)?.frameTree);
+  if (root === undefined) {
+    completeness?.exclude("frames", "invalid_protocol_value");
+    return { items: [] };
+  }
   const items: WebPageInspection["frames"] = [];
-  let total = 0;
-  for (const tree of walkFrameTrees(root)) {
+  for (const tree of walkFrameTrees(root, () =>
+    completeness?.exclude("frames", "invalid_protocol_value"),
+  )) {
     const frame = recordValue(tree.frame);
-    const frameId = stringValue(frame?.id);
+    const frameId = cdpStringValue(frame?.id);
     const sanitized = allowedSanitizedUrl(frame?.url, allowedOrigins);
-    if (frame === undefined || frameId === undefined || frameId.length > 256) {
+    if (frame === undefined || frameId === undefined) {
       completeness?.exclude("frames", "invalid_protocol_value");
       continue;
     }
     if (sanitized === undefined || sanitized.origin === null) {
       completeness?.exclude(
         "frames",
-        exclusionReasonForUrl(stringValue(frame.url)),
+        exclusionReasonForUrl(cdpStringValue(frame.url)),
       );
       continue;
     }
-    total += 1;
-    if (items.length >= maximum) continue;
+    if (maximum !== undefined && items.length >= maximum) continue;
     items.push({
       frame_id: frameId,
-      parent_frame_id:
-        (stringValue(frame.parentId) ?? "").slice(0, 256) || null,
+      parent_frame_id: cdpStringValue(frame.parentId) ?? null,
       url: sanitized.url,
       origin: sanitized.origin,
     });
   }
-  return { total, items };
+  return { items };
 };
 
 /** Read the current main-frame URL from an untrusted Page.getFrameTree result. */
 export const mainFrameUrl = (result: unknown): string | undefined =>
-  stringValue(
+  cdpStringValue(
     recordValue(recordValue(requiredRecord(result).frameTree)?.frame)?.url,
   );
 
-/** Normalize allowed resources while retaining a bounded prefix and total count. */
+/** Normalize every allowed resource. */
 export const captureResources = (
   result: unknown,
   allowedOrigins: ReadonlySet<string>,
-  maximum: number,
   completeness?: CdpCaptureCompleteness,
 ): {
-  readonly total: number;
   readonly items: readonly CapturedResource[];
 } => {
-  const root = recordValue(requiredRecord(result).frameTree);
-  if (root === undefined) return { total: 0, items: [] };
+  const root = recordValue(recordValue(result)?.frameTree);
+  if (root === undefined) {
+    completeness?.exclude("resources", "invalid_protocol_value");
+    return { items: [] };
+  }
   const items: CapturedResource[] = [];
-  let total = 0;
-  for (const tree of walkFrameTrees(root)) {
+  for (const tree of walkFrameTrees(root, () =>
+    completeness?.exclude("resources", "invalid_protocol_value"),
+  )) {
     for (const resource of recordsValue(tree.resources)) {
       const url = allowedSanitizedUrl(resource.url, allowedOrigins);
       if (url === undefined || url.origin === null) {
         completeness?.exclude(
           "resources",
-          exclusionReasonForUrl(stringValue(resource.url)),
+          exclusionReasonForUrl(cdpStringValue(resource.url)),
         );
         continue;
       }
-      total += 1;
-      if (items.length >= maximum) continue;
       const contentSize = numberValue(resource.contentSize);
       items.push({
-        rawUrl: stringValue(resource.url) ?? "",
+        rawUrl: cdpStringValue(resource.url) ?? "",
         url: url.url,
         origin: url.origin,
-        type: (stringValue(resource.type) ?? "Other").slice(0, 100),
-        mime_type: (stringValue(resource.mimeType) ?? "").slice(0, 256),
+        type: cdpStringValue(resource.type) ?? "Other",
+        mime_type: cdpStringValue(resource.mimeType) ?? "",
         content_size:
           contentSize === undefined ? null : Math.max(0, contentSize),
       });
     }
   }
-  return { total, items };
+  return { items };
 };
 
-const walkFrameTrees = function* (
+export const walkFrameTrees = function* (
   root: UnknownRecord,
+  onMalformedChild?: () => void,
 ): Generator<UnknownRecord> {
   const pending = [root];
   while (pending.length > 0) {
     const tree = pending.pop();
     if (tree === undefined) return;
-    const children = recordsValue(tree.childFrames);
+    const rawChildren = tree.childFrames;
+    if (rawChildren !== undefined && !Array.isArray(rawChildren))
+      onMalformedChild?.();
+    const children = Array.isArray(rawChildren)
+      ? rawChildren.flatMap((child) => {
+          const parsed = recordValue(child);
+          if (parsed === undefined) onMalformedChild?.();
+          return parsed === undefined ? [] : [parsed];
+        })
+      : [];
     for (let index = children.length - 1; index >= 0; index -= 1) {
       const child = children[index];
       if (child !== undefined) pending.push(child);
@@ -139,7 +149,7 @@ export const captureDom = (
 } => {
   const root = requiredRecord(result);
   const strings = Array.isArray(root.strings)
-    ? root.strings.map((value) => stringValue(value) ?? "")
+    ? root.strings.map((value) => cdpStringValue(value) ?? "")
     : [];
   const nodes: WebPageInspection["dom"]["nodes"] = [];
   const urls: WebPageInspection["metadata"]["dom_urls"] = [];
@@ -152,6 +162,7 @@ export const captureDom = (
       completeness?.exclude("dom", exclusionReasonForUrl(documentUrl));
       continue;
     }
+    const baseUrl = indexedString(strings, document.baseURL) || documentUrl;
     const documentNodes = recordValue(document.nodes);
     if (documentNodes === undefined) continue;
     const nodeTypes = numberArray(documentNodes.nodeType);
@@ -162,40 +173,40 @@ export const captureDom = (
       ? documentNodes.attributes
       : [];
     const baseIndex = nodes.length;
+    const ancestry = createDocumentSvgAncestry({
+      nodeTypes,
+      nodeNames,
+      parents,
+      strings,
+      attributes,
+    });
     total += nodeTypes.length;
-    for (
-      let index = 0;
-      index < nodeTypes.length && nodes.length < input.limits.max_dom_nodes;
-      index += 1
-    ) {
+    for (let index = 0; index < nodeTypes.length; index += 1) {
       const attributeIndexes = numberArray(attributes[index]);
       const parent = Math.trunc(parents[index] ?? -1);
       const nodeIndex = nodes.length;
-      const nodeName = indexedString(strings, nodeNames[index]).slice(0, 256);
+      const nodeName = indexedString(strings, nodeNames[index]);
+      const attributeNames = uniqueAttributeNames(attributeIndexes, strings);
       nodes.push({
         index: nodeIndex,
         parent_index: parent < 0 ? -1 : baseIndex + parent,
         node_type: Math.max(0, Math.trunc(nodeTypes[index] ?? 0)),
         node_name: nodeName,
         node_value_length: indexedString(strings, nodeValues[index]).length,
-        attribute_names: attributeIndexes
-          .filter((_value, attributeIndex) => attributeIndex % 2 === 0)
-          .map((value) => indexedString(strings, value).slice(0, 256))
-          .slice(0, 200),
+        attribute_names: attributeNames,
       });
       const metadata = domMetadata({
         strings,
         attributes: attributeIndexes,
+        // The BASE element itself resolves against the document fallback URL.
+        baseUrl: nodeName.toLowerCase() === "base" ? documentUrl : baseUrl,
         documentUrl,
         nodeIndex,
         nodeName,
         allowedOrigins,
+        ...domSvgLink(ancestry, index),
       });
       for (const url of metadata.urls) {
-        if (urls.length >= input.limits.max_resources) {
-          completeness?.truncate("metadata");
-          continue;
-        }
         urls.push(url);
         if (url.destination_scope !== "approved") {
           excludedUrls += 1;
@@ -214,94 +225,153 @@ export const captureDom = (
     total,
     nodes,
     urls,
-    agentHints: agentHints.slice(0, input.limits.max_resources),
+    agentHints,
     excludedUrls,
   };
 };
 
 export const captureAccessibility = (
   results: readonly unknown[],
-  maximum: number,
   options: {
     readonly includeText: boolean;
-    readonly maximumFieldBytes: number;
-    readonly maximumTotalBytes: number;
     readonly unavailable?: boolean;
   },
 ): {
   readonly total: number;
   readonly nodes: WebPageInspection["accessibility"]["nodes"];
   readonly textCapture: WebPageInspection["accessibility"]["text_capture"];
+  readonly treeIncomplete: boolean;
 } => {
   const all = results.flatMap((result) =>
     recordsValue(requiredRecord(result).nodes),
   );
-  let retainedBytes = 0;
+  const nodeIds = new Set(
+    all.flatMap((node) => {
+      const nodeId = cdpStringValue(node.nodeId);
+      return nodeId === undefined ? [] : [nodeId];
+    }),
+  );
   let excludedFields = 0;
-  let truncatedFields = 0;
-  const nodes = all.slice(0, maximum).map((node) => {
+  const nodes = all.map((node) => {
     const captureText = (value: unknown): string | null => {
-      const raw = stringValue(recordValue(value)?.value);
+      const raw = cdpStringValue(recordValue(value)?.value);
       if (raw === undefined) return null;
       if (!options.includeText) {
         excludedFields += 1;
         return null;
       }
-      const available = Math.max(0, options.maximumTotalBytes - retainedBytes);
-      const captured = boundedUtf8(
-        raw,
-        Math.min(options.maximumFieldBytes, available),
-      );
-      retainedBytes += captured.bytes;
-      if (captured.truncated) {
-        truncatedFields += 1;
-        if (captured.text === "" && raw !== "") {
-          excludedFields += 1;
-          return null;
-        }
-      }
-      return captured.text;
+      return raw;
     };
     return {
-      node_id: (stringValue(node.nodeId) ?? "").slice(0, 256),
-      parent_id: (stringValue(node.parentId) ?? "").slice(0, 256) || null,
+      node_id: cdpStringValue(node.nodeId) ?? "",
+      parent_id: cdpStringValue(node.parentId) ?? null,
       role: axText(node.role),
       name: captureText(node.name),
       description: captureText(node.description),
       ignored: node.ignored === true,
+      states: accessibilityStates(node.properties),
     };
   });
-  for (const node of all.slice(maximum)) {
-    for (const value of [node.name, node.description]) {
-      if (stringValue(recordValue(value)?.value) === undefined) continue;
-      excludedFields += 1;
-      if (options.includeText) truncatedFields += 1;
-    }
-  }
   return {
     total: all.length,
     nodes,
+    treeIncomplete: all.some(
+      (node) =>
+        Array.isArray(node.childIds) &&
+        node.childIds.some((childId) => {
+          const id = cdpStringValue(childId);
+          return id !== undefined && !nodeIds.has(id);
+        }),
+    ),
     textCapture: {
       status: options.unavailable
         ? "unavailable"
         : !options.includeText
           ? "not_approved"
-          : truncatedFields > 0
-            ? "truncated"
-            : "included",
-      retained_bytes: retainedBytes,
+          : "included",
+      retained_bytes: nodes.reduce(
+        (total, node) =>
+          total +
+          Buffer.byteLength(node.name ?? "") +
+          Buffer.byteLength(node.description ?? ""),
+        0,
+      ),
       excluded_fields: excludedFields,
-      truncated_fields: truncatedFields,
     },
   };
 };
 
+const ACCESSIBILITY_STATE_NAMES = new Set([
+  "atomic",
+  "autocomplete",
+  "busy",
+  "checked",
+  "disabled",
+  "editable",
+  "expanded",
+  "focusable",
+  "focused",
+  "hasPopup",
+  "hidden",
+  "invalid",
+  "level",
+  "live",
+  "modal",
+  "multiline",
+  "multiselectable",
+  "orientation",
+  "pressed",
+  "readonly",
+  "required",
+  "selected",
+  "valuemax",
+  "valuemin",
+]);
+
+const accessibilityStates = (
+  value: unknown,
+): WebPageInspection["accessibility"]["nodes"][number]["states"] => {
+  const states = new Map<string, boolean | number | string>();
+  for (const property of recordsValue(value)) {
+    const name = cdpStringValue(property.name);
+    if (name === undefined || !ACCESSIBILITY_STATE_NAMES.has(name)) continue;
+    const raw = recordValue(property.value)?.value;
+    const state =
+      typeof raw === "boolean"
+        ? raw
+        : typeof raw === "number"
+          ? numberValue(raw)
+          : typeof raw === "string"
+            ? raw
+            : undefined;
+    if (state !== undefined) states.set(name, state);
+  }
+  return [...states]
+    .sort(([left], [right]) => compareUnicodeCodePoints(left, right))
+    .map(([name, state]) => ({ name, value: state }));
+};
+
 const axText = (value: unknown): string | null =>
-  boundedText(recordValue(value)?.value, 1_024);
+  cdpStringValue(recordValue(value)?.value) ?? null;
 
 const indexedString = (strings: readonly string[], index: unknown): string => {
   const integer = numberValue(index);
   return integer === undefined ? "" : (strings[Math.trunc(integer)] ?? "");
+};
+
+const uniqueAttributeNames = (
+  attributeIndexes: readonly number[],
+  strings: readonly string[],
+): string[] => {
+  const names: string[] = [];
+  const seen = new Set<string>();
+  for (let index = 0; index < attributeIndexes.length; index += 2) {
+    const name = indexedString(strings, attributeIndexes[index]);
+    if (seen.has(name)) continue;
+    seen.add(name);
+    names.push(name);
+  }
+  return names;
 };
 
 const numberArray = (value: unknown): readonly number[] =>
@@ -315,11 +385,29 @@ const numberArray = (value: unknown): readonly number[] =>
 interface DomMetadataOptions {
   readonly strings: readonly string[];
   readonly attributes: readonly number[];
+  readonly baseUrl: string;
   readonly documentUrl: string;
   readonly nodeIndex: number;
   readonly nodeName: string;
   readonly allowedOrigins: ReadonlySet<string>;
+  readonly svgElement: boolean;
+  readonly xmlDocument: boolean;
+  readonly xlinkHref: string | undefined;
 }
+
+// Chrome reads an SVG XLink href only when href itself is absent, and an
+// empty href still wins. HTML keeps the literal attribute name `xlink:href`.
+// XML uses any prefix bound to the XLink namespace. Both are stored as href.
+const hrefAttributeValue = (
+  pairs: ReadonlyMap<string, string>,
+  attribute: string,
+  options: DomMetadataOptions,
+): string | undefined => {
+  const declared = pairs.get(attribute);
+  if (declared !== undefined) return declared;
+  if (attribute !== "href" || !options.svgElement) return undefined;
+  return options.xmlDocument ? options.xlinkHref : pairs.get("xlink:href");
+};
 
 const domMetadata = (
   options: DomMetadataOptions,
@@ -330,6 +418,7 @@ const domMetadata = (
   const {
     strings,
     attributes,
+    baseUrl,
     documentUrl,
     nodeIndex,
     nodeName,
@@ -337,15 +426,31 @@ const domMetadata = (
   } = options;
   const pairs = new Map<string, string>();
   for (let index = 0; index + 1 < attributes.length; index += 2) {
-    const name = indexedString(strings, attributes[index]).toLowerCase();
+    // Chrome already folds HTML names; SVG/XML names remain case-sensitive.
+    const name = indexedString(strings, attributes[index]);
     const value = indexedString(strings, attributes[index + 1]);
-    pairs.set(name, value);
+    // HTML keeps the first declaration. A later repeat must not move dom_urls.
+    if (!pairs.has(name)) pairs.set(name, value);
   }
   const urls: WebPageInspection["metadata"]["dom_urls"] = [];
   for (const attribute of domUrlAttributes) {
-    const value = pairs.get(attribute);
+    const value = hrefAttributeValue(pairs, attribute, options);
     if (value === undefined) continue;
-    const destination = domDestination(value, documentUrl, allowedOrigins);
+    const tagName = nodeName.toLowerCase();
+    // Chrome strips HTML whitespace for FORM.action, while submit controls
+    // use the document URL only for an exactly empty formaction attribute.
+    const usesDocumentUrl =
+      (tagName === "form" &&
+        attribute === "action" &&
+        /^[\t\n\f\r ]*$/u.test(value)) ||
+      ((tagName === "button" || tagName === "input") &&
+        attribute === "formaction" &&
+        value === "");
+    const destination = domDestination(
+      usesDocumentUrl ? documentUrl : value,
+      baseUrl,
+      allowedOrigins,
+    );
     urls.push({
       node_index: nodeIndex,
       attribute,
@@ -372,14 +477,14 @@ const domMetadata = (
 
 const domDestination = (
   value: string,
-  documentUrl: string,
+  baseUrl: string,
   allowedOrigins: ReadonlySet<string>,
 ): {
   readonly url: string | null;
   readonly scope: "approved" | "outside_policy" | "unsupported";
 } => {
   try {
-    const parsed = new URL(value, documentUrl);
+    const parsed = new URL(value, baseUrl);
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:")
       return { url: null, scope: "unsupported" };
     if (!allowedOrigins.has(parsed.origin))
@@ -388,31 +493,11 @@ const domDestination = (
       url: allowedSanitizedUrl(parsed.href, allowedOrigins)?.url ?? null,
       scope: "approved",
     };
-  } catch {
+  } catch (cause: unknown) {
+    // Unparseable URLs are out of scope, not failures.
+    void cause;
     return { url: null, scope: "unsupported" };
   }
-};
-
-const boundedUtf8 = (
-  value: string,
-  maximumBytes: number,
-): {
-  readonly text: string;
-  readonly bytes: number;
-  readonly truncated: boolean;
-} => {
-  const total = Buffer.byteLength(value);
-  if (total <= maximumBytes)
-    return { text: value, bytes: total, truncated: false };
-  let text = "";
-  let bytes = 0;
-  for (const character of value) {
-    const characterBytes = Buffer.byteLength(character);
-    if (bytes + characterBytes > maximumBytes) break;
-    text += character;
-    bytes += characterBytes;
-  }
-  return { text, bytes, truncated: true };
 };
 
 const domUrlAttributes = [

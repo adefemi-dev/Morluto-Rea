@@ -2,10 +2,9 @@ import { json, run, runWithStatus } from "./lib/verify-package-core.mjs";
 
 const REQUIRED_HELP_COMMANDS = [
   "setup",
-  "upgrade",
-  "inventory-artifact",
+  "update",
+  "inspect-artifact",
   "extract-artifact",
-  "investigate-versions",
   "import-reference-source",
   "list-browser-targets",
   "inspect-web-page",
@@ -22,11 +21,22 @@ const REQUIRED_LLM_TOPICS = [
   "trace",
   "capabilities",
   "providers",
-  "inventory-artifact",
+  "inspect-artifact",
   "list-browser-targets",
   "inspect-web-page",
   "analyze-javascript-application",
 ];
+
+/** Derive agent and Hopper setup support from the corresponding doctor checks. */
+export function packageSetupSupport(checks, platform) {
+  const supportedSetupHost =
+    checks?.find(({ name }) => name === "node")?.ok === true;
+  const hopperSetupSupported =
+    supportedSetupHost &&
+    checks?.find(({ name }) => name === "host")?.ok === true &&
+    platform !== "win32";
+  return { supportedSetupHost, hopperSetupSupported };
+}
 
 /** Validate --help, --llms, and doctor output and determine host setup support. */
 export async function verifyPackageDiscovery({ cli, environment }) {
@@ -38,8 +48,11 @@ export async function verifyPackageDiscovery({ cli, environment }) {
     environment,
   );
   const doctor = json(doctorExecution.stdout);
-  const supportedSetupHost =
-    doctor.checks?.find(({ name }) => name === "host")?.ok === true;
+  const { supportedSetupHost, hopperSetupSupported } = packageSetupSupport(
+    doctor.checks,
+    process.platform,
+  );
+  const hopperReady = doctor.checks?.find(({ name }) => name === "hopper")?.ok;
   const expectedDoctorHealth = doctor.checks?.every(({ ok }) => ok) === true;
   const missingHelp = REQUIRED_HELP_COMMANDS.filter(
     (command) => !help.includes(command),
@@ -52,10 +65,10 @@ export async function verifyPackageDiscovery({ cli, environment }) {
     missingLlms.length !== 0 ||
     doctor.healthy !== expectedDoctorHealth ||
     doctorExecution.status !== (expectedDoctorHealth ? 0 : 1) ||
-    doctor.checks?.find(({ name }) => name === "hopper")?.ok !== true
+    (hopperSetupSupported && hopperReady !== true)
   )
     throw new Error(
       `packaged CLI discovery or doctor failed: ${JSON.stringify({ helpSetup: help.includes("setup"), llmsDecompile: llms.includes("decompile"), doctor })}`,
     );
-  return { supportedSetupHost };
+  return { supportedSetupHost, hopperSetupSupported };
 }

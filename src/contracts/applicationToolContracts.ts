@@ -1,102 +1,69 @@
+import { applicationVersionComparisonResultSchema } from "../domain/javascript/javascriptApplicationVersionComparisonSchemas.js";
+import { applicationFeatureTraceResultSchema } from "../domain/javascript/javascriptFeatureTraceSchemas.js";
+import { javaScriptSemanticTraceResultSchema } from "../domain/javascript/javascriptSemanticTraceSchemas.js";
+import { javaScriptExportShapeComparisonResultSchema } from "../domain/javascript/javascriptExportShapeComparisonSchemas.js";
+import { sourceToBundleComparisonResultSchema } from "../domain/javascript/sourceToBundleComparisonSchemas.js";
 import {
-  applicationVersionComparisonResultSchema,
-  compareApplicationVersionsInputSchema,
-} from "../domain/javascriptApplicationVersionComparisonSchemas.js";
-import {
-  applicationFeatureTraceResultSchema,
-  traceApplicationFeatureInputSchema,
-} from "../domain/javascriptFeatureTraceSchemas.js";
-import {
-  controlledReplayInputSchema,
-  controlledReplayOutputSchema,
-} from "../domain/javascriptReplay.js";
-import {
-  nodeCharacterizationExecutionInputSchema,
-  nodeCharacterizationExecutionOutputSchema,
-  nodeCharacterizationPreparationInputSchema,
-  nodeCharacterizationPreparationOutputSchema,
-} from "../domain/nodeRuntimeCharacterization.js";
-import {
-  reconstructionCoverageCommitInputSchema,
-  reconstructionCoverageCommitOutputSchema,
-  reconstructionCoverageQueryInputSchema,
-} from "../application/ReconstructionCoverageService.js";
+  compareApplicationVersionsRequestSchema,
+  compareJavaScriptExportShapesRequestSchema,
+  compareSourceToBundleRequestSchema,
+  traceApplicationFeatureRequestSchema,
+  traceJavaScriptSemanticsRequestSchema,
+} from "./javascript/applicationWorkflowInputContracts.js";
+import { reconstructionCoverageEvaluationInputSchema } from "../domain/reconstructionCoverageInput.js";
 import { reconstructionClosureResultSchema } from "../domain/reconstructionCoverage.js";
-import { jsonObjectSchema } from "../domain/jsonValue.js";
-import type { ToolContract } from "./toolContracts.js";
+import {
+  reconstructionObligationLedgerInputSchema,
+  reconstructionObligationLedgerSchema,
+} from "../domain/reconstructionObligationLedgerSchemas.js";
+import {
+  androidApplicationProjectionInputSchema,
+  androidApplicationProjectionResultSchema,
+} from "../domain/android/androidApplication.js";
+import {
+  appleApplicationProjectionInputSchema,
+  appleApplicationProjectionResultSchema,
+} from "../domain/apple/appleApplication.js";
+import {
+  harmonyApplicationProjectionInputSchema,
+  harmonyApplicationProjectionResultSchema,
+} from "../domain/harmony/harmonyApplication.js";
+import type { ToolContract } from "./toolContractTypes.js";
 import { toolContractMetadata } from "./toolEffects.js";
-import { evidenceResultOf } from "./toolOutputSchemas.js";
+import { evidenceResultOf } from "./toolOutputSchemaPrimitives.js";
 import {
   JAVASCRIPT_APPLICATION_VERSION_COMPARISON_EXAMPLE,
   JAVASCRIPT_FEATURE_TRACE_EXAMPLE,
-} from "./javascriptApplicationWorkflowExamples.js";
+  SOURCE_TO_BUNDLE_COMPARISON_EXAMPLE,
+} from "./javascript/javascriptApplicationWorkflowExamples.js";
+import { JAVASCRIPT_EXPORT_SHAPE_COMPARISON_EXAMPLE } from "./javascript/javascriptExportShapeComparisonExample.js";
+import {
+  ANDROID_APPLICATION_GRAPH_EXAMPLE,
+  APPLE_APPLICATION_GRAPH_EXAMPLE,
+  HARMONY_APPLICATION_GRAPH_EXAMPLE,
+  MACOS_APPLICATION_GRAPH_EXAMPLE,
+} from "./mobileApplicationGraphExamples.js";
 
 const traceOutputSchema = evidenceResultOf(applicationFeatureTraceResultSchema);
+const semanticTraceOutputSchema = evidenceResultOf(
+  javaScriptSemanticTraceResultSchema,
+);
 const comparisonOutputSchema = evidenceResultOf(
   applicationVersionComparisonResultSchema,
 );
+const sourceToBundleOutputSchema = evidenceResultOf(
+  sourceToBundleComparisonResultSchema,
+);
+const exportShapeComparisonOutputSchema = evidenceResultOf(
+  javaScriptExportShapeComparisonResultSchema,
+);
+const reconstructionObligationLedgerOutputSchema = evidenceResultOf(
+  reconstructionObligationLedgerSchema,
+);
 const HASH = "0".repeat(64);
-const NODE_PREPARATION_EXAMPLE = jsonObjectSchema.parse({
-  preparation_approved: true,
-  selected_alias: "bundle",
-  expected_effect: "pure",
-  instrumentation: {
-    artifact_path: "/approved/bundle.js",
-    artifact_sha256: HASH,
-    selection: {
-      byte_start: 100,
-      byte_end: 120,
-      selected_sha256: HASH,
-      export_name: "selected",
-    },
-  },
-  replay: {
-    mode: "plan",
-    left: {
-      modules: [
-        {
-          alias: "bundle",
-          path: "/approved/bundle.js",
-          format: "commonjs-factory",
-          role: "module",
-          dependencies: {},
-        },
-      ],
-      entry_alias: "bundle",
-      entry_export: "selected",
-    },
-    cases: [{ case_id: "empty", arguments: [""] }],
-    approved: false,
-  },
-});
-
-const COVERAGE_WORKSPACE_EXAMPLE = jsonObjectSchema.parse({
-  schema_version: 1,
-  workspace_id: `rcw_${HASH}`,
-  name: "replacement",
-  revision: 1,
-  previous_revision_sha256: null,
-  revision_sha256: HASH,
-  evidence_bundle: {
-    bundle_version: 2,
-    artifacts: [],
-    providers: [],
-    environments: [],
-    scenarios: [],
-    captures: [],
-    unknowns: [],
-    records: [],
-  },
-  artifacts: [],
-  surfaces: [],
-  owners: [],
-  claims: [],
-  verifier_contracts: [],
-  verifier_results: [],
-  residual_unknown_ids: [],
-  contradictions: [],
-  package_proofs: [],
-  boundaries: [],
+const retained = (evidence_id: string) => ({
+  kind: "retained-evidence" as const,
+  evidence_id,
 });
 
 /** Provider-neutral graph workflow contracts shared by MCP and CLI adapters. */
@@ -105,14 +72,44 @@ export const APPLICATION_TOOL_CONTRACTS = [
     name: "trace_application_feature",
     ...toolContractMetadata("trace_application_feature"),
     description:
-      "Trace a typed literal seed through an authenticated JavaScript Application Graph with explicit direction, depth, node, edge, and path bounds. Original static, native, passive-runtime, inferred, and unknown authorities remain distinct; native addon handoffs never open a provider or execute the application.",
+      "Trace a typed literal seed through every reachable part of an authenticated JavaScript Application Graph supplied as inline Evidence or exact same-session retained references. Original static, native, passive-runtime, inferred, and unknown authorities remain distinct; native addon handoffs never open a provider or execute the application.",
     kind: "application",
-    inputSchema: traceApplicationFeatureInputSchema,
+    inputSchema: traceApplicationFeatureRequestSchema,
     outputSchema: traceOutputSchema,
     examples: [
       {
         title: "Trace one module seed through a retained application graph",
         input: JAVASCRIPT_FEATURE_TRACE_EXAMPLE,
+      },
+      {
+        title: "Use exact Evidence already retained in this session",
+        input: {
+          ...JAVASCRIPT_FEATURE_TRACE_EXAMPLE,
+          application: retained(
+            JAVASCRIPT_FEATURE_TRACE_EXAMPLE.application.evidence_id,
+          ),
+        },
+      },
+    ],
+  },
+  {
+    name: "trace_javascript_semantics",
+    ...toolContractMetadata("trace_javascript_semantics"),
+    description:
+      "Trace static JavaScript data-flow, direct call/return, and closure relations from inline application Evidence or an exact same-session retained reference. Dynamic or unsupported semantics remain explicit unknowns; static reachability never claims runtime execution.",
+    kind: "application",
+    inputSchema: traceJavaScriptSemanticsRequestSchema,
+    outputSchema: semanticTraceOutputSchema,
+    examples: [
+      {
+        title: "Trace backward provenance from one semantic node",
+        input: {
+          application: JAVASCRIPT_FEATURE_TRACE_EXAMPLE.application,
+          query: {
+            seed: { kind: "semantic-node", node_id: `jsrg_node_${HASH}` },
+            direction: "backward-provenance",
+          },
+        },
       },
     ],
   },
@@ -120,140 +117,246 @@ export const APPLICATION_TOOL_CONTRACTS = [
     name: "compare_application_versions",
     ...toolContractMetadata("compare_application_versions"),
     description:
-      "Compare two authenticated JavaScript Application Graph versions using unique-only exact digest, module source digest, source-map identity, structural fingerprint, and non-module semantic-key tiers. Reports added, removed, changed, ambiguous, and unknown entities plus a bounded changed_from graph without fuzzy or module-ordinal pairing.",
+      "Compare two authenticated JavaScript Application Graph versions supplied as inline Evidence or exact same-session retained references. Uses unique-only exact digest, module source digest, source-map identity, structural fingerprint, and non-module semantic-key tiers. Reports added, removed, changed, ambiguous, and unknown entities plus the complete matching changed_from graph without fuzzy or module-ordinal pairing.",
     kind: "application",
-    inputSchema: compareApplicationVersionsInputSchema,
+    inputSchema: compareApplicationVersionsRequestSchema,
     outputSchema: comparisonOutputSchema,
     examples: [
       {
         title: "Compare authenticated static and reconciled application graphs",
         input: JAVASCRIPT_APPLICATION_VERSION_COMPARISON_EXAMPLE,
       },
-    ],
-  },
-  {
-    name: "run_controlled_replay",
-    ...toolContractMetadata("run_controlled_replay"),
-    description:
-      "Plan or execute a content-bound extracted-module JavaScript replay inside the Linux Bubblewrap, seccomp, and cgroup boundary. Execution requires approved: true and the exact plan digest. Supports deterministic boundary cases and optional left/right differential comparison; observations have controlled-replay authority and do not claim real application runtime behavior.",
-    kind: "application",
-    inputSchema: controlledReplayInputSchema,
-    outputSchema: controlledReplayOutputSchema,
-    examples: [
       {
-        title: "Plan one extracted ESM parser replay",
+        title: "Use exact Evidence already retained in this session",
         input: {
-          mode: "plan",
-          left: {
-            modules: [
-              {
-                alias: "parser",
-                path: "/approved/parser.mjs",
-                format: "esm",
-                role: "module",
-                dependencies: {},
-              },
-            ],
-            entry_alias: "parser",
-            entry_export: "default",
-          },
-          cases: [{ case_id: "empty", arguments: [""] }],
-          determinism: {
-            clock_iso: "2000-01-01T00:00:00.000Z",
-            random_seed: 0,
-            locale: "en-US",
-            timezone: "UTC",
-            platform: "linux",
-          },
-          limits: {
-            wall_time_ms: 3000,
-            memory_bytes: 134217728,
-            tasks: 8,
-            cpu_quota_percent: 50,
-            tmpfs_bytes: 16777216,
-            module_bytes: 4194304,
-            input_bytes: 262144,
-            protocol_bytes: 16777216,
-            output_bytes: 524288,
-            stderr_bytes: 32768,
-            result_depth: 16,
-            result_nodes: 10000,
-          },
-          approved: false,
+          ...JAVASCRIPT_APPLICATION_VERSION_COMPARISON_EXAMPLE,
+          left: retained(
+            JAVASCRIPT_APPLICATION_VERSION_COMPARISON_EXAMPLE.left.evidence_id,
+          ),
+          right: retained(
+            JAVASCRIPT_APPLICATION_VERSION_COMPARISON_EXAMPLE.right.evidence_id,
+          ),
         },
       },
     ],
   },
   {
-    name: "prepare_node_characterization",
-    ...toolContractMetadata("prepare_node_characterization"),
+    name: "compare_source_to_bundle",
+    ...toolContractMetadata("compare_source_to_bundle"),
     description:
-      "Prepare a hash-bound Node/JavaScript characterization plan and deterministic reversible export transformation without executing target code. The exact source, selected byte range, runtime closure, sandbox profile, cases, and limits are committed for separate execution approval.",
+      "Compare a cryptographically committed HistoricalSourceGraph with authenticated JavaScript Application Graph Evidence supplied inline or by exact same-session retained reference. Uses explicit exact-digest, source-map path, current-path, suffix, and basename signals with stable weights. Classifies unchanged, modified, removed, split, merged, duplicated, and unknown; incomplete coverage and ambiguous weak signals never become absence or forced matches.",
     kind: "application",
-    inputSchema: nodeCharacterizationPreparationInputSchema,
-    outputSchema: nodeCharacterizationPreparationOutputSchema,
+    inputSchema: compareSourceToBundleRequestSchema,
+    outputSchema: sourceToBundleOutputSchema,
     examples: [
       {
-        title: "Prepare one exact bundled callable characterization",
-        input: NODE_PREPARATION_EXAMPLE,
+        title:
+          "Compare committed historical source with a shipped bundle graph",
+        input: SOURCE_TO_BUNDLE_COMPARISON_EXAMPLE,
       },
     ],
   },
   {
-    name: "execute_node_characterization",
-    ...toolContractMetadata("execute_node_characterization"),
+    name: "compare_javascript_export_shapes",
+    ...toolContractMetadata("compare_javascript_export_shapes"),
     description:
-      "Recompute and execute one separately approved exact Node characterization plan in the owned controlled-replay boundary. Returns transformation, replay, cleanup, and provider-neutral characterization Evidence v2; stale plans fail before execution.",
+      "Compare static return shapes for one exact module/export selector on each authenticated JavaScript Application Graph supplied as inline Evidence or exact same-session retained references. Variants pair only by reciprocal unique literal discriminants. Each retained variant lists observed return-property names even when values stay unknown. Presence (present, absent, or unknown-coverage) is separate from value resolution: a name present on only one paired shape is added or removed when parent-property coverage is complete on both sides, including when the static value is unresolved. Dynamic values, incomplete parent coverage, and unpaired variants remain unknown. Reports JSON Pointer changes without executing JavaScript; runtime behavior requires a separate agent-run probe.",
     kind: "application",
-    inputSchema: nodeCharacterizationExecutionInputSchema,
-    outputSchema: nodeCharacterizationExecutionOutputSchema,
+    inputSchema: compareJavaScriptExportShapesRequestSchema,
+    outputSchema: exportShapeComparisonOutputSchema,
     examples: [
       {
-        title: "Execute one approved exact characterization plan",
+        title:
+          "Report observed return-property presence when static values stay unknown",
+        input: JAVASCRIPT_EXPORT_SHAPE_COMPARISON_EXAMPLE,
+      },
+      {
+        title: "Use exact Evidence already retained in this session",
         input: {
-          execution_approved: true,
-          approved_plan_sha256: HASH,
-          preparation: NODE_PREPARATION_EXAMPLE,
+          ...JAVASCRIPT_EXPORT_SHAPE_COMPARISON_EXAMPLE,
+          left: retained(
+            JAVASCRIPT_EXPORT_SHAPE_COMPARISON_EXAMPLE.left.evidence_id,
+          ),
+          right: retained(
+            JAVASCRIPT_EXPORT_SHAPE_COMPARISON_EXAMPLE.right.evidence_id,
+          ),
         },
       },
     ],
   },
   {
-    name: "commit_reconstruction_coverage",
-    ...toolContractMetadata("commit_reconstruction_coverage"),
+    name: "build_reconstruction_obligation_ledger",
+    ...toolContractMetadata("build_reconstruction_obligation_ledger"),
     description:
-      "Atomically commit one canonical evidence-backed reconstruction coverage workspace revision under an approved root. CAS revisions reject lost updates; every Evidence and residual-unknown reference must resolve in the embedded canonical bundle.",
+      "Generate the complete deterministic ReconstructionObligationLedger from an authenticated Evidence bundle, reviewed obligations, and an explicit reconstruction manifest. Static candidates remain candidates; duplicate ownership, missing original or reconstruction cases, missing parser/type, weak verifier authority, unenumerated claims, contradictions, dependencies, and residual unknowns fail closed. The inline result carries the full-ledger closure digest and typed per-obligation diagnostics.",
     kind: "application",
-    inputSchema: reconstructionCoverageCommitInputSchema,
-    outputSchema: reconstructionCoverageCommitOutputSchema,
+    inputSchema: reconstructionObligationLedgerInputSchema,
+    outputSchema: reconstructionObligationLedgerOutputSchema,
     examples: [
       {
-        title: "Commit the first canonical coverage revision",
+        title: "Generate the complete obligation ledger",
         input: {
-          approved: true,
-          workspace_path: "/approved/coverage.json",
-          expected_revision: null,
-          workspace: COVERAGE_WORKSPACE_EXAMPLE,
+          evidence_bundle: {
+            artifacts: [],
+            providers: [],
+            environments: [],
+            scenarios: [],
+            captures: [],
+            unknowns: [],
+            records: [],
+          },
+          reviewed_obligations: [],
+          manifest: {
+            bindings: [],
+            contradictions: [],
+          },
         },
       },
     ],
   },
   {
-    name: "query_reconstruction_coverage",
-    ...toolContractMetadata("query_reconstruction_coverage"),
+    name: "evaluate_reconstruction_coverage",
+    ...toolContractMetadata("evaluate_reconstruction_coverage"),
     description:
-      "Evaluate one named reconstruction boundary from a canonical coverage workspace. Missing ownership or inventory is partial; stale, weak, truncated, skipped, or unresolved proof is unknown; contradictions, failed proof, missing owners, and authority routing fail closed.",
+      "Evaluate inline evidence-backed reconstruction coverage against one named boundary. Missing ownership or inventory is partial; stale, weak, truncated, skipped, unresolved, or conflicting tied verifier proof is unknown; contradictions, failed proof, missing owners, and authority routing fail closed.",
     kind: "application",
-    inputSchema: reconstructionCoverageQueryInputSchema,
+    inputSchema: reconstructionCoverageEvaluationInputSchema,
     outputSchema: reconstructionClosureResultSchema,
     examples: [
       {
         title: "Evaluate one replacement boundary",
         input: {
-          workspace_path: "/approved/coverage.json",
+          coverage: {
+            evidence_bundle: {
+              artifacts: [],
+              providers: [],
+              environments: [],
+              scenarios: [],
+              captures: [],
+              unknowns: [],
+              records: [],
+            },
+            artifacts: [],
+            surfaces: [],
+            owners: [],
+            claims: [],
+            verifier_contracts: [],
+            verifier_results: [],
+            residual_unknown_ids: [],
+            contradictions: [],
+            package_proofs: [],
+            boundaries: [
+              {
+                boundary_id: "replacement.cli",
+                title: "CLI replacement",
+                required_surface_ids: ["cli.help"],
+                required_claim_ids: ["claim.cli.help"],
+                required_package_proof_kinds: [
+                  "clean-install",
+                  "authority-independence",
+                ],
+                allowed_dispositions: [],
+                allowed_unknown_ids: [],
+              },
+            ],
+          },
           boundary_id: "replacement.cli",
         },
       },
     ],
   },
+  {
+    name: "project_android_application_graph",
+    ...toolContractMetadata("project_android_application_graph"),
+    description:
+      "Project authenticated APK inventory_artifact Evidence into an execution-free Android application inventory. Reports exact component paths and hashes, runtime-family hints, and path-based bridge hypotheses without decoding DEX, executing the APK, or claiming observed runtime calls.",
+    kind: "application",
+    inputSchema: androidApplicationProjectionInputSchema,
+    outputSchema: evidenceResultOf(androidApplicationProjectionResultSchema),
+    examples: [
+      {
+        title:
+          "Project APK inventory Evidence into an Android application graph",
+        input: ANDROID_APPLICATION_GRAPH_EXAMPLE,
+      },
+    ],
+  },
+  {
+    name: "project_apple_application_graph",
+    ...toolContractMetadata("project_apple_application_graph"),
+    description:
+      "Project authenticated IPA, macOS .app directory, ZIP, or DMG inventory Evidence into an execution-free Apple application inventory. Reports application roots, nested bundles with path-convention roles (app extensions, XPC services, login items, privileged helpers, system extensions, frameworks), launchd plists, exact component paths and hashes, runtime-family hints, and path-based bridge hypotheses without parsing plist/CMS semantics or claiming observed runtime calls.",
+    kind: "application",
+    inputSchema: appleApplicationProjectionInputSchema,
+    outputSchema: evidenceResultOf(appleApplicationProjectionResultSchema),
+    examples: [
+      {
+        title: "Project IPA inventory Evidence into an Apple application graph",
+        input: APPLE_APPLICATION_GRAPH_EXAMPLE,
+      },
+      {
+        title:
+          "Project a macOS .app directory inventory into its bundle anatomy",
+        input: MACOS_APPLICATION_GRAPH_EXAMPLE,
+      },
+    ],
+  },
+  {
+    name: "project_harmony_application_graph",
+    ...toolContractMetadata("project_harmony_application_graph"),
+    description:
+      "Project authenticated HarmonyOS HAP, HSP, or App Pack inventory Evidence into an execution-free application inventory. Reports packaging-model hints (Stage module.json versus FA config.json), exact component paths and hashes (manifests, Ark bytecode, resources, native libraries, JavaScript, signing), App Pack child packages, runtime-family hints, and path-based N-API bridge hypotheses without decoding Ark bytecode, parsing manifest semantics, or claiming observed runtime calls.",
+    kind: "application",
+    inputSchema: harmonyApplicationProjectionInputSchema,
+    outputSchema: evidenceResultOf(harmonyApplicationProjectionResultSchema),
+    examples: [
+      {
+        title:
+          "Project HAP inventory Evidence into a HarmonyOS application graph",
+        input: HARMONY_APPLICATION_GRAPH_EXAMPLE,
+      },
+    ],
+  },
 ] as const satisfies readonly ToolContract[];
+
+/** Resolve one named application contract without relying on array position. */
+export function applicationToolContract(
+  name: "trace_application_feature",
+): (typeof APPLICATION_TOOL_CONTRACTS)[0];
+export function applicationToolContract(
+  name: "trace_javascript_semantics",
+): (typeof APPLICATION_TOOL_CONTRACTS)[1];
+export function applicationToolContract(
+  name: "compare_application_versions",
+): (typeof APPLICATION_TOOL_CONTRACTS)[2];
+export function applicationToolContract(
+  name: "compare_source_to_bundle",
+): (typeof APPLICATION_TOOL_CONTRACTS)[3];
+export function applicationToolContract(
+  name: "compare_javascript_export_shapes",
+): (typeof APPLICATION_TOOL_CONTRACTS)[4];
+export function applicationToolContract(
+  name: "build_reconstruction_obligation_ledger",
+): (typeof APPLICATION_TOOL_CONTRACTS)[5];
+export function applicationToolContract(
+  name: "evaluate_reconstruction_coverage",
+): (typeof APPLICATION_TOOL_CONTRACTS)[6];
+export function applicationToolContract(
+  name: "project_android_application_graph",
+): (typeof APPLICATION_TOOL_CONTRACTS)[7];
+export function applicationToolContract(
+  name: "project_apple_application_graph",
+): (typeof APPLICATION_TOOL_CONTRACTS)[8];
+export function applicationToolContract(
+  name: "project_harmony_application_graph",
+): (typeof APPLICATION_TOOL_CONTRACTS)[9];
+export function applicationToolContract(
+  name: (typeof APPLICATION_TOOL_CONTRACTS)[number]["name"],
+): (typeof APPLICATION_TOOL_CONTRACTS)[number] {
+  const contract = APPLICATION_TOOL_CONTRACTS.find(
+    ({ name: candidate }) => candidate === name,
+  );
+  if (contract === undefined)
+    throw new Error(`Missing application tool contract: ${name}`);
+  return contract;
+}

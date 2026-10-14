@@ -1,34 +1,46 @@
 import { constants } from "node:fs";
-import { access, readFile, readdir } from "node:fs/promises";
-import { homedir } from "node:os";
-import { delimiter, join } from "node:path";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { access, readdir, stat } from "node:fs/promises";
+import { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
+import { homeDirectoryFromEnvironment } from "../config/homeDirectory.js";
+import { join } from "node:path";
 
-import { parseBinaryTarget } from "../domain/binaryTarget.js";
-import { probeHomebrew } from "./homebrew.js";
+import { analysisErrorRemediationAction } from "../domain/analysisErrorPresentation.js";
+import { BinaryTargetError } from "../domain/configurationErrors.js";
+import { parseBinaryTarget } from "./BinaryTargetResolver.js";
+import { execFileOutput } from "../process/ExecFileOutput.js";
+import type { JsonValue } from "../domain/jsonValue.js";
+import {
+  javaScriptRuntime,
+  type JavaScriptRuntime,
+} from "../domain/runtimeVersion.js";
+import { installedCaskAppdir, probeHomebrew } from "./homebrew.js";
 import {
   linuxHopperBinarySupported,
   linuxSharedLibrariesAvailable,
   readLinuxDistribution,
   type LinuxDistribution,
 } from "./LinuxHopper.js";
+import {
+  readInstalledSkillIdentity,
+  type InstalledSkillIdentity,
+} from "./SetupSkill.js";
 import { CATALOG_IDENTITY } from "../catalogIdentity.js";
 import { PRODUCT_IDENTITY, SDK_IDENTITY } from "../identity.js";
 import {
   readClientRegistrationStatuses,
   type ClientRegistrationStatus,
+  type UnhealthyClientRegistrationStatus,
 } from "./ClientRegistrationStatus.js";
-import {
-  inspectRuntimeExecutables,
-  type RuntimeExecutableInventory,
-} from "./RuntimeExecutableDiagnostics.js";
 import {
   collectDoctorDiagnostics,
   doctorHealthy,
 } from "./DoctorDiagnostics.js";
+import {
+  normalizeDoctorScope,
+  scopeDoctorChecks,
+  type DoctorScopeReport,
+} from "./DoctorScope.js";
 
-const execFileAsync = promisify(execFile);
 /** One actionable environment diagnostic. */
 export interface DoctorCheck {
   readonly name: string;
@@ -37,9 +49,11 @@ export interface DoctorCheck {
     | "healthy"
     | "missing_dependency"
     | "unsupported_host"
+    | "unsupported_target"
     | "missing_analysis_engine"
     | "config_drift";
   readonly detail?: string;
+  readonly details?: Readonly<Record<string, JsonValue>>;
   readonly remediation?: string;
 }
 
@@ -59,7 +73,8 @@ export interface DoctorProviderInspection {
   readonly configured: boolean;
   readonly available: boolean;
   readonly providerVersion: string | null;
-  /** Exact non-secret variables safe to persist in an approved registration. */
+  /** Adapter-validated non-secret settings, independent of runtime readiness.
+   * Invalid installations publish no settings. */
   readonly registrationEnvironment: Readonly<Record<string, string>>;
   readonly checks: readonly DoctorProviderCheck[];
 }
@@ -67,41 +82,49 @@ export interface DoctorProviderInspection {
 export interface DoctorHost {
   readonly platform: NodeJS.Platform;
   readonly architecture: NodeJS.Architecture;
-  readonly nodeVersion: string;
+  readonly runtime: JavaScriptRuntime;
+  readonly homeDirectory: string;
   readonly configuredHopperPath?: string;
   readonly configuredIlspyCmdPath?: string;
   macosVersion(): Promise<string | undefined>;
   linuxDistribution(): Promise<LinuxDistribution | undefined>;
   validTarget(path: string): Promise<boolean>;
+  /** Route-specific target admission details, when supplied by the host. */
+  inspectTarget?(path: string): Promise<DoctorCheck>;
   executable(path: string): Promise<boolean>;
   supportedLinuxHopper(path: string): Promise<boolean>;
-  linuxDemoRuntimeReady(): Promise<boolean>;
+  linuxDemoRuntimeCheck(): Promise<DoctorCheck>;
   brewHopperPath(): Promise<string | undefined>;
   manualHopperPaths(): Promise<readonly string[]>;
   providerInspections?(): Promise<readonly DoctorProviderInspection[]>;
   installationPaths?(): Promise<readonly string[]>;
-  installedSkillVersion?(): Promise<string | undefined>;
-  installedSkillIdentity?(): Promise<InstalledSkillIdentity | undefined>;
+  installedSkillIdentity?(
+    clientIds: readonly string[],
+  ): Promise<InstalledSkillIdentity | undefined>;
+  close?(): Promise<string | undefined>;
   clientRegistrations?(): Promise<readonly ClientRegistrationStatus[]>;
-  javascriptReplayCheck?(): Promise<DoctorCheck>;
   ilspyCmdVersion?(path: string): Promise<string | undefined>;
-  runtimeExecutables?(): Promise<RuntimeExecutableInventory>;
-}
-
-/** Parsed identity committed by an installed REA skill. */
-interface InstalledSkillIdentity {
-  readonly version: string | null;
-  readonly toolCount: number | null;
-  readonly catalogDigest: string | null;
 }
 
 /** Structured result returned by the read-only doctor workflow. */
 export interface DoctorReport {
   readonly healthy: boolean;
+  readonly environment_healthy: boolean;
+  readonly scope: DoctorScopeReport;
+  readonly scope_checks: readonly DoctorCheck[];
+  readonly informational_checks: readonly DoctorCheck[];
   readonly hopperPath?: string;
   readonly providerInspections?: readonly DoctorProviderInspection[];
   readonly checks: readonly DoctorCheck[];
   readonly identity?: DoctorIdentity;
+}
+
+/** Caller-selected readiness boundary; omitted values retain audit semantics. */
+export interface DoctorScope {
+  readonly clients?: readonly string[];
+  readonly skillClients?: readonly string[];
+  readonly providers?: readonly string[];
+  readonly skill?: boolean;
 }
 
 /** Installed-package, skill, client, and runtime identity observations. */
@@ -121,12 +144,10 @@ interface DoctorIdentity {
   readonly skill: {
     readonly installed_version: string | null;
     readonly installed_tool_count: number | null;
-    readonly installed_catalog_digest: string | null;
     readonly state: "aligned" | "stale" | "missing";
     readonly remediation: string | null;
   };
   readonly registrations: readonly ClientRegistrationStatus[];
-  readonly runtime_executables: RuntimeExecutableInventory | null;
 }
 
 /**
@@ -136,26 +157,75 @@ interface DoctorIdentity {
  */
 export const runDoctor = async (
   target?: string,
-  host: DoctorHost = systemDoctorHost(),
+  selectedHost?: DoctorHost,
+  requestedScope?: DoctorScope,
+): Promise<DoctorReport> =>
+  selectedHost === undefined
+    ? runDoctorOwned(target, systemDoctorHost(), requestedScope)
+    : inspectDoctor(target, selectedHost, requestedScope);
+
+/** Inspect with a host whose lifetime belongs to this operation. */
+export const runDoctorOwned = async (
+  target: string | undefined,
+  host: DoctorHost,
+  requestedScope?: DoctorScope,
 ): Promise<DoctorReport> => {
+  let report: DoctorReport;
+  try {
+    report = await inspectDoctor(target, host, requestedScope);
+  } catch (cause: unknown) {
+    const cleanup = await closeDoctorHost(host);
+    if (cleanup !== undefined)
+      throw new AggregateError(
+        [cause, new Error(cleanup)],
+        "Doctor failed and its resource cleanup remains incomplete.",
+        { cause },
+      );
+    throw cause;
+  }
+  const cleanup = await closeDoctorHost(host);
+  return cleanup === undefined
+    ? report
+    : doctorReportWithCleanup(report, cleanup);
+};
+
+const inspectDoctor = async (
+  target: string | undefined,
+  host: DoctorHost,
+  requestedScope?: DoctorScope,
+): Promise<DoctorReport> => {
+  const scope = normalizeDoctorScope(requestedScope, target);
   const {
     checks: diagnosticChecks,
     hopperPath,
     providerInspections,
-    runtimeExecutables,
   } = await collectDoctorDiagnostics(target, host);
-  const identity = await collectDoctorIdentity(host, runtimeExecutables);
+  const identity = await collectDoctorIdentity(host, scope);
   const checks = [...diagnosticChecks, ...identity.checks];
+  const providers = {
+    hopperAvailable:
+      hopperPath !== undefined &&
+      checks
+        .filter(({ name }) => name.startsWith("hopper"))
+        .every(({ ok }) => ok),
+    hopperConfigured: host.configuredHopperPath !== undefined,
+    providerInspections,
+  };
+  const environmentHealthy = doctorHealthy(checks, providers);
+  const scoped = scopeDoctorChecks({
+    checks,
+    registrations: identity.value.registrations,
+    skillState: identity.value.skill.state,
+    providers,
+    scope,
+  });
   return {
-    healthy: doctorHealthy(checks, {
-      hopperAvailable:
-        hopperPath !== undefined &&
-        checks
-          .filter(({ name }) => name.startsWith("hopper"))
-          .every(({ ok }) => ok),
-      hopperConfigured: host.configuredHopperPath !== undefined,
-      providerInspections,
-    }),
+    healthy: scope.mode === "audit-wide" ? environmentHealthy : scoped.healthy,
+    environment_healthy: environmentHealthy,
+    scope,
+    scope_checks: scope.mode === "audit-wide" ? checks : scoped.scopeChecks,
+    informational_checks:
+      scope.mode === "audit-wide" ? [] : scoped.informationalChecks,
     ...(hopperPath === undefined ? {} : { hopperPath }),
     ...(providerInspections === undefined ? {} : { providerInspections }),
     checks,
@@ -163,22 +233,61 @@ export const runDoctor = async (
   };
 };
 
+const closeDoctorHost = async (
+  host: DoctorHost,
+): Promise<string | undefined> => {
+  try {
+    return await host.close?.();
+  } catch (cause: unknown) {
+    return `Doctor host cleanup failed: ${cause instanceof Error ? cause.message : String(cause)}`;
+  }
+};
+
+const doctorReportWithCleanup = (
+  report: DoctorReport,
+  detail: string,
+): DoctorReport => {
+  const check: DoctorCheck = {
+    name: "doctor-resource-cleanup",
+    ok: false,
+    classification: "config_drift",
+    detail,
+    remediation: "Resolve the reported cleanup failure, then rerun rea doctor.",
+  };
+  return {
+    ...report,
+    healthy: false,
+    environment_healthy: false,
+    checks: [...report.checks, check],
+    scope_checks: [...report.scope_checks, check],
+  };
+};
+
 const collectDoctorIdentity = async (
   host: DoctorHost,
-  runtimeExecutables: RuntimeExecutableInventory | undefined,
+  scope: DoctorScopeReport,
 ): Promise<{
   readonly checks: readonly DoctorCheck[];
   readonly value: DoctorIdentity;
 }> => {
   const installationPaths = (await host.installationPaths?.()) ?? [];
-  const installedSkillIdentity = await readInstalledSkillIdentity(host);
-  const skillAligned = skillIdentityAligned(installedSkillIdentity);
   const registrations = (await host.clientRegistrations?.()) ?? [];
+  const skillClientIds =
+    scope.skill_clients ??
+    (scope.mode === "audit-wide"
+      ? registrations.map(({ client }) => client)
+      : scope.clients);
+  const installedSkillIdentity =
+    await host.installedSkillIdentity?.(skillClientIds);
+  const skillAligned = skillIdentityAligned(installedSkillIdentity);
   return {
     checks: [
       ...(skillAligned ? [] : [skillIdentityCheck(installedSkillIdentity)]),
       ...registrations
-        .filter(({ state }) => state !== "aligned")
+        .filter(
+          (registration): registration is UnhealthyClientRegistrationStatus =>
+            registration.state !== "aligned" && registration.state !== "manual",
+        )
         .map(registrationCheck),
     ],
     value: {
@@ -189,7 +298,7 @@ const collectDoctorIdentity = async (
       live_server: {
         state: "unknown",
         remediation:
-          "Compare rea://server/identity or binary_session from the active client; an on-disk registration cannot prove the running server version.",
+          "Call binary_session in the active client to inspect the running server identity.",
       },
       installations: {
         paths: installationPaths,
@@ -198,7 +307,6 @@ const collectDoctorIdentity = async (
       skill: {
         installed_version: installedSkillIdentity?.version ?? null,
         installed_tool_count: installedSkillIdentity?.toolCount ?? null,
-        installed_catalog_digest: installedSkillIdentity?.catalogDigest ?? null,
         state:
           installedSkillIdentity === undefined
             ? "missing"
@@ -210,20 +318,8 @@ const collectDoctorIdentity = async (
           : "Run rea setup to update the installed REA skill.",
       },
       registrations,
-      runtime_executables: runtimeExecutables ?? null,
     },
   };
-};
-
-const readInstalledSkillIdentity = async (
-  host: DoctorHost,
-): Promise<InstalledSkillIdentity | undefined> => {
-  const observed = await host.installedSkillIdentity?.();
-  if (observed !== undefined) return observed;
-  const legacyVersion = await host.installedSkillVersion?.();
-  return legacyVersion === undefined
-    ? undefined
-    : { version: legacyVersion, toolCount: null, catalogDigest: null };
 };
 
 const skillIdentityAligned = (
@@ -231,7 +327,7 @@ const skillIdentityAligned = (
 ): boolean =>
   identity?.version === PRODUCT_IDENTITY.skillVersion &&
   identity.toolCount === CATALOG_IDENTITY.counts.mcp_tools &&
-  identity.catalogDigest === CATALOG_IDENTITY.digests.combined_sha256;
+  identity.canonical;
 
 const skillIdentityCheck = (
   identity: InstalledSkillIdentity | undefined,
@@ -247,15 +343,13 @@ const skillIdentityCheck = (
 });
 
 const registrationCheck = (
-  registration: ClientRegistrationStatus,
+  registration: UnhealthyClientRegistrationStatus,
 ): DoctorCheck => ({
   name: `registration:${registration.client}`,
   ok: false,
   classification: "config_drift",
   detail: registration.config_path,
-  remediation:
-    registration.remediation ??
-    "Run rea setup, then restart the affected client.",
+  remediation: registration.remediation,
 });
 
 const installationState = (
@@ -265,171 +359,234 @@ const installationState = (
 
 /** Optional outer-adapter diagnostics composed without reversing dependencies. */
 export interface SystemDoctorHostOptions {
+  readonly platform?: NodeJS.Platform;
+  readonly architecture?: NodeJS.Architecture;
+  readonly environment?: NodeJS.ProcessEnv;
+  readonly execFileOutput?: typeof execFileOutput;
   readonly providerInspections?: () => Promise<
     readonly DoctorProviderInspection[]
   >;
-  readonly javascriptReplayCheck?: () => Promise<DoctorCheck>;
+  readonly linuxDemoRuntimeCheck?: () => Promise<DoctorCheck>;
 }
 
 /** Create diagnostics backed by the current process and host commands. */
 export const systemDoctorHost = (
   options: SystemDoctorHostOptions = {},
-): DoctorHost => ({
-  platform: process.platform,
-  architecture: process.arch,
-  nodeVersion: process.versions.node,
-  ...(process.env.HOPPER_LAUNCHER_PATH === undefined
-    ? {}
-    : { configuredHopperPath: process.env.HOPPER_LAUNCHER_PATH }),
-  ...(process.env.REA_ILSPY_CMD_PATH === undefined
-    ? {}
-    : { configuredIlspyCmdPath: process.env.REA_ILSPY_CMD_PATH }),
-  macosVersion: readMacosVersion,
-  linuxDistribution: readLinuxDistribution,
-  async validTarget(path) {
-    return (await parseBinaryTarget(path)).ok;
-  },
-  executable: executableAvailable,
-  linuxDemoRuntimeReady,
-  supportedLinuxHopper: linuxHopperBinarySupported,
-  async brewHopperPath() {
-    return probeHomebrew(async (command) => {
+): DoctorHost => {
+  const resources = new ArtifactResourceScope();
+  const platform = options.platform ?? process.platform;
+  const architecture = options.architecture ?? process.arch;
+  const environment = options.environment ?? process.env;
+  const hostExecFileOutput = options.execFileOutput ?? execFileOutput;
+  const homeDirectory = homeDirectoryFromEnvironment(environment, platform);
+  const commandEnvironment = { env: environment };
+  return {
+    platform,
+    architecture,
+    runtime: javaScriptRuntime(process.versions),
+    homeDirectory,
+    ...(environment.HOPPER_LAUNCHER_PATH === undefined
+      ? {}
+      : { configuredHopperPath: environment.HOPPER_LAUNCHER_PATH }),
+    ...(environment.REA_ILSPY_CMD_PATH === undefined
+      ? {}
+      : { configuredIlspyCmdPath: environment.REA_ILSPY_CMD_PATH }),
+    macosVersion: () =>
+      readMacosVersion(hostExecFileOutput, commandEnvironment),
+    linuxDistribution: readLinuxDistribution,
+    async validTarget(path) {
+      return (
+        await parseBinaryTarget(path, {
+          cwd: process.cwd(),
+          hostArchitecture: architecture,
+        })
+      ).ok;
+    },
+    async inspectTarget(path) {
+      const result = await parseBinaryTarget(path, {
+        cwd: process.cwd(),
+        hostArchitecture: architecture,
+      });
+      if (result.ok)
+        return {
+          name: "target",
+          ok: true,
+          classification: "healthy",
+          detail: path,
+        };
+      const error = result.error;
+      const targetError =
+        error instanceof BinaryTargetError ? error : undefined;
+      return {
+        name: "target",
+        ok: false,
+        classification:
+          targetError?.constraint !== undefined
+            ? "unsupported_target"
+            : "config_drift",
+        detail: path,
+        details: {
+          reason: targetError?.reason ?? error.message,
+          ...(targetError?.constraint === undefined
+            ? {}
+            : { constraint: targetError.constraint }),
+        },
+        remediation: analysisErrorRemediationAction(error),
+      };
+    },
+    executable: (path) =>
+      executableAvailable(
+        path,
+        platform,
+        hostExecFileOutput,
+        commandEnvironment,
+      ),
+    linuxDemoRuntimeCheck:
+      options.linuxDemoRuntimeCheck ?? uncomposedLinuxDemoRuntimeCheck,
+    supportedLinuxHopper: linuxHopperBinarySupported,
+    async brewHopperPath() {
+      return probeHomebrew(async (command) => {
+        let caskroom: string;
+        try {
+          // Without a cask argument, `--caskroom` does not load Homebrew's
+          // cask API, so doctor writes no Homebrew cache files.
+          caskroom = (
+            await hostExecFileOutput(
+              command,
+              ["--caskroom"],
+              commandEnvironment,
+            )
+          ).stdout.trim();
+        } catch (cause: unknown) {
+          // best-effort cleanup: optional Homebrew probing; absence means uninstalled.
+          void cause;
+          return undefined;
+        }
+        const appdir = await installedCaskAppdir(
+          caskroom,
+          "hopper-disassembler",
+          homeDirectory,
+        );
+        return appdir === undefined
+          ? undefined
+          : join(appdir, "Hopper Disassembler.app/Contents/MacOS/hopper");
+      });
+    },
+    manualHopperPaths: () => manualHopperPaths(homeDirectory),
+    ...(options.providerInspections === undefined
+      ? {}
+      : { providerInspections: options.providerInspections }),
+    async ilspyCmdVersion(path) {
       try {
-        const prefix = (
-          await execFileAsync(command, [
-            "--prefix",
-            "--cask",
-            "hopper-disassembler",
-          ])
-        ).stdout.trim();
-        return `${prefix}/Hopper Disassembler.app/Contents/MacOS/hopper`;
-      } catch {
+        await access(path, constants.X_OK);
+        return firstIlspyVersionLine(
+          (
+            await hostExecFileOutput(path, ["--version"], {
+              timeout: 10_000,
+              ...commandEnvironment,
+            })
+          ).stdout,
+        );
+      } catch (cause: unknown) {
+        // best-effort cleanup: optional version probing; failure means unavailable.
+        void cause;
         return undefined;
       }
-    });
-  },
-  manualHopperPaths,
-  ...(options.providerInspections === undefined
-    ? {}
-    : { providerInspections: options.providerInspections }),
-  ...(options.javascriptReplayCheck === undefined
-    ? {}
-    : { javascriptReplayCheck: options.javascriptReplayCheck }),
-  async ilspyCmdVersion(path) {
-    try {
-      await access(path, constants.X_OK);
-      return firstIlspyVersionLine(
-        (await execFileAsync(path, ["--version"], { timeout: 10_000 })).stdout,
-      );
-    } catch {
-      return undefined;
-    }
-  },
-  runtimeExecutables: () =>
-    inspectRuntimeExecutables({
-      platform: process.platform,
-      path: process.env.PATH ?? "",
-      launcherNode: process.execPath,
-      ...(process.env.PATHEXT === undefined
-        ? {}
-        : { pathExtensions: process.env.PATHEXT.split(delimiter) }),
-    }),
-  async installationPaths() {
-    try {
-      const command = process.platform === "win32" ? "where" : "which";
-      const arguments_ = process.platform === "win32" ? ["rea"] : ["-a", "rea"];
-      return uniqueLines((await execFileAsync(command, arguments_)).stdout);
-    } catch {
-      return [];
-    }
-  },
-  installedSkillVersion,
-  installedSkillIdentity,
-  clientRegistrations: () => readClientRegistrationStatuses(homedir()),
-});
+    },
+    async installationPaths() {
+      try {
+        const command = platform === "win32" ? "where" : "which";
+        const arguments_ = platform === "win32" ? ["rea"] : ["-a", "rea"];
+        return uniqueLines(
+          (await hostExecFileOutput(command, arguments_, commandEnvironment))
+            .stdout,
+        );
+      } catch (cause: unknown) {
+        // best-effort cleanup: optional path probing; failure means none found.
+        void cause;
+        return [];
+      }
+    },
+    installedSkillIdentity: (clientIds) =>
+      readInstalledSkillIdentity(
+        homeDirectory,
+        clientIds,
+        environment,
+        platform,
+        resources,
+      ),
+    close: async () => {
+      try {
+        await resources.close();
+        return undefined;
+      } catch (cause: unknown) {
+        return `Doctor resource cleanup failed: ${cause instanceof Error ? cause.message : String(cause)}`;
+      }
+    },
+    clientRegistrations: () =>
+      readClientRegistrationStatuses(homeDirectory, undefined, {
+        platform,
+        environment,
+        resources,
+      }),
+  };
+};
 
-const readMacosVersion = async (): Promise<string | undefined> => {
+const readMacosVersion = async (
+  run: typeof execFileOutput,
+  options: { readonly env: NodeJS.ProcessEnv },
+): Promise<string | undefined> => {
   try {
-    return (await execFileAsync("sw_vers", ["-productVersion"])).stdout.trim();
-  } catch {
+    return (await run("sw_vers", ["-productVersion"], options)).stdout.trim();
+  } catch (cause: unknown) {
+    // best-effort cleanup: optional OS version probing; failure means unknown.
+    void cause;
     return undefined;
   }
 };
 
-const executableAvailable = async (path: string): Promise<boolean> => {
+const executableAvailable = async (
+  path: string,
+  platform: NodeJS.Platform,
+  run: typeof execFileOutput,
+  options: { readonly env: NodeJS.ProcessEnv },
+): Promise<boolean> => {
   try {
     await access(path, constants.X_OK);
-    if (process.platform !== "linux") return true;
-    const linked = await execFileAsync("ldd", [path]);
+    if (!(await stat(path)).isFile()) return false;
+    if (platform !== "linux") return true;
+    const linked = await run("ldd", [path], options);
     return linuxSharedLibrariesAvailable(`${linked.stdout}\n${linked.stderr}`);
-  } catch {
+  } catch (cause: unknown) {
+    // best-effort cleanup: optional executable probing; failure means unavailable.
+    void cause;
     return false;
   }
 };
 
-const linuxDemoRuntimeReady = async (): Promise<boolean> => {
-  try {
-    await access("/usr/bin/Xvfb", constants.X_OK);
-    await access("/usr/bin/xauth", constants.X_OK);
-    await access("/usr/bin/python3", constants.X_OK);
-    await execFileAsync("/usr/bin/python3", [
-      "-c",
-      "import ctypes; ctypes.CDLL('libX11.so.6'); ctypes.CDLL('libXtst.so.6')",
-    ]);
-    return true;
-  } catch {
-    return false;
-  }
-};
+const uncomposedLinuxDemoRuntimeCheck = (): Promise<DoctorCheck> =>
+  Promise.resolve({
+    name: "hopper-demo-runtime",
+    ok: false,
+    classification: "config_drift",
+    detail: "Linux Hopper private-display diagnostics were not composed",
+    remediation: "Run rea doctor through the production CLI adapter.",
+  });
 
-const manualHopperPaths = async (): Promise<readonly string[]> => {
+const manualHopperPaths = async (home: string): Promise<readonly string[]> => {
   const paths: string[] = [];
-  for (const root of ["/Applications", join(homedir(), "Applications")]) {
+  for (const root of ["/Applications", join(home, "Applications")]) {
     try {
       for (const entry of await readdir(root, { withFileTypes: true })) {
         if (entry.isDirectory() && /^Hopper.*\.app$/i.test(entry.name))
           paths.push(join(root, entry.name, "Contents/MacOS/hopper"));
       }
-    } catch {
+    } catch (cause: unknown) {
       // A missing or unreadable optional application directory is not fatal.
+      void cause;
     }
   }
   return paths;
-};
-
-const readInstalledSkill = (): Promise<string> =>
-  readFile(
-    join(homedir(), ".agents/skills", PRODUCT_IDENTITY.skillName, "SKILL.md"),
-    "utf8",
-  );
-
-const installedSkillVersion = async (): Promise<string | undefined> => {
-  try {
-    return /^\s{2}version:\s*"([^"]+)"\s*$/mu.exec(
-      await readInstalledSkill(),
-    )?.[1];
-  } catch {
-    return undefined;
-  }
-};
-
-const installedSkillIdentity = async (): Promise<
-  InstalledSkillIdentity | undefined
-> => {
-  try {
-    const content = await readInstalledSkill();
-    const countText = /^\s{2}tool_count:\s*(\d+)\s*$/mu.exec(content)?.[1];
-    return {
-      version: /^\s{2}version:\s*"([^"]+)"\s*$/mu.exec(content)?.[1] ?? null,
-      toolCount:
-        countText === undefined ? null : Number.parseInt(countText, 10),
-      catalogDigest:
-        /^\s{2}catalog_digest:\s*"([a-f0-9]{64})"\s*$/mu.exec(content)?.[1] ??
-        null,
-    };
-  } catch {
-    return undefined;
-  }
 };
 
 const uniqueLines = (value: string): string[] => [

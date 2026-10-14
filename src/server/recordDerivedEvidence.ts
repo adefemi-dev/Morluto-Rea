@@ -1,10 +1,10 @@
-import type { BinarySessionPort } from "../application/BinarySession.js";
-import type { AnalysisError } from "../domain/errors.js";
+import type { BinarySessionPort } from "../application/binary/BinarySessionPort.js";
+import type { AnalysisError } from "../domain/analysisErrorBase.js";
 import type { Evidence } from "../domain/evidence.js";
 import type { RecordUnknownInput } from "../domain/residualUnknown.js";
 import { ok, type Result } from "../domain/result.js";
 
-/** Atomically record derived Evidence with an optional approved unknown. */
+/** Atomically record derived Evidence with an optional supported unknown. */
 export const recordDerivedEvidence = (
   session: BinarySessionPort,
   evidence: Evidence,

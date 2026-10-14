@@ -1,11 +1,11 @@
 import { z } from "incur";
 
-import { projectManagedApplicationGraphEvidence } from "../application/ManagedApplicationGraphService.js";
+import { projectManagedApplicationGraphEvidence } from "../application/managed/ManagedApplicationGraphService.js";
 import { CLI_COMMANDS } from "../cliCommandNames.js";
 import { parseCliJsonInput } from "../cliJsonInput.js";
 import { logCliCommand } from "../cliLogging.js";
-import { projectAnalysisError } from "../domain/errors.js";
-import type { Logger } from "../logger.js";
+import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
+import type { Logger } from "pino";
 import type { CliInstance } from "./types.js";
 
 /** Register managed static-Evidence application graph projection. */

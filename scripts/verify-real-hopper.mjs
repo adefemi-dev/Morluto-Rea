@@ -1,27 +1,55 @@
 import { execFile } from "node:child_process";
-import { readdir } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 
-import { TOOL_CONTRACTS } from "../dist/contracts/toolContracts.js";
 import {
   firstProcedureAddress,
   requireAddressArray,
   requireFunctionDossier,
   requirePseudocode,
 } from "../dist/application/RealHopperAssertions.js";
-import { HOPPER_PROVIDER_IDENTITY } from "../dist/hopper/HopperProvider.js";
+import { HOPPER_PROVIDER_IDENTITY } from "../dist/hopper/HopperProviderCapabilities.js";
+import { HOPPER_TARGET_LEASE_DIRECTORY } from "../dist/hopper/HopperTargetLease.js";
 import { REA_WORKFLOW_PROVIDER } from "../dist/application/InvestigationProviders.js";
 import { loadRealHopperFixtureTargets } from "./lib/real-hopper-fixture.mjs";
+import { verifyHopperStringObjects } from "./lib/real-hopper-search.mjs";
 import {
+  requireBridgeDiagnostic,
+  requireBridgeProgress,
   requireCurrentDocument,
   requireSafeDiagnostics,
+  requireTruthfulMemoryRegions,
   verifyRealHopperFixture,
 } from "./lib/real-hopper-semantic.mjs";
-import { openAndVerifyLargeFixture } from "./lib/real-hopper-pagination.mjs";
+import {
+  mcpTextValue,
+  requireEvidenceProvider,
+  requireMcpOperationResult,
+  requireMcpLifecycleResult,
+  requireMcpEvidenceResult,
+  sortVerifierNames,
+  requireWorkflowEvidenceProvider,
+} from "./lib/mcp-verifier-results.mjs";
+import {
+  verifyHopperTerminalInstructions,
+  verifyHopperFunctionBasics,
+} from "./lib/real-hopper-function-basics.mjs";
+import { openAndVerifyLargeFixture } from "./lib/real-hopper-exhaustive-search.mjs";
+import { completeVerifierRun, createVerifierRun } from "./lib/verifier-run.mjs";
+import { requireHopperSelection } from "./lib/real-hopper-selection.mjs";
+import { verifyHopperInventories } from "./lib/real-hopper-inventory.mjs";
+import {
+  verifyHopperBoundaryContracts,
+  verifyHopperLifecycleAndCli,
+} from "./lib/real-hopper-boundaries.mjs";
+import { startUnrelatedHopperSentinel } from "./lib/unrelated-hopper-sentinel.mjs";
+import { snapshotHopperRuntime } from "./lib/real-hopper-cleanup.mjs";
+import { verifyLinuxHopperOwnerExit } from "./lib/real-hopper-owner-exit.mjs";
 const execFileAsync = promisify(execFile);
+const verifierRun = createVerifierRun();
 const timeout = 180_000;
 const parseServerArgs = (encoded) => {
   const parsed = JSON.parse(encoded);
@@ -33,90 +61,13 @@ const parseServerArgs = (encoded) => {
   return parsed;
 };
 
-const sessionsBefore = new Set(
-  (await readdir("/tmp")).filter((name) => name.startsWith("rea-")),
+const runtimeParent = process.platform === "darwin" ? "/tmp" : tmpdir();
+const sessionsBefore = await snapshotHopperRuntime(
+  runtimeParent,
+  HOPPER_TARGET_LEASE_DIRECTORY,
 );
-const textValue = (result) => {
-  const text = result.content?.find((item) => item.type === "text")?.text;
-  if (typeof text !== "string") throw new Error("Tool result omitted text");
-  return text;
-};
-
-const jsonValue = (result) => JSON.parse(textValue(result));
-
-const requireSuccessfulTool = (result, operation) => {
-  if (result.isError === true) {
-    throw new Error(`${operation} failed: ${textValue(result)}`);
-  }
-  const value = jsonValue(result);
-  if (
-    value === null ||
-    typeof value !== "object" ||
-    !("normalized_result" in value)
-  ) {
-    throw new Error(`${operation} omitted its evidence result`);
-  }
-  return value.normalized_result;
-};
-
-const requireHopperEvidence = (result, operation) => {
-  const envelope = jsonValue(result);
-  if (
-    envelope?.provider?.id !== HOPPER_PROVIDER_IDENTITY.id ||
-    envelope?.analysis_profile?.provider?.id !== HOPPER_PROVIDER_IDENTITY.id ||
-    typeof envelope.analysis_profile.provider.version !== "string"
-  )
-    throw new Error(`${operation} omitted its concrete Hopper provenance`);
-};
-
-const requireHopperWorkflowEvidence = (result, operation) => {
-  const envelope = jsonValue(result);
-  const profile = envelope?.analysis_profile;
-  const upstream = profile?.parameters?.upstream_analysis_profile;
-  if (
-    envelope?.provider?.id !== REA_WORKFLOW_PROVIDER.id ||
-    profile?.provider?.id !== REA_WORKFLOW_PROVIDER.id ||
-    upstream?.provider?.id !== HOPPER_PROVIDER_IDENTITY.id ||
-    typeof upstream.provider.version !== "string"
-  ) {
-    throw new Error(
-      `${operation} omitted its composed workflow or upstream Hopper provenance`,
-    );
-  }
-};
-
-const requireHopperSelection = (status, expected) => {
-  const candidates = status.analysis_provider_candidates;
-  const hopper = Array.isArray(candidates)
-    ? candidates.find(
-        (candidate) => candidate?.provider?.id === HOPPER_PROVIDER_IDENTITY.id,
-      )
-    : undefined;
-  if (
-    hopper === undefined ||
-    hopper.availability?.status !== "available" ||
-    hopper.target_support?.status !== expected.targetSupport ||
-    hopper.selected !== expected.selected
-  ) {
-    throw new Error("binary_session omitted truthful Hopper candidate status");
-  }
-  if (!expected.selected) {
-    if (status.analysis_provider_binding !== null)
-      throw new Error("Target-free status unexpectedly selected a provider");
-    return null;
-  }
-  const binding = status.analysis_provider_binding;
-  if (
-    binding?.provider?.id !== HOPPER_PROVIDER_IDENTITY.id ||
-    typeof binding.provider.version !== "string" ||
-    binding.selection_source !== "auto-single-candidate" ||
-    binding.analysis_profile?.provider?.id !== HOPPER_PROVIDER_IDENTITY.id ||
-    binding.analysis_profile.provider.version !== binding.provider.version
-  ) {
-    throw new Error("binary_session omitted its concrete Hopper binding");
-  }
-  return binding;
-};
+const ownedProcessIds = new Set();
+const textValue = mcpTextValue;
 
 const requireOverview = (value, operation) => {
   if (
@@ -135,35 +86,11 @@ const requireOverview = (value, operation) => {
   return value;
 };
 
-const requireTruthfulMemoryRegions = (segments) => {
-  if (!Array.isArray(segments) || segments.length === 0) {
-    throw new Error("list_segments returned no real memory regions");
-  }
-  const regions = segments.flatMap((segment) => [
-    segment,
-    ...(Array.isArray(segment.sections) ? segment.sections : []),
-  ]);
-  for (const region of regions) {
-    for (const permission of ["readable", "writable", "executable"]) {
-      if (![true, false, null].includes(region?.[permission])) {
-        throw new Error(`list_segments omitted tri-state ${permission}`);
-      }
-    }
-    if (
-      region.provenance !== "hopper-public-python-api" ||
-      region.permissions?.available !== false ||
-      typeof region.permissions.reason !== "string"
-    ) {
-      throw new Error("list_segments omitted permission provenance");
-    }
-  }
-};
-
 const verifyRelationships = async (client, options, procedure) => {
   const related = {};
   for (const operation of ["procedure_callers", "procedure_callees"]) {
     related[operation] = requireAddressArray(
-      requireSuccessfulTool(
+      requireMcpEvidenceResult(
         await client.callTool(
           { name: operation, arguments: { procedure } },
           options,
@@ -174,7 +101,7 @@ const verifyRelationships = async (client, options, procedure) => {
     );
   }
   related.xrefs = requireAddressArray(
-    requireSuccessfulTool(
+    requireMcpEvidenceResult(
       await client.callTool(
         { name: "xrefs", arguments: { address: procedure } },
         options,
@@ -186,54 +113,64 @@ const verifyRelationships = async (client, options, procedure) => {
   return related;
 };
 
-const verifyCurrentTarget = async (client, options) => {
-  const procedures = requireSuccessfulTool(
-    await client.callTool({ name: "list_procedures", arguments: {} }, options),
-    "list_procedures",
+const verifyByteAccess = async (client, options, firstAddress) => {
+  const byteRead = requireMcpEvidenceResult(
+    await client.callTool(
+      { name: "read_bytes", arguments: { address: firstAddress, length: 16 } },
+      options,
+    ),
+    "read_bytes",
   );
-  const firstAddress = firstProcedureAddress(procedures);
-  const containment = requireSuccessfulTool(
+  if (
+    byteRead?.address !== firstAddress ||
+    byteRead.requested_bytes !== 16 ||
+    byteRead.returned_bytes !== 16 ||
+    byteRead.complete !== true ||
+    !/^[a-f0-9]{32}$/u.test(byteRead.bytes_hex)
+  ) {
+    throw new Error("read_bytes returned an invalid bounded byte window");
+  }
+  const mappedOffset = requireMcpEvidenceResult(
     await client.callTool(
       {
-        name: "resolve_containing_procedure",
+        name: "address_to_file_offset",
         arguments: { address: firstAddress },
       },
       options,
     ),
-    "resolve_containing_procedure",
+    "address_to_file_offset",
   );
   if (
-    containment?.found !== true ||
-    containment.procedure?.address !== firstAddress
+    mappedOffset?.address !== firstAddress ||
+    !Number.isSafeInteger(mappedOffset.file_offset) ||
+    mappedOffset.file_offset < 0
   ) {
-    throw new Error(
-      "resolve_containing_procedure returned the wrong procedure",
-    );
+    throw new Error("address_to_file_offset returned an invalid mapping");
   }
-  const references = requireSuccessfulTool(
-    await client.callTool(
-      {
-        name: "procedure_references",
-        arguments: {
-          procedure: firstAddress,
-          direction: "outgoing",
-          limit: 10,
-          max_instructions: 100,
-        },
-      },
-      options,
-    ),
-    "procedure_references",
+  return {
+    byteReadCount: byteRead.returned_bytes,
+    mappedFileOffset: mappedOffset.file_offset,
+  };
+};
+
+const verifyCurrentTarget = async (client, options) => {
+  const procedures = requireMcpEvidenceResult(
+    await client.callTool({ name: "list_procedures", arguments: {} }, options),
+    "list_procedures",
   );
-  if (!Array.isArray(references?.references?.items)) {
-    throw new Error("procedure_references returned an invalid bounded result");
-  }
+  const firstAddress = firstProcedureAddress(procedures);
+  const byteAccess = await verifyByteAccess(client, options, firstAddress);
+  const basics = await verifyHopperFunctionBasics(
+    client,
+    options,
+    firstAddress,
+  );
   const relationships = await verifyRelationships(
     client,
     options,
     firstAddress,
   );
-  const boundedResult = requireSuccessfulTool(
+  const boundedResult = requireMcpEvidenceResult(
     await client.callTool(
       {
         name: "batch_decompile",
@@ -262,7 +199,7 @@ const verifyCurrentTarget = async (client, options) => {
     "batch_decompile",
   );
   const dossier = requireFunctionDossier(
-    requireSuccessfulTool(
+    requireMcpEvidenceResult(
       await client.callTool(
         {
           name: "analyze_function",
@@ -278,17 +215,19 @@ const verifyCurrentTarget = async (client, options) => {
     procedure: dossier.procedure,
     procedureCount: procedures.total,
     boundedPseudocodeChars: boundedPseudocode.length,
-    analyzedPseudocodeChars: [...dossier.pseudocode.text].length,
+    analyzedPseudocodeChars: [...dossier.pseudocode].length,
     callerCount: relationships.procedure_callers.length,
     calleeCount: relationships.procedure_callees.length,
     xrefCount: relationships.xrefs.length,
-    outgoingReferenceCount: references.references.items.length,
+    outgoingReferenceCount: basics.outgoingReferenceCount,
+    instructionWindowCount: basics.instructionWindowCount,
+    ...byteAccess,
   };
 };
 
-const fixtureManifestPath = process.env.REA_HOPPER_CONFORMANCE_MANIFEST_PATH;
-if (!fixtureManifestPath)
-  throw new Error("REA_HOPPER_CONFORMANCE_MANIFEST_PATH is required");
+const fixtureManifestPath =
+  process.env.REA_HOPPER_CONFORMANCE_MANIFEST_PATH ??
+  "build/conformance/manifest.json";
 const fixtureTargets = await loadRealHopperFixtureTargets(fixtureManifestPath);
 const targetA = fixtureTargets.primary.path;
 const targetB = fixtureTargets.secondary.path;
@@ -318,28 +257,46 @@ let stderrBytes = 0;
 const stderrChunks = [];
 transport.stderr?.on("data", (chunk) => {
   stderrBytes += chunk.length;
-  if (stderrBytes <= 16_384) stderrChunks.push(chunk.toString("utf8"));
+  stderrChunks.push(chunk.toString("utf8"));
 });
 const client = new Client({ name: "real-hopper-verifier", version: "1.0.0" });
+const unrelatedHopper = await startUnrelatedHopperSentinel();
+let unrelatedHopperSurvived = false;
 let summary;
 
 try {
   await client.connect(transport);
+  if (transport.pid === null)
+    throw new Error("The verifier did not capture its MCP process identity");
+  ownedProcessIds.add(transport.pid);
+  const progressUpdates = [];
+  const options = {
+    timeout,
+    onprogress: (update) => progressUpdates.push(update),
+  };
+  const fullSessionStatus = () =>
+    client.callTool({ name: "binary_session", arguments: {} }, options);
+  const initialSession = await fullSessionStatus();
+  const initialStatus = requireMcpLifecycleResult(
+    initialSession,
+    "binary_session",
+  );
   const listed = await client.listTools();
-  const expectedNames = TOOL_CONTRACTS.map(({ name }) => name).sort();
-  const actualNames = listed.tools.map(({ name }) => name).sort();
+  const availableTools = initialStatus.tool_availability;
+  if (!Array.isArray(availableTools))
+    throw new Error("The real session omitted tool availability");
+  const expectedNames = sortVerifierNames(
+    availableTools.map(({ name }) => name),
+  );
+  const actualNames = sortVerifierNames(listed.tools.map(({ name }) => name));
   if (JSON.stringify(actualNames) !== JSON.stringify(expectedNames)) {
+    const expected = new Set(expectedNames);
+    const actual = new Set(actualNames);
     throw new Error(
-      "The real server tool inventory did not match its contracts",
+      `The real server tool catalog diverged from session capability inventory (untracked tools: ${actualNames.filter((name) => !expected.has(name)).join(", ") || "none"}; missing catalog tools: ${expectedNames.filter((name) => !actual.has(name)).join(", ") || "none"})`,
     );
   }
 
-  const options = { timeout };
-  const initialSession = await client.callTool(
-    { name: "binary_session", arguments: {} },
-    options,
-  );
-  const initialStatus = jsonValue(initialSession);
   if (initialStatus.open !== false)
     throw new Error("The verifier did not start without a target");
   requireHopperSelection(initialStatus, {
@@ -351,8 +308,9 @@ try {
     options,
   );
   if (opened.isError === true) throw new Error(textValue(opened));
-  const firstStatus = jsonValue(
-    await client.callTool({ name: "binary_session", arguments: {} }, options),
+  const firstStatus = requireMcpLifecycleResult(
+    await fullSessionStatus(),
+    "binary_session",
   );
   const providerBinding = requireHopperSelection(firstStatus, {
     targetSupport: "supported",
@@ -362,20 +320,40 @@ try {
     { name: "list_documents", arguments: {} },
     options,
   );
+  requireMcpEvidenceResult(documents, "list_documents");
+  requireBridgeProgress(progressUpdates);
+  const rejectedProcedure = await client.callTool(
+    {
+      name: "procedure_info",
+      arguments: { procedure: "__rea_missing_procedure__" },
+    },
+    options,
+  );
+  if (rejectedProcedure.isError !== true)
+    throw new Error("The real Hopper bridge accepted an unknown procedure");
   const overview = await client.callTool(
     { name: "binary_overview", arguments: {} },
     options,
   );
-  requireHopperEvidence(documents, "list_documents");
-  requireHopperWorkflowEvidence(overview, "binary_overview");
+  requireMcpEvidenceResult(overview, "binary_overview");
+  const inventoryCounts = await verifyHopperInventories(client, options);
+  requireEvidenceProvider(
+    documents,
+    "list_documents",
+    HOPPER_PROVIDER_IDENTITY.id,
+  );
+  requireWorkflowEvidenceProvider(overview, "binary_overview", {
+    workflowProviderId: REA_WORKFLOW_PROVIDER.id,
+    upstreamProviderId: HOPPER_PROVIDER_IDENTITY.id,
+  });
   const segments = await client.callTool(
     { name: "list_segments", arguments: {} },
     options,
   );
   requireTruthfulMemoryRegions(
-    requireSuccessfulTool(segments, "list_segments"),
+    requireMcpEvidenceResult(segments, "list_segments"),
   );
-  const firstDocuments = requireSuccessfulTool(documents, "list_documents");
+  const firstDocuments = requireMcpEvidenceResult(documents, "list_documents");
   if (
     !Array.isArray(firstDocuments) ||
     firstDocuments.length === 0 ||
@@ -386,27 +364,38 @@ try {
     client,
     options,
     firstDocuments,
-    requireSuccessfulTool,
+    requireMcpEvidenceResult,
   );
   const firstOverview = requireOverview(
-    requireSuccessfulTool(overview, "binary_overview"),
+    requireMcpEvidenceResult(overview, "binary_overview"),
     "binary_overview",
   );
+  if (firstOverview.document !== currentDocument)
+    throw new Error(
+      "binary_overview did not identify the selected Hopper document",
+    );
   const firstAnalysis = await verifyCurrentTarget(client, options);
   const fixtureAnalysis = await verifyRealHopperFixture({
     client,
     options,
     document: currentDocument,
     oracle: fixtureTargets.oracle,
-    normalizedResult: requireSuccessfulTool,
+    normalizedResult: requireMcpEvidenceResult,
   });
+  const boundaryContracts = await verifyHopperBoundaryContracts(
+    client,
+    options,
+    fixtureAnalysis.procedures.entry,
+    targetA,
+  );
   const switched = await client.callTool(
     { name: "open_binary", arguments: { path: targetB } },
     options,
   );
   if (switched.isError === true) throw new Error(textValue(switched));
-  const secondSession = jsonValue(
-    await client.callTool({ name: "binary_session", arguments: {} }, options),
+  const secondSession = requireMcpLifecycleResult(
+    await fullSessionStatus(),
+    "binary_session",
   );
   if (secondSession.path !== targetB)
     throw new Error("The real session did not switch to target B");
@@ -419,14 +408,53 @@ try {
     options,
   );
   const verifiedSecondOverview = requireOverview(
-    requireSuccessfulTool(secondOverview, "binary_overview"),
+    requireMcpEvidenceResult(secondOverview, "binary_overview"),
     "binary_overview after target switch",
   );
   const secondAnalysis = await verifyCurrentTarget(client, options);
-  const largePagination = await openAndVerifyLargeFixture({
+  const documentsAfterTargetSwitch = requireMcpEvidenceResult(
+    await client.callTool({ name: "list_documents", arguments: {} }, options),
+    "list_documents",
+  );
+  const secondDocument = await requireCurrentDocument(
     client,
     options,
-    normalizedResult: requireSuccessfulTool,
+    documentsAfterTargetSwitch,
+    requireMcpEvidenceResult,
+  );
+  if (verifiedSecondOverview.document !== secondDocument)
+    throw new Error(
+      "binary_overview retained another document after target switch",
+    );
+  const expectedDocumentsAfterTargetSwitch = firstDocuments.length;
+  if (
+    !Array.isArray(documentsAfterTargetSwitch) ||
+    documentsAfterTargetSwitch.length !== expectedDocumentsAfterTargetSwitch
+  )
+    throw new Error(
+      "Target switching did not replace the previous Hopper document",
+    );
+  const reopenedTarget = await client.callTool(
+    { name: "open_binary", arguments: { path: targetB } },
+    options,
+  );
+  if (reopenedTarget.isError === true)
+    throw new Error(textValue(reopenedTarget));
+  const documentsAfterReopen = requireMcpEvidenceResult(
+    await client.callTool({ name: "list_documents", arguments: {} }, options),
+    "list_documents",
+  );
+  if (
+    !Array.isArray(documentsAfterReopen) ||
+    documentsAfterReopen.length !== documentsAfterTargetSwitch.length
+  )
+    throw new Error(
+      "Reopening the same target created a duplicate Hopper document",
+    );
+  const largeInventory = await openAndVerifyLargeFixture({
+    client,
+    options,
+    normalizedResult: requireMcpEvidenceResult,
     path: largeTarget,
     expectedCount: fixtureTargets.largeOracle.symbolCount,
     symbolPrefix: fixtureTargets.largeOracle.symbolPrefix,
@@ -442,18 +470,52 @@ try {
       "Hopper's bundled MCP server was running during verification",
     );
   }
-  const diagnosticCount = requireSafeDiagnostics(stderrChunks);
-
   const closed = await client.callTool(
     { name: "close_binary", arguments: {} },
     options,
   );
   if (closed.isError === true) throw new Error(textValue(closed));
-  const closedSession = jsonValue(
-    await client.callTool({ name: "binary_session", arguments: {} }, options),
+  let unicodeStrings = null;
+  let terminalInstructions = null;
+  if (fixtureTargets.unicode !== undefined) {
+    const call = async (name, args = {}) =>
+      requireMcpOperationResult(
+        await client.callTool({ name, arguments: args }, options),
+        name,
+      );
+    await call("open_binary", { path: fixtureTargets.unicode.path });
+    terminalInstructions = await verifyHopperTerminalInstructions(call);
+    unicodeStrings = await verifyHopperStringObjects(call, [
+      { value: "REA_UTF16_é_😀", encoding: "utf-16-le" },
+      { value: 'REA_UTF16_ESCAPED_é_"\\line\nend\t\r', encoding: "utf-16-le" },
+      { value: "\nREA_UTF16_LEADING_é", encoding: "utf-16-le" },
+    ]);
+    await call("close_binary");
+  }
+  const lifecycleAndCli = await verifyHopperLifecycleAndCli(client, options, {
+    primary: targetA,
+    secondary: targetB,
+    ...(fixtureTargets.unicode === undefined
+      ? {}
+      : { unicode: fixtureTargets.unicode.path }),
+    ownedProcessIds,
+  });
+  const closedSession = requireMcpLifecycleResult(
+    await fullSessionStatus(),
+    "binary_session",
   );
   if (closedSession.open !== false)
     throw new Error("The real session remained open after close_binary");
+  const diagnosticCount = requireSafeDiagnostics(
+    stderrChunks,
+    [
+      "procedure_info",
+      "batch_decompile",
+      ...boundaryContracts.rejectedOperations,
+    ],
+    ["HopperRemoteError", "HopperCancelledError", "AnalysisCancelledError"],
+  );
+  requireBridgeDiagnostic(stderrChunks);
 
   summary = {
     toolCount: actualNames.length,
@@ -462,17 +524,25 @@ try {
     segmentCount: firstOverview.segment_count,
     analyses: [firstAnalysis, secondAnalysis],
     fixtureAnalysis,
-    largePagination,
+    unicodeStrings,
+    terminalInstructions,
+    boundaryContracts,
+    lifecycleAndCli,
+    inventoryCounts,
+    largeInventory,
     fixtureManifest: fixtureTargets.manifestPath,
     bundledMcpRunning,
     stderrBytes,
     diagnosticCount,
+    bridgeProgressUpdates: progressUpdates.length,
     dynamicSession: true,
     providerBinding,
     targets: [targetA, targetB, largeTarget],
     targetHashes: [targetHashA, targetHashB, fixtureTargets.large.sha256],
     switched: true,
     secondOverview: verifiedSecondOverview,
+    documentCountAfterTargetSwitch: documentsAfterTargetSwitch.length,
+    documentCountAfterSameTargetReopen: documentsAfterReopen.length,
   };
 } finally {
   const keepAlive = setInterval(() => undefined, 100);
@@ -481,38 +551,61 @@ try {
     await transport.close();
   } finally {
     clearInterval(keepAlive);
+    unrelatedHopperSurvived = await unrelatedHopper.verifyAndClose();
   }
 }
 
 await new Promise((resolve) => setTimeout(resolve, 500));
-const sessionsAfter = (await readdir("/tmp")).filter(
-  (name) => name.startsWith("rea-") && !sessionsBefore.has(name),
-);
+const sessionsAfter = [
+  ...(await snapshotHopperRuntime(
+    runtimeParent,
+    HOPPER_TARGET_LEASE_DIRECTORY,
+    ownedProcessIds,
+  )),
+]
+  .filter((path) => !sessionsBefore.has(path))
+  .sort();
 if (sessionsAfter.length > 0) {
-  throw new Error("The MCP runtime leaked a bridge session directory");
-}
-const afterCloseProcesses = await execFileAsync("ps", [
-  "-ax",
-  "-o",
-  "command=",
-]);
-if (
-  afterCloseProcesses.stdout
-    .split("\n")
-    .some((line) => line.includes("node dist/main.js"))
-) {
+  await writeVerificationReport({
+    ...summary,
+    unrelatedHopperSurvived,
+    cleanShutdown: false,
+    retainedRuntimePaths: sessionsAfter,
+  });
   throw new Error(
-    "The TypeScript MCP server remained alive after client close",
+    `The MCP runtime retained Hopper resources: ${sessionsAfter.join(", ")}`,
   );
 }
 if (summary === undefined)
   throw new Error("Real-Hopper verification did not produce a summary");
-await new Promise((resolve, reject) => {
-  process.stdout.write(
-    `${JSON.stringify({ ...summary, cleanShutdown: true }, null, 2)}\n`,
-    (cause) => {
+if (process.platform === "linux")
+  summary.ownerExit = await verifyLinuxHopperOwnerExit({
+    primary: targetA,
+    secondary: targetB,
+    serverCommand,
+    serverArgs,
+    environment: serverEnvironment,
+  });
+const completedVerifierRun = await completeVerifierRun(verifierRun);
+if (
+  completedVerifierRun.process_lineage.status !== "verified" ||
+  completedVerifierRun.process_lineage.descendants.length !== 0
+)
+  throw new Error(
+    "The verifier's process lineage did not prove owned child cleanup",
+  );
+await writeVerificationReport({
+  verifier_run: completedVerifierRun,
+  ...summary,
+  unrelatedHopperSurvived,
+  cleanShutdown: true,
+});
+
+async function writeVerificationReport(report) {
+  await new Promise((resolve, reject) => {
+    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`, (cause) => {
       if (cause) reject(cause);
       else resolve();
-    },
-  );
-});
+    });
+  });
+}

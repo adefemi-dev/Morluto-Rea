@@ -1,23 +1,34 @@
 import { parse } from "@babel/parser";
 import * as t from "@babel/types";
 
-import type { WebPageInspection } from "./browserObservation.js";
-import type {
-  AnalyzeWebBundleInput,
-  WebBundleAnalysis,
-} from "./webBundleAnalysis.js";
+import { sanitizeEndpointCandidate } from "./browserObservation.js";
+import { compositeKey } from "./unicodeCodePointOrder.js";
+import type { WebPageInspection } from "./browserObservationSchemas.js";
+import type { WebBundleAnalysis } from "./webBundleAnalysis.js";
+import {
+  completeSemanticSteps,
+  traverseJavaScriptAst,
+} from "./javascript/javascriptSemanticTraversal.js";
+import {
+  classifyParsedJavaScriptOpenReceivers,
+  classifyParsedJavaScriptRpcClientRootsSteps,
+} from "./javascript/javascriptSemanticAnalysis.js";
+import type { JavaScriptOpenReceiverFact } from "./javascript/javascriptSemanticAnalysis.js";
+import { semanticStaticPropertyName } from "./javascript/javascriptAstValues.js";
 import {
   calleeName,
   endpointArgument,
+  stringValue,
+} from "./javascript/javascriptStaticAnalysisHelpers.js";
+import {
   location,
   locationFields,
   objectString,
   objectValue,
-  propertyName,
   resolveSpecifier,
-  sanitizeCandidate,
-  stringArgument,
+  isUrlLikeModuleSpecifier,
 } from "./webBundleAnalyzerAst.js";
+import { createJavaScriptRpcScan } from "./javascript/javascriptRpcEndpoints.js";
 
 type BundleObservations = WebBundleAnalysis["observations"];
 type ChunkEdge = BundleObservations["chunks"]["edges"][number];
@@ -40,13 +51,10 @@ export interface AnalysisAccumulator {
   visitedNodes: number;
   parsedScripts: number;
   parseFailures: number;
-  droppedFindings: number;
-  astLimitReached: boolean;
 }
 
 export const analyzeScript = (
   script: IncludedScript,
-  input: AnalyzeWebBundleInput,
   accumulator: AnalysisAccumulator,
 ): void => {
   let file: ReturnType<typeof parse>;
@@ -56,24 +64,34 @@ export const analyzeScript = (
       errorRecovery: true,
       plugins: ["jsx", "typescript"],
     });
-  } catch {
+  } catch (cause: unknown) {
+    // Unparseable scripts are counted; the failure needs no extra detail.
+    void cause;
     accumulator.parseFailures += 1;
     return;
   }
   accumulator.parsedScripts += 1;
-  detectVendorFingerprints(
-    script,
-    accumulator,
-    input.analysis_limits.max_findings,
+  detectVendorFingerprints(script, accumulator);
+  const openReceiverFacts = classifyParsedJavaScriptOpenReceivers(file);
+  const rpc = createJavaScriptRpcScan(
+    script.source.artifact.text,
+    completeSemanticSteps(classifyParsedJavaScriptRpcClientRootsSteps(file)),
   );
-  t.traverseFast(file, (node) => {
-    accumulator.visitedNodes += 1;
-    if (accumulator.visitedNodes > input.analysis_limits.max_ast_nodes) {
-      accumulator.astLimitReached = true;
-      return t.traverseFast.stop;
-    }
-    inspectNode(script, node, accumulator, input.analysis_limits.max_findings);
-    return undefined;
+  traverseJavaScriptAst(file, {
+    enter: (node) => {
+      accumulator.visitedNodes += 1;
+      inspectNode(script, node, accumulator, openReceiverFacts);
+      const endpoint = rpc.inspect(node);
+      if (endpoint !== undefined)
+        addFinding({
+          collection: accumulator.endpoints,
+          script,
+          rawValue: endpoint.value,
+          mechanism: endpoint.mechanism,
+          node,
+          accumulator,
+        });
+    },
   });
 };
 
@@ -81,7 +99,7 @@ const inspectNode = (
   script: IncludedScript,
   node: t.Node,
   accumulator: AnalysisAccumulator,
-  maximumFindings: number,
+  openReceiverFacts: ReadonlyMap<number, JavaScriptOpenReceiverFact>,
 ): void => {
   if (
     (t.isImportDeclaration(node) || t.isExportAllDeclaration(node)) &&
@@ -93,7 +111,6 @@ const inspectNode = (
       kind: "static_import",
       node,
       accumulator,
-      maximumFindings,
     });
   else if (t.isExportNamedDeclaration(node) && node.source != null)
     addEdge({
@@ -102,7 +119,6 @@ const inspectNode = (
       kind: "static_import",
       node,
       accumulator,
-      maximumFindings,
     });
   else if (t.isImportExpression(node) && t.isStringLiteral(node.source))
     addEdge({
@@ -111,22 +127,24 @@ const inspectNode = (
       kind: "dynamic_import",
       node,
       accumulator,
-      maximumFindings,
     });
-  if (t.isObjectProperty(node))
-    inspectRouteProperty(script, node, accumulator, maximumFindings);
-  if (t.isCallExpression(node) || t.isNewExpression(node))
-    inspectCall(script, node, accumulator, maximumFindings);
+  if (t.isObjectProperty(node)) inspectRouteProperty(script, node, accumulator);
+  if (
+    t.isCallExpression(node) ||
+    t.isOptionalCallExpression(node) ||
+    t.isNewExpression(node)
+  )
+    inspectCall(script, node, accumulator, openReceiverFacts);
 };
 
 const inspectCall = (
   script: IncludedScript,
-  node: t.CallExpression | t.NewExpression,
+  node: t.CallExpression | t.OptionalCallExpression | t.NewExpression,
   accumulator: AnalysisAccumulator,
-  maximumFindings: number,
+  openReceiverFacts: ReadonlyMap<number, JavaScriptOpenReceiverFact>,
 ): void => {
   const name = calleeName(node.callee);
-  const first = stringArgument(node.arguments[0]);
+  const first = stringValue(node.arguments[0]);
   if ((name === "require" || name.endsWith(".require")) && first !== undefined)
     addEdge({
       script,
@@ -134,20 +152,13 @@ const inspectCall = (
       kind: "require",
       node,
       accumulator,
-      maximumFindings,
     });
-  if (
-    (name === "importScripts" || name.endsWith(".importScripts")) &&
-    first !== undefined
-  )
-    addEdge({
-      script,
-      specifier: first,
-      kind: "worker_import",
-      node,
-      accumulator,
-      maximumFindings,
-    });
+  if (name === "importScripts" || name.endsWith(".importScripts"))
+    for (const argument of node.arguments) {
+      const specifier = stringValue(argument);
+      if (specifier === undefined) continue;
+      addEdge({ script, specifier, kind: "worker_import", node, accumulator });
+    }
   if (
     routeCallNames.some(
       (candidate) => name === candidate || name.endsWith(`.${candidate}`),
@@ -161,17 +172,20 @@ const inspectCall = (
         mechanism: `call:${name}`,
         node,
         accumulator,
-        maximumFindings,
       });
     addRouteFrameworkInference({
       script,
       name,
       node,
       accumulator,
-      maximumFindings,
     });
   }
-  const endpoint = endpointArgument(name, node.arguments);
+  const endpoint = endpointArgument(
+    name,
+    node.arguments,
+    node.callee,
+    openReceiverFacts.get(node.start ?? -1),
+  );
   if (endpoint !== undefined)
     addFinding({
       collection: accumulator.endpoints,
@@ -180,22 +194,21 @@ const inspectCall = (
       mechanism: `call:${name}`,
       node,
       accumulator,
-      maximumFindings,
     });
   if (
-    name.endsWith("modelContext.registerTool") ||
-    name === "modelContext.registerTool"
+    (t.isCallExpression(node) || t.isNewExpression(node)) &&
+    (name.endsWith("modelContext.registerTool") ||
+      name === "modelContext.registerTool")
   )
-    addWebMcpDeclaration(script, node, accumulator, maximumFindings);
+    addWebMcpDeclaration(script, node, accumulator);
 };
 
 const inspectRouteProperty = (
   script: IncludedScript,
   node: t.ObjectProperty,
   accumulator: AnalysisAccumulator,
-  maximumFindings: number,
 ): void => {
-  const key = propertyName(node.key);
+  const key = semanticStaticPropertyName(node.key, node.computed);
   if ((key === "path" || key === "route") && t.isStringLiteral(node.value))
     addFinding({
       collection: accumulator.routes,
@@ -204,7 +217,6 @@ const inspectRouteProperty = (
       mechanism: `property:${key}`,
       node,
       accumulator,
-      maximumFindings,
     });
 };
 
@@ -214,18 +226,20 @@ interface AddEdgeContext {
   readonly kind: ChunkEdge["kind"];
   readonly node: t.Node;
   readonly accumulator: AnalysisAccumulator;
-  readonly maximumFindings: number;
 }
 
 const addEdge = (context: AddEdgeContext): void => {
-  const bounded = context.specifier.slice(0, 4_096);
-  const key = `edge\0${context.script.script_key}\0${context.kind}\0${bounded}`;
-  addBounded(context.accumulator, key, context.maximumFindings, () =>
+  const key = `edge\0${context.script.script_key}\0${context.kind}\0${context.specifier}`;
+  addUnique(context.accumulator, key, () =>
     context.accumulator.edges.push({
       from_script_key: context.script.script_key,
       kind: context.kind,
-      specifier: bounded,
-      resolved_url: resolveSpecifier(bounded, context.script.url),
+      specifier: context.specifier,
+      resolved_url:
+        context.kind === "worker_import" ||
+        isUrlLikeModuleSpecifier(context.specifier)
+          ? resolveSpecifier(context.specifier, context.script.url)
+          : null,
       location: location(context.script.script_key, context.node),
     }),
   );
@@ -238,13 +252,12 @@ interface AddFindingContext {
   readonly mechanism: string;
   readonly node: t.Node;
   readonly accumulator: AnalysisAccumulator;
-  readonly maximumFindings: number;
 }
 
 const addFinding = (context: AddFindingContext): void => {
-  const value = sanitizeCandidate(context.rawValue);
+  const value = sanitizeEndpointCandidate(context.rawValue);
   const key = `finding\0${context.mechanism}\0${context.script.script_key}\0${value}`;
-  addBounded(context.accumulator, key, context.maximumFindings, () =>
+  addUnique(context.accumulator, key, () =>
     context.collection.push({
       value,
       mechanism: context.mechanism,
@@ -257,7 +270,6 @@ const addWebMcpDeclaration = (
   script: IncludedScript,
   node: t.CallExpression | t.NewExpression,
   accumulator: AnalysisAccumulator,
-  maximumFindings: number,
 ): void => {
   const declaration = node.arguments[0];
   if (!t.isObjectExpression(declaration)) return;
@@ -275,18 +287,25 @@ const addWebMcpDeclaration = (
   const schemaPropertyNames = t.isObjectExpression(propertyObject)
     ? propertyObject.properties.flatMap((property) =>
         t.isObjectProperty(property)
-          ? [propertyName(property.key)].filter(Boolean)
+          ? [
+              semanticStaticPropertyName(property.key, property.computed),
+            ].filter(Boolean)
           : [],
       )
     : [];
-  const key = `webmcp\0${script.script_key}\0${name ?? ""}\0${schemaPropertyNames.join("\0")}`;
-  addBounded(accumulator, key, maximumFindings, () =>
+  // Property names are a variable-length source-derived list: NUL-joins
+  // would collapse ["a\0b"] with ["a", "b"] and drop a declaration.
+  const key = compositeKey([
+    "webmcp",
+    script.script_key,
+    name ?? "",
+    schemaPropertyNames,
+  ]);
+  addUnique(accumulator, key, () =>
     accumulator.webMcp.push({
-      name: name?.slice(0, 256) ?? null,
-      description: description?.slice(0, 2_048) ?? null,
-      schema_property_names: [...new Set(schemaPropertyNames)]
-        .sort()
-        .slice(0, 256),
+      name: name ?? null,
+      description: description ?? null,
+      schema_property_names: [...new Set(schemaPropertyNames)].sort(),
       trust: "page-declared-untrusted",
       location: location(script.script_key, node),
     }),
@@ -296,13 +315,12 @@ const addWebMcpDeclaration = (
 const detectVendorFingerprints = (
   script: IncludedScript,
   accumulator: AnalysisAccumulator,
-  maximumFindings: number,
 ): void => {
   const text = script.source.artifact.text;
   for (const detector of vendorDetectors) {
     if (!detector.patterns.some((pattern) => text.includes(pattern))) continue;
     const key = `vendor\0${script.script_key}\0${detector.value}`;
-    addBounded(accumulator, key, maximumFindings, () =>
+    addUnique(accumulator, key, () =>
       accumulator.inferences.push({
         kind: detector.kind,
         value: detector.value,
@@ -318,7 +336,6 @@ interface RouteFrameworkContext {
   readonly name: string;
   readonly node: t.Node;
   readonly accumulator: AnalysisAccumulator;
-  readonly maximumFindings: number;
 }
 
 const addRouteFrameworkInference = (context: RouteFrameworkContext): void => {
@@ -328,7 +345,7 @@ const addRouteFrameworkInference = (context: RouteFrameworkContext): void => {
       ? "React Router-compatible route API"
       : "Generic route registration API";
   const key = `route-framework\0${context.script.script_key}\0${value}`;
-  addBounded(context.accumulator, key, context.maximumFindings, () =>
+  addUnique(context.accumulator, key, () =>
     context.accumulator.inferences.push({
       kind: "route_framework",
       value,
@@ -343,23 +360,12 @@ const addRouteFrameworkInference = (context: RouteFrameworkContext): void => {
   );
 };
 
-const addBounded = (
+const addUnique = (
   accumulator: AnalysisAccumulator,
   key: string,
-  maximum: number,
   add: () => void,
 ): void => {
   if (accumulator.seen.has(key)) return;
-  const findings =
-    accumulator.edges.length +
-    accumulator.routes.length +
-    accumulator.endpoints.length +
-    accumulator.webMcp.length +
-    accumulator.inferences.length;
-  if (findings >= maximum) {
-    accumulator.droppedFindings += 1;
-    return;
-  }
   accumulator.seen.add(key);
   add();
 };
@@ -382,8 +388,6 @@ export const emptyAccumulator = (): AnalysisAccumulator => ({
   visitedNodes: 0,
   parsedScripts: 0,
   parseFailures: 0,
-  droppedFindings: 0,
-  astLimitReached: false,
 });
 
 export const isIncludedScript = (

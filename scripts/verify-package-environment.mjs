@@ -1,5 +1,6 @@
 import { chmod, mkdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { supportedClients } from "../dist/application/SupportedClients.js";
 
 /** Create an isolated prefix, fake PATH, client configs, and environment. */
 export async function verifyPackageEnvironment({
@@ -48,7 +49,11 @@ export async function verifyPackageEnvironment({
     chmod(hopper, 0o755),
     chmod(npx, 0o755),
   ]);
-  const claudeDir = join(home, "Library/Application Support/Claude");
+  const claudeDir = supportedClients(home, process.platform, {}).find(
+    ({ name }) => name === "claude_desktop",
+  )?.markerPath;
+  if (claudeDir === undefined)
+    throw new Error("Claude Desktop fixture has no configuration directory");
   const codexDir = join(home, ".codex");
   const cursorDir = join(home, ".cursor");
   await Promise.all([
@@ -69,17 +74,28 @@ export async function verifyPackageEnvironment({
   const environment = {
     ...process.env,
     HOME: home,
+    USERPROFILE: home,
+    APPDATA: join(home, "AppData", "Roaming"),
+    CLAUDE_CONFIG_DIR: home,
+    CODEX_HOME: codexDir,
+    COPILOT_HOME: join(home, ".copilot"),
+    GROK_HOME: join(home, ".grok"),
+    SAND_DATA_ROOT: join(home, ".grokbot"),
+    OMP_PROFILE: undefined,
+    PI_CODING_AGENT_DIR: undefined,
+    PI_CONFIG_DIR: undefined,
+    PI_PROFILE: undefined,
+    QWEN_HOME: undefined,
+    OPENCODE_CONFIG: undefined,
+    OPENCODE_CONFIG_DIR: undefined,
+    GEMINI_CLI_HOME: undefined,
+    GEMINI_CLI_SYSTEM_SETTINGS_PATH: undefined,
+    GEMINI_CLI_SYSTEM_DEFAULTS_PATH: undefined,
     XDG_CONFIG_HOME: join(home, ".config"),
     PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
     REA_ANALYSIS_PROVIDER: "auto",
-    HOPPER_LAUNCHER_PATH: process.execPath,
-    HOPPER_LOADER_ARGS_JSON: JSON.stringify([
-      join(root, "tests/fixtures/fakeLauncher.mjs"),
-    ]),
+    ...packageHopperEnvironment(root),
     REA_NPX_LOG: npxLog,
-    REA_EVIDENCE_ROOTS_JSON: JSON.stringify([evidenceRoot]),
-    REA_INVESTIGATION_INPUT_ROOTS_JSON: JSON.stringify([workspace]),
-    REA_REFERENCE_ROOTS_JSON: JSON.stringify([referenceRoot]),
     REA_REFERENCE_SECRET_PATTERNS_JSON: JSON.stringify([".env"]),
   };
   return {
@@ -94,3 +110,22 @@ export async function verifyPackageEnvironment({
     environment,
   };
 }
+
+export const packageHopperEnvironment = (root, platform = process.platform) => {
+  const fakeLauncher = join(root, "tests/fixtures/fakeLauncher.mjs");
+  if (platform !== "linux")
+    return {
+      HOPPER_LAUNCHER_PATH: process.execPath,
+      HOPPER_LOADER_ARGS_JSON: JSON.stringify([fakeLauncher]),
+    };
+  return {
+    HOPPER_LAUNCHER_PATH: "/bin/sh",
+    HOPPER_LOADER_ARGS_JSON: JSON.stringify([
+      "-c",
+      'node_path=$1; shift; "$node_path" "$@"',
+      "rea-package-hopper",
+      process.execPath,
+      fakeLauncher,
+    ]),
+  };
+};

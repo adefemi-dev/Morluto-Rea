@@ -1,33 +1,30 @@
 import {
+  EvidenceFileError,
   EvidenceIntegrityError,
-  type AnalysisError,
-} from "../domain/errors.js";
-import type {
-  EvidenceFilePolicy,
-  EvidenceBundle,
-} from "../domain/evidenceBundle.js";
+} from "../domain/evidenceErrors.js";
+import type { AnalysisError } from "../domain/analysisErrorBase.js";
+import type { EvidenceBundle } from "../domain/evidenceBundle.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 import { jsonValueSchema } from "../domain/jsonValue.js";
 import { err, ok, type Result } from "../domain/result.js";
 import { compareBundles } from "../domain/bundleComparison.js";
-import { EvidenceLedger } from "./EvidenceLedger.js";
+import { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 import {
   readEvidenceBundle,
   writeEvidenceBundle,
 } from "./EvidenceBundleFiles.js";
 
-/** Validate and merge one bundle using the same bounded ledger as MCP. */
+/** Validate a standalone bundle and report its complete record/revision counts. */
 export const importEvidenceBundleCommand = async (
   path: string,
-  policy: EvidenceFilePolicy,
 ): Promise<Result<JsonValue, AnalysisError>> => {
-  const loaded = await readEvidenceBundle(path, policy);
+  const loaded = await readEvidenceBundle(path);
   if (!loaded.ok) return loaded;
-  const ledger = createLedger();
-  const imported = ledger.import(loaded.value);
-  return imported.ok
-    ? ok({ imported: imported.value, total: ledger.export().records.length })
-    : imported;
+  return ok({
+    imported: loaded.value.records.length,
+    unknowns_added: loaded.value.unknowns.length,
+    total: loaded.value.records.length,
+  });
 };
 
 /** Validate a source bundle and atomically export canonical bytes. */
@@ -35,36 +32,51 @@ export const exportEvidenceBundleCommand = async (
   sourcePath: string,
   outputPath: string,
   overwrite: boolean,
-  policy: EvidenceFilePolicy,
 ): Promise<Result<JsonValue, AnalysisError>> => {
-  const loaded = await readEvidenceBundle(sourcePath, policy);
+  const loaded = await readEvidenceBundle(sourcePath);
   if (!loaded.ok) return loaded;
-  return projectWrite(
+  const resources = new ArtifactResourceScope();
+  const written = await writeEvidenceBundle(
     loaded.value,
-    await writeEvidenceBundle(loaded.value, outputPath, overwrite, policy),
+    outputPath,
+    overwrite,
+    resources,
   );
+  if (written.ok) return projectWrite(loaded.value, written);
+
+  let cleanupSucceeded = false;
+  try {
+    await resources.close();
+    cleanupSucceeded = true;
+  } catch {
+    // The original error cause retains the same staged-output owner for diagnostics.
+  }
+  if (
+    cleanupSucceeded &&
+    written.error instanceof EvidenceFileError &&
+    written.error.published
+  ) {
+    return projectWrite(loaded.value, {
+      ok: true,
+      value: written.error.published,
+    });
+  }
+  return written;
 };
 
-/** Compare two validated canonical Evidence v2 bundles without session state. */
+/** Compare two validated canonical Evidence bundles without session state. */
 export const compareEvidenceBundlesCommand = async (input: {
   readonly leftPath: string;
   readonly rightPath: string;
-  readonly offset: number;
-  readonly limit: number;
-  readonly policy: EvidenceFilePolicy;
 }): Promise<Result<JsonValue, AnalysisError>> => {
   const [left, right] = await Promise.all([
-    readEvidenceBundle(input.leftPath, input.policy),
-    readEvidenceBundle(input.rightPath, input.policy),
+    readEvidenceBundle(input.leftPath),
+    readEvidenceBundle(input.rightPath),
   ]);
   if (!left.ok) return left;
   if (!right.ok) return right;
   try {
-    return ok(
-      jsonValueSchema.parse(
-        compareBundles(left.value, right.value, [], input.offset, input.limit),
-      ),
-    );
+    return ok(jsonValueSchema.parse(compareBundles(left.value, right.value)));
   } catch (cause: unknown) {
     return err(
       new EvidenceIntegrityError("Evidence bundle comparison failed", {
@@ -73,9 +85,6 @@ export const compareEvidenceBundlesCommand = async (input: {
     );
   }
 };
-
-const createLedger = (): EvidenceLedger =>
-  new EvidenceLedger({ maxRecords: 10_000, maxBytes: 64 * 1024 * 1024 });
 
 const projectWrite = (
   bundle: EvidenceBundle,

@@ -1,72 +1,58 @@
+import { managedDecodeBudget } from "./ManagedDecodeBudget.js";
+import { memberDeclaringTypeRowLookup } from "./ManagedMemberOwnership.js";
+
 import type {
   ManagedArtifactInspection,
   ManagedParseIssue,
-} from "../domain/managedArtifact.js";
+} from "../domain/managed/managedArtifact.js";
 import {
   metadataRowOffset,
   type ManagedMetadataLayout,
 } from "./ManagedMetadataLayout.js";
 import {
-  MetadataRowCursor,
+  metadataRowCursor,
+  metadataCodedToken,
+  metadataCodedTokenInvalidReason,
   metadataToken,
   readMetadataBlob,
   readMetadataGuid,
   readMetadataString,
-  sha256Bytes,
-  strongNameToken,
 } from "./ManagedMetadataHeaps.js";
-import { managedFailure } from "./ManagedReaderFailure.js";
+import { managedFailure, readManagedValue } from "./ManagedReaderFailure.js";
 import type { ManagedResourceDirectory } from "./ManagedMetadataInventory.js";
 
 type ModuleIdentity = NonNullable<ManagedArtifactInspection["module"]>;
 type AssemblyIdentity = NonNullable<ManagedArtifactInspection["assembly"]>;
-type AssemblyReference =
-  ManagedArtifactInspection["references"]["items"][number];
-type ManagedResource = ManagedArtifactInspection["resources"]["items"][number];
-type CustomAttribute = ManagedArtifactInspection["attributes"]["items"][number];
+type AssemblyReference = ManagedArtifactInspection["references"][number];
+type ManagedResource = ManagedArtifactInspection["resources"][number];
+type CustomAttribute = ManagedArtifactInspection["attributes"][number];
 
-interface RowCursorContext {
-  readonly bytes: Buffer;
-  readonly layout: ManagedMetadataLayout;
-  readonly table: number;
-  readonly row: number;
-}
+const HAS_CUSTOM_ATTRIBUTE_TABLES = [
+  6, 4, 1, 2, 8, 9, 10, 0, 14, 23, 20, 17, 26, 27, 32, 35, 38, 39, 40, 42, 44,
+  43,
+] as const;
 
-const rowCursor = ({
-  bytes,
-  layout,
-  table,
-  row,
-}: RowCursorContext): MetadataRowCursor => {
-  const descriptor = layout.table(table);
-  const start = metadataRowOffset(layout, table, row);
-  if (descriptor === undefined)
-    throw managedFailure(
-      "invalid-row",
-      `metadata.${String(table)}`,
-      "Metadata table is absent",
-      start,
-    );
-  return new MetadataRowCursor(
-    bytes,
-    start,
-    start + descriptor.rowSize,
-    `metadata.${descriptor.name}`,
-  );
-};
+const CUSTOM_ATTRIBUTE_TYPE_TABLES = [undefined, undefined, 6, 10] as const;
 
 const publicKeyIdentity = (
   bytes: Buffer,
   kind: "public-key" | "public-key-token",
+  layout: ManagedMetadataLayout,
 ): AssemblyIdentity["public_key"] => ({
   kind: bytes.length === 0 ? "none" : kind,
   byte_length: bytes.length,
-  sha256: bytes.length === 0 ? null : sha256Bytes(bytes),
+  sha256:
+    bytes.length === 0
+      ? null
+      : managedDecodeBudget(layout).digest(bytes, "sha256"),
   token:
     bytes.length === 0
       ? null
       : kind === "public-key"
-        ? strongNameToken(bytes)
+        ? Buffer.from(managedDecodeBudget(layout).digest(bytes, "sha1"), "hex")
+            .subarray(-8)
+            .reverse()
+            .toString("hex")
         : bytes.length === 8
           ? bytes.toString("hex")
           : null,
@@ -75,17 +61,17 @@ const publicKeyIdentity = (
 export const readModule = (
   bytes: Buffer,
   layout: ManagedMetadataLayout,
-  maxBytes: number,
+  heapExtent: number,
 ): ModuleIdentity | null => {
   const table = layout.table(0);
   if (table === undefined || table.rowCount === 0) return null;
-  const cursor = rowCursor({ bytes, layout, table: 0, row: 1 });
+  const cursor = metadataRowCursor(bytes, layout, 0, 1);
   const generation = cursor.readUInt16();
   const name = readMetadataString(
     bytes,
     layout,
     cursor.readIndex(layout.stringIndexSize),
-    maxBytes,
+    heapExtent,
   );
   const mvid = readMetadataGuid(
     bytes,
@@ -116,11 +102,11 @@ export const readModule = (
 export const readAssembly = (
   bytes: Buffer,
   layout: ManagedMetadataLayout,
-  maxBytes: number,
+  heapExtent: number,
 ): AssemblyIdentity | null => {
   const table = layout.table(32);
   if (table === undefined || table.rowCount === 0) return null;
-  const cursor = rowCursor({ bytes, layout, table: 32, row: 1 });
+  const cursor = metadataRowCursor(bytes, layout, 32, 1);
   const hashAlgorithm = cursor.readUInt32();
   const version = [
     cursor.readUInt16(),
@@ -133,19 +119,19 @@ export const readAssembly = (
     bytes,
     layout,
     cursor.readIndex(layout.blobIndexSize),
-    maxBytes,
+    heapExtent,
   );
   const name = readMetadataString(
     bytes,
     layout,
     cursor.readIndex(layout.stringIndexSize),
-    maxBytes,
+    heapExtent,
   );
   const culture = readMetadataString(
     bytes,
     layout,
     cursor.readIndex(layout.stringIndexSize),
-    maxBytes,
+    heapExtent,
   );
   return {
     name,
@@ -156,6 +142,7 @@ export const readAssembly = (
     public_key: publicKeyIdentity(
       key,
       (flags & 1) === 0 ? "public-key-token" : "public-key",
+      layout,
     ),
     token: metadataToken(32, 1),
     row_offset: table.offset,
@@ -166,9 +153,9 @@ export const readAssemblyReference = (
   bytes: Buffer,
   layout: ManagedMetadataLayout,
   row: number,
-  maxBytes: number,
+  heapExtent: number,
 ): AssemblyReference => {
-  const cursor = rowCursor({ bytes, layout, table: 35, row });
+  const cursor = metadataRowCursor(bytes, layout, 35, row);
   const version = [
     cursor.readUInt16(),
     cursor.readUInt16(),
@@ -180,25 +167,25 @@ export const readAssemblyReference = (
     bytes,
     layout,
     cursor.readIndex(layout.blobIndexSize),
-    maxBytes,
+    heapExtent,
   );
   const name = readMetadataString(
     bytes,
     layout,
     cursor.readIndex(layout.stringIndexSize),
-    maxBytes,
+    heapExtent,
   );
   const culture = readMetadataString(
     bytes,
     layout,
     cursor.readIndex(layout.stringIndexSize),
-    maxBytes,
+    heapExtent,
   );
   const hashValue = readMetadataBlob(
     bytes,
     layout,
     cursor.readIndex(layout.blobIndexSize),
-    maxBytes,
+    heapExtent,
   );
   return {
     name,
@@ -208,24 +195,16 @@ export const readAssemblyReference = (
     public_key_or_token: publicKeyIdentity(
       keyOrToken,
       (flags & 1) === 0 ? "public-key-token" : "public-key",
+      layout,
     ),
-    hash_value_sha256: hashValue.length === 0 ? null : sha256Bytes(hashValue),
+    hash_value_sha256:
+      hashValue.length === 0
+        ? null
+        : managedDecodeBudget(layout).digest(hashValue, "sha256"),
     hash_value_length: hashValue.length,
     token: metadataToken(35, row),
     row_offset: metadataRowOffset(layout, 35, row),
   };
-};
-
-const codedToken = (
-  raw: number,
-  bits: number,
-  tables: readonly (number | undefined)[],
-): string | null => {
-  if (raw === 0) return null;
-  const tag = raw & (2 ** bits - 1);
-  const row = Math.floor(raw / 2 ** bits);
-  const table = tables[tag];
-  return table === undefined || row === 0 ? null : metadataToken(table, row);
 };
 
 interface ReadTypeNameContext {
@@ -233,7 +212,7 @@ interface ReadTypeNameContext {
   readonly layout: ManagedMetadataLayout;
   readonly table: 1 | 2;
   readonly row: number;
-  readonly maxBytes: number;
+  readonly heapExtent: number;
 }
 
 const readTypeName = ({
@@ -241,25 +220,25 @@ const readTypeName = ({
   layout,
   table,
   row,
-  maxBytes,
+  heapExtent,
 }: ReadTypeNameContext): string | null => {
   const descriptor = layout.table(table);
   if (descriptor === undefined || row < 1 || row > descriptor.rowCount)
     return null;
-  const cursor = rowCursor({ bytes, layout, table, row });
+  const cursor = metadataRowCursor(bytes, layout, table, row);
   if (table === 1) cursor.readIndex(layout.codedIndexSize("ResolutionScope"));
   else cursor.readUInt32();
   const name = readMetadataString(
     bytes,
     layout,
     cursor.readIndex(layout.stringIndexSize),
-    maxBytes,
+    heapExtent,
   );
   const namespace = readMetadataString(
     bytes,
     layout,
     cursor.readIndex(layout.stringIndexSize),
-    maxBytes,
+    heapExtent,
   );
   return namespace.length === 0 ? name : `${namespace}.${name}`;
 };
@@ -268,73 +247,48 @@ const declaringTypeForMethod = (
   bytes: Buffer,
   layout: ManagedMetadataLayout,
   methodRow: number,
-  maxBytes: number,
+  heapExtent: number,
 ): string | null => {
-  const types = layout.table(2);
-  const methods = layout.table(6);
-  if (types === undefined || methods === undefined) return null;
-  for (let row = 1; row <= types.rowCount; row += 1) {
-    const cursor = rowCursor({ bytes, layout, table: 2, row });
-    cursor.readUInt32();
-    const nameIndex = cursor.readIndex(layout.stringIndexSize);
-    const namespaceIndex = cursor.readIndex(layout.stringIndexSize);
-    cursor.readIndex(layout.codedIndexSize("TypeDefOrRef"));
-    cursor.readIndex(layout.tableIndexSize(4));
-    const methodStart = cursor.readIndex(layout.tableIndexSize(6));
-    const methodEnd =
-      row === types.rowCount
-        ? methods.rowCount + 1
-        : methodListForType(bytes, layout, row + 1);
-    if (methodRow < methodStart || methodRow >= methodEnd) continue;
-    const name = readMetadataString(bytes, layout, nameIndex, maxBytes);
-    const namespace = readMetadataString(
-      bytes,
-      layout,
-      namespaceIndex,
-      maxBytes,
-    );
-    return namespace.length === 0 ? name : `${namespace}.${name}`;
-  }
-  return null;
-};
-
-const methodListForType = (
-  bytes: Buffer,
-  layout: ManagedMetadataLayout,
-  row: number,
-): number => {
-  const cursor = rowCursor({ bytes, layout, table: 2, row });
-  cursor.readUInt32();
-  cursor.readIndex(layout.stringIndexSize);
-  cursor.readIndex(layout.stringIndexSize);
-  cursor.readIndex(layout.codedIndexSize("TypeDefOrRef"));
-  cursor.readIndex(layout.tableIndexSize(4));
-  return cursor.readIndex(layout.tableIndexSize(6));
+  const owner = memberDeclaringTypeRowLookup(bytes, layout, 6)(methodRow);
+  if (owner === 0) return null;
+  return readTypeName({ bytes, layout, table: 2, row: owner, heapExtent });
 };
 
 const attributeTypeName = (
   bytes: Buffer,
   layout: ManagedMetadataLayout,
   rawType: number,
-  maxBytes: number,
+  heapExtent: number,
 ): string | null => {
   const tag = rawType & 7;
   const row = Math.floor(rawType / 8);
   if (row === 0) return null;
-  if (tag === 2) return declaringTypeForMethod(bytes, layout, row, maxBytes);
+  if (tag === 2) return declaringTypeForMethod(bytes, layout, row, heapExtent);
   if (tag !== 3) return null;
   const memberRefs = layout.table(10);
   if (memberRefs === undefined || row > memberRefs.rowCount) return null;
-  const cursor = rowCursor({ bytes, layout, table: 10, row });
+  const cursor = metadataRowCursor(bytes, layout, 10, row);
   const parent = cursor.readIndex(layout.codedIndexSize("MemberRefParent"));
   const parentTag = parent & 7;
   const parentRow = Math.floor(parent / 8);
   if (parentTag === 0)
-    return readTypeName({ bytes, layout, table: 2, row: parentRow, maxBytes });
+    return readTypeName({
+      bytes,
+      layout,
+      table: 2,
+      row: parentRow,
+      heapExtent,
+    });
   if (parentTag === 1)
-    return readTypeName({ bytes, layout, table: 1, row: parentRow, maxBytes });
+    return readTypeName({
+      bytes,
+      layout,
+      table: 1,
+      row: parentRow,
+      heapExtent,
+    });
   if (parentTag === 3)
-    return declaringTypeForMethod(bytes, layout, parentRow, maxBytes);
+    return declaringTypeForMethod(bytes, layout, parentRow, heapExtent);
   return null;
 };
 
@@ -367,18 +321,24 @@ const decodeCompressedLength = (
   return undefined;
 };
 
-const decodeFixedString = (blob: Buffer): string | null => {
+const decodeFixedString = (
+  blob: Buffer,
+  layout: ManagedMetadataLayout,
+): string | null => {
   if (blob.length < 3 || blob.readUInt16LE(0) !== 1 || blob[2] === 0xff)
     return null;
   const length = decodeCompressedLength(blob, 2);
   if (length === undefined) return null;
   const start = 2 + length.prefix;
   if (start > blob.length - length.length) return null;
+  managedDecodeBudget(layout).reserveString(length.length, layout.blob.offset);
   try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
       blob.subarray(start, start + length.length),
     );
-  } catch {
+  } catch (cause: unknown) {
+    // Invalid UTF-8 blobs decode as null.
+    void cause;
     return null;
   }
 };
@@ -387,12 +347,14 @@ export const readCustomAttribute = (
   bytes: Buffer,
   layout: ManagedMetadataLayout,
   row: number,
-  maxBytes: number,
+  heapExtent: number,
+  issues: ManagedParseIssue[],
 ): CustomAttribute => {
-  const cursor = rowCursor({ bytes, layout, table: 12, row });
+  const cursor = metadataRowCursor(bytes, layout, 12, row);
   const parentRaw = cursor.readIndex(
     layout.codedIndexSize("HasCustomAttribute"),
   );
+  const typeOffset = cursor.offset;
   const typeRaw = cursor.readIndex(
     layout.codedIndexSize("CustomAttributeType"),
   );
@@ -400,33 +362,67 @@ export const readCustomAttribute = (
     bytes,
     layout,
     cursor.readIndex(layout.blobIndexSize),
-    maxBytes,
+    heapExtent,
   );
-  const parent = codedToken(
+  const parent = metadataCodedToken(
     parentRaw,
     5,
-    [
-      6, 4, 1, 2, 8, 9, 10, 0, 14, 23, 20, 17, 26, 27, 32, 35, 38, 39, 40, 42,
-      44, 43,
-    ],
+    HAS_CUSTOM_ATTRIBUTE_TABLES,
+    layout.rowCounts,
   );
-  if (parent === null)
+  if (parent === null) {
+    const parentReason = metadataCodedTokenInvalidReason(
+      parentRaw,
+      5,
+      HAS_CUSTOM_ATTRIBUTE_TABLES,
+      layout.rowCounts,
+    );
     throw managedFailure(
       "invalid-row",
-      "metadata.CustomAttribute",
-      "CustomAttribute parent coded index is invalid",
+      `metadata.CustomAttribute:${metadataToken(12, row)}`,
+      `CustomAttribute parent coded index 0x${parentRaw.toString(16)} is invalid${parentReason === null ? " because the required parent is null" : `: ${parentReason}`}`,
       cursor.start,
     );
-  const typeName = attributeTypeName(bytes, layout, typeRaw, maxBytes);
+  }
+  const constructor = metadataCodedToken(
+    typeRaw,
+    3,
+    CUSTOM_ATTRIBUTE_TYPE_TABLES,
+    layout.rowCounts,
+  );
+  if (constructor === null) {
+    const typeReason = metadataCodedTokenInvalidReason(
+      typeRaw,
+      3,
+      CUSTOM_ATTRIBUTE_TYPE_TABLES,
+      layout.rowCounts,
+    );
+    issues.push({
+      code: "invalid-row",
+      scope: `metadata.CustomAttribute:${metadataToken(12, row)}`,
+      offset: typeOffset,
+      detail:
+        typeReason === null
+          ? "CustomAttribute constructor coded index 0x0 is null, but Type must reference a MethodDef or MemberRef row"
+          : `CustomAttribute constructor coded index 0x${typeRaw.toString(16)} is invalid: ${typeReason}`,
+    });
+  }
+  let typeName: string | null = null;
+  if (constructor !== null)
+    typeName =
+      readManagedValue(
+        () => attributeTypeName(bytes, layout, typeRaw, heapExtent),
+        issues,
+      ) ?? null;
   return {
     parent_token: parent,
-    constructor_token: codedToken(typeRaw, 3, [undefined, undefined, 6, 10]),
+    constructor_token: constructor,
     type_name: typeName,
     value_length: value.length,
-    value_sha256: sha256Bytes(value),
+    value_sha256: managedDecodeBudget(layout).digest(value, "sha256"),
     decoded_fixed_string:
       typeName === "System.Runtime.Versioning.TargetFrameworkAttribute"
-        ? decodeFixedString(value)
+        ? decodeFixedString(value, layout)
         : null,
     token: metadataToken(12, row),
     row_offset: cursor.start,
@@ -437,7 +433,6 @@ interface ReadResourceContext {
   readonly bytes: Buffer;
   readonly layout: ManagedMetadataLayout;
   readonly row: number;
-  readonly maxBytes: number;
   readonly directory: ManagedResourceDirectory | null;
   readonly issues: ManagedParseIssue[];
 }
@@ -446,23 +441,41 @@ export const readResource = ({
   bytes,
   layout,
   row,
-  maxBytes,
   directory,
   issues,
 }: ReadResourceContext): ManagedResource => {
-  const cursor = rowCursor({ bytes, layout, table: 40, row });
+  const cursor = metadataRowCursor(bytes, layout, 40, row);
   const declaredOffset = cursor.readUInt32();
   const flags = cursor.readUInt32();
   const name = readMetadataString(
     bytes,
     layout,
     cursor.readIndex(layout.stringIndexSize),
-    maxBytes,
+    Math.max(layout.strings.size, layout.blob.size),
   );
+  const implementationOffset = cursor.offset;
   const implementationRaw = cursor.readIndex(
     layout.codedIndexSize("Implementation"),
   );
-  const implementationToken = codedToken(implementationRaw, 2, [38, 35, 39]);
+  const implementationToken = metadataCodedToken(
+    implementationRaw,
+    2,
+    [38, 35, 39],
+    layout.rowCounts,
+  );
+  const implementationReason = metadataCodedTokenInvalidReason(
+    implementationRaw,
+    2,
+    [38, 35, 39],
+    layout.rowCounts,
+  );
+  if (implementationReason !== null)
+    issues.push({
+      code: "invalid-row",
+      scope: `metadata.ManifestResource:${metadataToken(40, row)}`,
+      offset: implementationOffset,
+      detail: `ManifestResource implementation coded index 0x${implementationRaw.toString(16)} is invalid: ${implementationReason}`,
+    });
   let dataLength: number | null = null;
   let dataSha256: string | null = null;
   if (implementationRaw === 0) {
@@ -483,16 +496,10 @@ export const readResource = ({
           offset: start,
           detail: "Embedded resource length leaves the CLI resources directory",
         });
-      } else if (dataLength > maxBytes) {
-        issues.push({
-          code: "limit-exceeded",
-          scope: `metadata.ManifestResource:${metadataToken(40, row)}`,
-          offset: start + 4,
-          detail: `Embedded resource exceeds max_heap_item_bytes ${String(maxBytes)}; digest omitted`,
-        });
       } else {
-        dataSha256 = sha256Bytes(
+        dataSha256 = managedDecodeBudget(layout).digest(
           bytes.subarray(start + 4, start + 4 + dataLength),
+          "sha256",
         );
       }
     }

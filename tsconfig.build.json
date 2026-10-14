@@ -1,11 +1,15 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "incremental": true,
     "rootDir": "src",
-    "tsBuildInfoFile": "node_modules/.cache/rea-tsconfig-build.tsbuildinfo",
     "types": ["node"]
   },
   "include": ["src/**/*.ts"],
-  "exclude": ["src/**/*.test.ts", "tests", "dist", "node_modules"]
+  "exclude": [
+    "src/**/*.fixture.ts",
+    "src/**/*.test.ts",
+    "tests",
+    "dist",
+    "node_modules"
+  ]
 }

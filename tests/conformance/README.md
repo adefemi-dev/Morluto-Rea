@@ -1,9 +1,11 @@
 # Source-built conformance fixtures
 
 These sources are deliberately small semantic oracles for REA providers. Run
-`npm run verify:fixtures` on macOS to compile them into the ignored
+`npm run verify:fixtures` on macOS or Linux to compile them into the ignored
 `build/conformance/` directory, emit a hash-and-toolchain manifest, and verify
-their Mach-O symbols and strings with native command-line tools.
+their platform-native symbols and strings with local command-line tools. The
+portable C, version, and large-inventory fixtures build as Mach-O on macOS and
+ELF on Linux; Objective-C, Swift, and N-API-like fixtures remain macOS-only.
 
 Only source files are versioned. Generated binaries, generated large-fixture
 source, debug information, and manifests must remain under `build/`.
@@ -16,12 +18,18 @@ the read-only Ghidra inventory contracts without committing a binary.
 `scripts/create-ghidra-windows-fixture.mjs` separately emits a deterministic,
 ignored native x86-64 PE application for the controlled Windows Ghidra P0 lane.
 The generator and fixed SHA-256 are versioned; the `.exe` is never committed or
-executed. `npm run verify:ghidra:windows` uses it to prove all 18 operations,
+executed. `npm run verify:ghidra:windows` uses it to verify the admitted read-only operation inventory,
 digest linkage, transport, and cleanup on the self-hosted real-Ghidra runner.
 
 The C fixture fixes a known call chain and strings. The version pair fixes an
 added symbol, changed string, and changed call relationship. The generated
-large fixture contains 1,205 uniquely named functions and strings so provider
-pagination can be checked at boundaries of 500, 1,000, and 1,205. Objective-C,
-Swift, and N-API-like fixtures provide metadata-oriented inputs without package
+large fixture contains 1,205 uniquely named functions and strings to verify that
+providers return complete inventories. Objective-C, Swift, and N-API-like
+fixtures provide metadata-oriented inputs without package
 or network dependencies.
+
+`readiness/` adds source-only generated JavaScript CLI and Electron fixtures for
+the repository's reconstruction-readiness verifier. `npm run verify:readiness`
+combines them with the compiled native fixtures, exercises CLI and MCP parity
+for real analysis operations, and checks the internal machine-readable report
+documented in `docs/reconstruction-readiness.md`.

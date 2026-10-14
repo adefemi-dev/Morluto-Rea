@@ -1,6 +1,24 @@
 import type { z } from "zod";
+import {
+  AnalysisInputError,
+  type AnalysisInputIssue,
+} from "./analysisErrorCore.js";
 
-import type { AnalysisInputIssue } from "./errors.js";
+/** Build the standard application input error while retaining schema causes and extra semantic issues. */
+export const analysisInputErrorFromIssues = (
+  operation: string,
+  issues: readonly z.core.$ZodIssue[],
+  input: unknown,
+  options: {
+    readonly cause?: unknown;
+    readonly additionalIssues?: readonly AnalysisInputIssue[];
+  } = {},
+): AnalysisInputError =>
+  new AnalysisInputError(
+    operation,
+    options.cause === undefined ? undefined : { cause: options.cause },
+    [...projectInputIssues(issues, input), ...(options.additionalIssues ?? [])],
+  );
 
 /** Project Zod failures to secret-safe caller correction metadata. */
 export const projectInputIssues = (
@@ -16,6 +34,42 @@ const projectIssue = (
   const path = issue.path.flatMap((part) =>
     typeof part === "string" || typeof part === "number" ? [part] : [],
   );
+  // Branch issue paths are relative to the union; branches often agree.
+  if (issue.code === "invalid_union") {
+    // Unmatched discriminators and ambiguous unions have no branch issues.
+    // Keep their outer failure instead of flattening it into an empty list.
+    if (issue.errors.length === 0) {
+      const expected =
+        "options" in issue ? issue.options?.filter(isSafeExpected) : undefined;
+      return [
+        {
+          path,
+          reason:
+            valueAtPath(input, path) === undefined
+              ? "missing_argument"
+              : "invalid_value",
+          ...(expected === undefined ? {} : { expected }),
+        },
+      ];
+    }
+    return uniqueIssues(
+      issue.errors.flatMap((branch) =>
+        branch.flatMap((branchIssue) =>
+          projectIssue(
+            { ...branchIssue, path: [...issue.path, ...branchIssue.path] },
+            input,
+          ),
+        ),
+      ),
+    );
+  }
+  if (issue.code === "invalid_key")
+    return issue.issues.flatMap((keyIssue) =>
+      projectIssue(
+        { ...keyIssue, path: [...issue.path, ...keyIssue.path] },
+        input,
+      ),
+    );
   if (issue.code === "unrecognized_keys")
     return issue.keys.map((key) => ({
       path: [...path, key],
@@ -37,7 +91,16 @@ const projectIssue = (
   if (issue.code === "too_big")
     return [boundedIssue(path, "maximum", numericBound(issue.maximum))];
   if (issue.code === "invalid_format")
-    return [{ path, reason: "invalid_format", expected: issue.format }];
+    return [
+      {
+        path,
+        reason: "invalid_format",
+        expected: issue.format,
+        ...(issue.format === "regex" && issue.message.length > 0
+          ? { message: issue.message }
+          : {}),
+      },
+    ];
   if (issue.code === "invalid_value")
     return [
       {
@@ -46,8 +109,20 @@ const projectIssue = (
         expected: issue.values.filter(isSafeExpected),
       },
     ];
-  return [{ path, reason: "invalid_value" }];
+  return [
+    {
+      path,
+      reason: "invalid_value",
+      ...(issue.message.length > 0 ? { message: issue.message } : {}),
+    },
+  ];
 };
+
+const uniqueIssues = (
+  issues: readonly AnalysisInputIssue[],
+): AnalysisInputIssue[] => [
+  ...new Map(issues.map((issue) => [JSON.stringify(issue), issue])).values(),
+];
 
 const valueAtPath = (
   input: unknown,
@@ -56,7 +131,8 @@ const valueAtPath = (
   let current = input;
   for (const part of path) {
     if (typeof current !== "object" || current === null) return undefined;
-    current = (current as Readonly<Record<string | number, unknown>>)[part];
+    const next: unknown = Reflect.get(current, part);
+    current = next;
   }
   return current;
 };

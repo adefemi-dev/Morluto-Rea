@@ -1,9 +1,10 @@
-import { performance } from "node:perf_hooks";
-
 import type { JsonValue } from "../domain/jsonValue.js";
 import { err, type Result } from "../domain/result.js";
 import type { GhidraRequestOptions } from "./GhidraClientTypes.js";
-import type { GhidraSessionError } from "./GhidraSessionError.js";
+import type {
+  GhidraSessionError,
+  GhidraSessionFailureKind,
+} from "./GhidraSessionError.js";
 
 /** Result settled by one queued Ghidra Program request. */
 export type GhidraQueuedRequestResult = Result<JsonValue, GhidraSessionError>;
@@ -15,64 +16,46 @@ export type GhidraRequestExecutor = (
 ) => Promise<GhidraQueuedRequestResult>;
 /** Bind queue failures to the owning client's live diagnostics. */
 export type GhidraQueueFailureFactory = (
-  kind: "cancelled" | "timeout" | "protocol",
+  kind: GhidraSessionFailureKind,
   message: string,
-  timeoutMs?: number,
+  cause?: unknown,
 ) => GhidraSessionError;
+
+/** Stop the provider session when an admitted operation is cancelled. */
+export type GhidraActiveCancellationHandler = () => Promise<void>;
 
 interface QueuedRequest {
   readonly method: string;
   readonly parameters: JsonValue;
   readonly signal: AbortSignal | undefined;
-  readonly timeoutMs: number;
-  readonly deadline: number;
   readonly resolve: (result: GhidraQueuedRequestResult) => void;
-  readonly timer: NodeJS.Timeout;
   readonly onAbort: (() => void) | undefined;
 }
 
-/** Bounded FIFO that admits one Ghidra Program request at a time. */
+/** FIFO that admits one Ghidra Program request at a time. */
 export class GhidraRequestQueue {
   readonly #queue: QueuedRequest[] = [];
   #active = false;
-  #size = 0;
+  #closedFailure: GhidraSessionError | undefined;
 
   constructor(
-    private readonly maximum: number,
     private readonly execute: GhidraRequestExecutor,
     private readonly failure: GhidraQueueFailureFactory,
+    private readonly onActiveCancellation: GhidraActiveCancellationHandler,
   ) {}
 
-  /** Queue one request, counting queue wait against its declared deadline. */
+  /** Queue one request until it completes, is cancelled, or the session closes. */
   run(
     method: string,
     parameters: JsonValue,
-    options: GhidraRequestOptions & { readonly timeoutMs: number },
+    options: GhidraRequestOptions,
   ): Promise<GhidraQueuedRequestResult> {
+    if (this.#closedFailure !== undefined)
+      return Promise.resolve(err(this.#closedFailure));
     if (options.signal?.aborted === true)
       return Promise.resolve(
         err(this.failure("cancelled", "Ghidra request was cancelled")),
       );
-    if (options.timeoutMs <= 0)
-      return Promise.resolve(
-        err(
-          this.failure(
-            "timeout",
-            "Ghidra request deadline elapsed",
-            options.timeoutMs,
-          ),
-        ),
-      );
-    if (this.#size >= this.maximum)
-      return Promise.resolve(
-        err(
-          this.failure(
-            "protocol",
-            `Ghidra serial request queue reached its ${String(this.maximum)}-request limit`,
-          ),
-        ),
-      );
-    this.#size += 1;
     return new Promise((resolve) => {
       let entry: QueuedRequest;
       const onAbort =
@@ -83,28 +66,11 @@ export class GhidraRequestQueue {
                 entry,
                 err(this.failure("cancelled", "Ghidra request was cancelled")),
               );
-      const timer = setTimeout(
-        () =>
-          this.#rejectQueued(
-            entry,
-            err(
-              this.failure(
-                "timeout",
-                "Ghidra request deadline elapsed in the serial queue",
-                options.timeoutMs,
-              ),
-            ),
-          ),
-        options.timeoutMs,
-      );
       entry = {
         method,
         parameters,
         signal: options.signal,
-        timeoutMs: options.timeoutMs,
-        deadline: performance.now() + options.timeoutMs,
         resolve,
-        timer,
         onAbort,
       };
       this.#queue.push(entry);
@@ -116,11 +82,16 @@ export class GhidraRequestQueue {
 
   /** Fail requests that have not crossed the socket during session cleanup. */
   failQueued(failure: GhidraSessionError): void {
+    this.#closedFailure = failure;
     for (const entry of this.#queue.splice(0)) {
       this.#release(entry);
-      this.#size -= 1;
       entry.resolve(err(failure));
     }
+  }
+
+  /** Admit requests after the owning client completes a new session startup. */
+  reopen(): void {
+    this.#closedFailure = undefined;
   }
 
   #drain(): void {
@@ -128,43 +99,72 @@ export class GhidraRequestQueue {
     const entry = this.#queue.shift();
     if (entry === undefined) return;
     this.#release(entry);
-    const remaining = entry.deadline - performance.now();
-    if (entry.signal?.aborted === true || remaining <= 0) {
-      this.#size -= 1;
+    if (entry.signal?.aborted === true) {
       entry.resolve(
-        err(
-          entry.signal?.aborted === true
-            ? this.failure("cancelled", "Ghidra request was cancelled")
-            : this.failure(
-                "timeout",
-                "Ghidra request deadline elapsed in the serial queue",
-                entry.timeoutMs,
-              ),
-        ),
+        err(this.failure("cancelled", "Ghidra request was cancelled")),
       );
       this.#drain();
       return;
     }
     this.#active = true;
-    void this.execute(entry.method, entry.parameters, {
-      ...(entry.signal === undefined ? {} : { signal: entry.signal }),
-      timeoutMs: remaining,
-    })
-      .then(entry.resolve)
-      .catch(() =>
+    let executionSettled = false;
+    let activeCancellation: Promise<void> | undefined;
+    const onAbort =
+      entry.signal === undefined
+        ? undefined
+        : () => {
+            if (executionSettled) return;
+            this.failQueued(
+              this.failure(
+                "process",
+                "Ghidra session closed after active request cancellation",
+              ),
+            );
+            activeCancellation = this.onActiveCancellation();
+          };
+    if (onAbort !== undefined)
+      entry.signal?.addEventListener("abort", onAbort, { once: true });
+    void this.execute(
+      entry.method,
+      entry.parameters,
+      entry.signal === undefined ? {} : { signal: entry.signal },
+    )
+      .then(async (result) => {
+        if (activeCancellation !== undefined) {
+          try {
+            await activeCancellation;
+          } catch (cause: unknown) {
+            result = err(
+              this.failure(
+                "process",
+                cause instanceof Error
+                  ? `Ghidra cleanup after cancellation failed: ${cause.message}`
+                  : "Ghidra cleanup after cancellation failed",
+                cause,
+              ),
+            );
+          }
+        }
+        executionSettled = true;
+        entry.resolve(result);
+      })
+      .catch((cause: unknown) => {
+        executionSettled = true;
         entry.resolve(
           err(
             this.failure(
               "protocol",
               "Ghidra serial request execution rejected unexpectedly",
+              cause,
             ),
           ),
-        ),
-      )
+        );
+      })
       .finally(() => {
+        if (entry.signal !== undefined && onAbort !== undefined)
+          entry.signal.removeEventListener("abort", onAbort);
         this.#active = false;
-        this.#size -= 1;
-        this.#drain();
+        if (this.#closedFailure === undefined) this.#drain();
       });
   }
 
@@ -173,12 +173,10 @@ export class GhidraRequestQueue {
     if (index < 0) return;
     this.#queue.splice(index, 1);
     this.#release(entry);
-    this.#size -= 1;
     entry.resolve(result);
   }
 
   #release(entry: QueuedRequest): void {
-    clearTimeout(entry.timer);
     if (entry.signal !== undefined && entry.onAbort !== undefined)
       entry.signal.removeEventListener("abort", entry.onAbort);
   }

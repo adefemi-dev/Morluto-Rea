@@ -1,13 +1,13 @@
-import { homedir } from "node:os";
-
-import { supportsNodeVersion } from "../domain/runtimeVersion.js";
+import {
+  SUPPORTED_NODE_VERSION_PROSE,
+  supportsNodeVersion,
+} from "../domain/runtimeVersion.js";
 import { linuxHopperLauncherPath } from "./LinuxHopper.js";
 import type {
   DoctorCheck,
   DoctorHost,
   DoctorProviderInspection,
 } from "./Doctor.js";
-import type { RuntimeExecutableInventory } from "./RuntimeExecutableDiagnostics.js";
 
 const DEFAULT_HOPPER =
   "/Applications/Hopper Disassembler.app/Contents/MacOS/hopper";
@@ -18,7 +18,6 @@ export interface DoctorDiagnostics {
   readonly checks: readonly DoctorCheck[];
   readonly hopperPath?: string;
   readonly providerInspections?: readonly DoctorProviderInspection[];
-  readonly runtimeExecutables?: RuntimeExecutableInventory;
 }
 
 /** Collect host, provider, and optional-target diagnostics without mutation. */
@@ -26,11 +25,7 @@ export const collectDoctorDiagnostics = async (
   target: string | undefined,
   host: DoctorHost,
 ): Promise<DoctorDiagnostics> => {
-  const runtimeExecutables = await host.runtimeExecutables?.();
-  const checks: DoctorCheck[] = [
-    nodeCheck(host),
-    ...runtimeChecks(runtimeExecutables),
-  ];
+  const checks: DoctorCheck[] = [nodeCheck(host)];
   checks.push(await hostCheck(host));
 
   const hopperPath = await findHopper(host);
@@ -42,8 +37,6 @@ export const collectDoctorDiagnostics = async (
   if (providerInspections !== undefined)
     checks.push(...providerInspections.flatMap(providerDoctorChecks));
 
-  const javascriptReplayCheck = await host.javascriptReplayCheck?.();
-  if (javascriptReplayCheck !== undefined) checks.push(javascriptReplayCheck);
   const ilspyCheck = await optionalIlspyCheck(host);
   if (ilspyCheck !== undefined) checks.push(ilspyCheck);
   const hopperDemoCheck = await optionalHopperDemoCheck(host, hopperPath);
@@ -55,7 +48,6 @@ export const collectDoctorDiagnostics = async (
     checks,
     ...(hopperPath === undefined ? {} : { hopperPath }),
     ...(providerInspections === undefined ? {} : { providerInspections }),
-    ...(runtimeExecutables === undefined ? {} : { runtimeExecutables }),
   };
 };
 
@@ -99,31 +91,35 @@ export const doctorHealthy = (
   );
 };
 
-const nodeCheck = (host: DoctorHost): DoctorCheck =>
-  check("node", supportsNodeVersion(host.nodeVersion), host.nodeVersion, {
-    remediation: "Install Node.js 22.19+ or 24.11+.",
+/** Bun passes when its reported Node.js compatibility version is supported. */
+const nodeCheck = ({ runtime }: DoctorHost): DoctorCheck => {
+  const failure = {
+    remediation: `Install ${SUPPORTED_NODE_VERSION_PROSE}.`,
     classification: "missing_dependency",
-  });
-
-const runtimeChecks = (
-  inventory: RuntimeExecutableInventory | undefined,
-): readonly DoctorCheck[] => {
-  if (inventory === undefined) return [];
-  const broken = inventory.candidates.filter(({ healthy }) => !healthy);
-  const detail =
-    broken.length === 0
-      ? `${String(inventory.candidates.length)} runtime executable candidates passed bounded version probes.`
-      : `${String(broken.length)} of ${String(inventory.candidates.length)} runtime executable candidates failed bounded version probes: ${broken
-          .slice(0, 5)
-          .map(({ lexical_path: path }) => path)
-          .join(", ")}${broken.length > 5 ? ", …" : ""}`;
-  return [
-    check("node-toolchains", broken.length === 0, detail, {
-      remediation:
-        "Select a verified healthy Node toolchain or repair the failing installation, then rerun rea doctor. Do not create compatibility-library symlinks.",
-      classification: "missing_dependency",
-    }),
-  ];
+  } as const;
+  if (runtime.id === "node")
+    return {
+      ...check(
+        "node",
+        supportsNodeVersion(runtime.version),
+        runtime.version,
+        failure,
+      ),
+      details: { runtime: "node", version: runtime.version },
+    };
+  return {
+    ...check(
+      "node",
+      supportsNodeVersion(runtime.nodeCompatibilityVersion),
+      `Bun ${runtime.version} (Node.js ${runtime.nodeCompatibilityVersion} compatibility)`,
+      failure,
+    ),
+    details: {
+      runtime: "bun",
+      version: runtime.version,
+      node_compatibility_version: runtime.nodeCompatibilityVersion,
+    },
+  };
 };
 
 const hostCheck = async (host: DoctorHost): Promise<DoctorCheck> => {
@@ -142,7 +138,7 @@ const hostCheck = async (host: DoctorHost): Promise<DoctorCheck> => {
       : `${linuxDistribution.id} ${linuxDistribution.versionId ?? "unknown"}`);
   return check("host", supported, detail, {
     remediation:
-      "REA supports macOS 12+, Ubuntu 24.04+, Fedora 41+, 64-bit Arch Linux, and the experimental Windows x64 Ghidra P0 boundary.",
+      "REA supports macOS 12+, Ubuntu 24.04+, Fedora 41+, Nobara 44+, 64-bit Arch Linux, CachyOS, Omarchy, and the experimental Windows x64 Ghidra P0 boundary.",
     classification: "unsupported_host",
   });
 };
@@ -153,7 +149,7 @@ const findHopper = async (host: DoctorHost): Promise<string | undefined> => {
       ? [
           DEFAULT_HOPPER,
           SYSTEM_LINUX_HOPPER,
-          linuxHopperLauncherPath(homedir()),
+          linuxHopperLauncherPath(host.homeDirectory),
           ...(await host.manualHopperPaths()),
         ]
       : [host.configuredHopperPath];
@@ -220,16 +216,7 @@ const optionalHopperDemoCheck = async (
 ): Promise<DoctorCheck | undefined> =>
   host.platform !== "linux" || hopperPath === undefined
     ? undefined
-    : check(
-        "hopper-demo-runtime",
-        await host.linuxDemoRuntimeReady(),
-        undefined,
-        {
-          remediation:
-            "Rerun rea setup to install the Xvfb, xauth, Python, X11, and XTEST packages required for Linux demo sessions.",
-          classification: "missing_dependency",
-        },
-      );
+    : host.linuxDemoRuntimeCheck();
 
 const optionalIlspyCheck = async (
   host: DoctorHost,
@@ -256,10 +243,12 @@ const optionalTargetCheck = async (
 ): Promise<DoctorCheck | undefined> =>
   target === undefined
     ? undefined
-    : check("target", await host.validTarget(target), target, {
-        remediation: "Supply a readable local app or program path.",
-        classification: "config_drift",
-      });
+    : host.inspectTarget !== undefined
+      ? host.inspectTarget(target)
+      : check("target", await host.validTarget(target), target, {
+          remediation: "Supply a readable local app or program path.",
+          classification: "config_drift",
+        });
 
 const check = (
   name: string,

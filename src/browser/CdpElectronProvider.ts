@@ -2,7 +2,7 @@ import type {
   ExecutionOptions,
   ProviderIdentity,
 } from "../application/AnalysisProvider.js";
-import type { ElectronObservationPort } from "../application/ElectronObservationPort.js";
+import type { ElectronObservationPort } from "../application/javascript/ElectronObservationPort.js";
 import {
   electronPageInspectionSchema,
   electronTargetListSchema,
@@ -10,13 +10,11 @@ import {
   type ElectronTargetList,
   type InspectElectronPageInput,
   type ListElectronTargetsInput,
-} from "../domain/electronObservation.js";
-import {
-  AnalysisError,
-  BrowserObservationError,
-  ProviderAdapterError,
-  type BrowserObservationOperation,
-} from "../domain/errors.js";
+} from "../domain/javascript/electronObservation.js";
+import { AnalysisError } from "../domain/analysisErrorBase.js";
+import { BrowserObservationError } from "../domain/browserObservationError.js";
+import { ProviderAdapterError } from "../domain/providerAdapterError.js";
+import type { BrowserObservationOperation } from "../domain/browserObservationErrors.js";
 import { err, ok, type Result } from "../domain/result.js";
 import {
   discoverCdpEndpoint,
@@ -29,23 +27,14 @@ import {
   type CdpTargetSession,
 } from "./CdpTargetSession.js";
 import { inspectCdpElectronPage } from "./CdpElectronInspection.js";
-import {
-  authorizedElectronFile,
-  canonicalElectronRoots,
-} from "./ElectronFileScope.js";
+import { authorizedElectronFile } from "./ElectronFileScope.js";
 
-/** Public identity committed by passive Electron observations. */
-export const CDP_ELECTRON_PROVIDER_IDENTITY: ProviderIdentity = Object.freeze({
-  id: "rea-cdp-electron",
-  name: "REA Electron file-page CDP observation provider",
-  version: "1",
-});
-const IDENTITY = CDP_ELECTRON_PROVIDER_IDENTITY;
-
-/** Passive Electron provider with canonical file-root confinement. */
+import { CDP_ELECTRON_PROVIDER_IDENTITY } from "./providerIdentities.js";
+import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
+/** Passive Electron provider for local file pages exposed by loopback CDP. */
 export class CdpElectronProvider implements ElectronObservationPort {
   identity(): ProviderIdentity {
-    return IDENTITY;
+    return CDP_ELECTRON_PROVIDER_IDENTITY;
   }
 
   async listTargets(
@@ -53,14 +42,12 @@ export class CdpElectronProvider implements ElectronObservationPort {
     options: ExecutionOptions = {},
   ): Promise<Result<ElectronTargetList, AnalysisError>> {
     try {
-      const roots = await canonicalElectronRoots(input.allowed_file_roots);
       const discovery = await discoverCdpEndpoint(
         input.cdp_endpoint,
         "list_electron_targets",
         options.signal,
       );
       const allowed = [];
-      let outsideRoot = 0;
       let unsupportedUrl = 0;
       let nonPage = 0;
       let unconnectable = 0;
@@ -69,10 +56,9 @@ export class CdpElectronProvider implements ElectronObservationPort {
           nonPage += 1;
           continue;
         }
-        const path = await authorizedElectronFile(target.url, roots);
+        const path = await authorizedElectronFile(target.url);
         if (path === undefined) {
-          if (isFileUrl(target.url)) outsideRoot += 1;
-          else unsupportedUrl += 1;
+          unsupportedUrl += 1;
           continue;
         }
         if (!hasCdpTargetWebSocket(discovery, target)) {
@@ -82,40 +68,34 @@ export class CdpElectronProvider implements ElectronObservationPort {
         allowed.push({
           target_id: target.id,
           type: target.type,
-          title: target.title.slice(0, 16_384),
+          title: target.title,
           file_path: path,
           attached: target.attached,
         });
       }
       allowed.sort((left, right) =>
-        left.target_id.localeCompare(right.target_id),
+        compareUnicodeCodePoints(left.target_id, right.target_id),
       );
-      const items = allowed.slice(input.offset, input.offset + input.limit);
-      const next = input.offset + items.length;
       return ok(
         electronTargetListSchema.parse({
-          schema_version: 1,
           browser: discovery.version,
-          targets: {
-            items,
-            offset: input.offset,
-            limit: input.limit,
-            total: allowed.length,
-            next_offset: next < allowed.length ? next : null,
-            has_more: next < allowed.length,
-          },
+          targets: allowed,
           excluded: {
-            outside_root: outsideRoot,
             unsupported_url: unsupportedUrl,
             non_page: nonPage,
           },
           limitations: [
-            "Only page targets whose canonical file path is contained by an approved root are listed.",
+            "Every local file page exposed by the selected loopback CDP endpoint is eligible for listing.",
             ...(unconnectable === 0
               ? []
               : [
                   `${String(unconnectable)} otherwise allowed page target(s) lacked a validated direct CDP WebSocket and were excluded.`,
                 ]),
+            ...(allowed.some((target) => target.attached === null)
+              ? [
+                  "CDP discovery omitted attachment state for one or more targets; attached is reported as unknown.",
+                ]
+              : []),
           ],
         }),
       );
@@ -130,17 +110,12 @@ export class CdpElectronProvider implements ElectronObservationPort {
   ): Promise<Result<ElectronPageInspection, AnalysisError>> {
     let targetSession: CdpTargetSession | undefined;
     try {
-      const roots = await canonicalElectronRoots(input.allowed_file_roots);
       const discovery = await discoverCdpEndpoint(
         input.cdp_endpoint,
         "inspect_electron_page",
         options.signal,
       );
-      const target = await authorizeTarget(
-        discovery.targets,
-        input.target_id,
-        roots,
-      );
+      const target = await authorizeTarget(discovery.targets, input.target_id);
       targetSession = await openCdpTargetSession(
         discovery,
         target,
@@ -166,11 +141,11 @@ export class CdpElectronProvider implements ElectronObservationPort {
       return err(providerError(cause, "inspect_electron_page"));
     } finally {
       if (targetSession !== undefined)
-        await closeCdpTargetSession(targetSession, [
-          "Debugger",
-          "Runtime",
-          "Page",
-        ]);
+        await closeCdpTargetSession(
+          targetSession,
+          ["Debugger", "Runtime", "Page"],
+          options.signal,
+        );
     }
   }
 }
@@ -178,25 +153,16 @@ export class CdpElectronProvider implements ElectronObservationPort {
 const authorizeTarget = async (
   targets: readonly CdpEndpointTarget[],
   targetId: string,
-  roots: readonly string[],
 ): Promise<CdpEndpointTarget> => {
   const target = targets.find(({ id }) => id === targetId);
   if (target === undefined)
     throw new BrowserObservationError("inspect_web_page", "target_not_found");
   if (
     target.type !== "page" ||
-    (await authorizedElectronFile(target.url, roots)) === undefined
+    (await authorizedElectronFile(target.url)) === undefined
   )
     throw new BrowserObservationError("inspect_web_page", "target_not_allowed");
   return target;
-};
-
-const isFileUrl = (value: string): boolean => {
-  try {
-    return new URL(value).protocol === "file:";
-  } catch {
-    return false;
-  }
 };
 
 const providerError = (
@@ -207,4 +173,6 @@ const providerError = (
     ? new BrowserObservationError(operation, cause.reason, { cause })
     : cause instanceof AnalysisError
       ? cause
-      : new ProviderAdapterError(IDENTITY.id, operation, { cause });
+      : new ProviderAdapterError(CDP_ELECTRON_PROVIDER_IDENTITY.id, operation, {
+          cause,
+        });

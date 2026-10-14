@@ -3,8 +3,10 @@ import { z } from "zod";
 import { browserCompletenessSchema } from "./browserCompleteness.js";
 import { webTextArtifactSchema } from "./webContentArtifact.js";
 import { jsonShapeSchema } from "./jsonShape.js";
+import { prefixedDigestSchema } from "./../domain/digests.js";
 
-const browserVersionSchema = z.object({
+/** Shared CDP/browser version identity carried on observation Evidence. */
+export const browserVersionSchema = z.object({
   product: z.string(),
   protocol_version: z.string(),
   revision: z.string(),
@@ -18,21 +20,18 @@ const browserTargetSchema = z.object({
   title: z.string(),
   url: z.string(),
   origin: z.string(),
-  attached: z.boolean(),
+  attached: z
+    .boolean()
+    .nullable()
+    .describe(
+      "Discovery-reported debugger attachment state; null means unknown",
+    ),
 });
 
-/** Bounded and policy-filtered browser target discovery result. */
+/** Complete policy-filtered browser target discovery result. */
 export const browserTargetListSchema = z.object({
-  schema_version: z.literal(1),
   browser: browserVersionSchema,
-  targets: z.object({
-    items: z.array(browserTargetSchema),
-    offset: z.number().int().min(0),
-    limit: z.number().int().min(1),
-    total: z.number().int().min(0),
-    next_offset: z.number().int().min(0).nullable(),
-    has_more: z.boolean(),
-  }),
+  targets: z.array(browserTargetSchema),
   excluded: z.object({
     disallowed_origin: z.number().int().min(0),
     unsupported_url: z.number().int().min(0),
@@ -63,6 +62,14 @@ const browserAxNodeSchema = z.object({
   name: z.string().nullable(),
   description: z.string().nullable(),
   ignored: z.boolean(),
+  states: z
+    .array(
+      z.object({
+        name: z.string(),
+        value: z.union([z.boolean(), z.number(), z.string()]),
+      }),
+    )
+    .default([]),
 });
 const browserScriptSourceSchema = z.discriminatedUnion("included", [
   z.object({ included: z.literal(false), reason: z.string() }),
@@ -87,16 +94,29 @@ const browserScriptSchema = z.object({
   frame_id: z.string().nullable().default(null),
   url: z.string(),
   origin: z.string().nullable(),
-  cdp_hash: z.string(),
-  length: z.number().int().min(0),
-  is_module: z.boolean(),
+  cdp_hash: z
+    .string()
+    .nullable()
+    .describe("Producer-reported script hash; null when unavailable."),
+  length: z
+    .number()
+    .int()
+    .min(0)
+    .nullable()
+    .describe("Producer-reported script length; null when unavailable."),
+  is_module: z
+    .boolean()
+    .nullable()
+    .describe(
+      "Producer-reported module classification; null when unavailable.",
+    ),
   language: z.string().nullable(),
   source_map_url: z.string().nullable(),
   resource_reconciliation: browserResourceReconciliationSchema,
   source: browserScriptSourceSchema,
 });
 const browserResourceSchema = z.object({
-  resource_key: z.string().regex(/^res_[a-f0-9]{64}$/u),
+  resource_key: prefixedDigestSchema("res"),
   url: z.string(),
   origin: z.string().nullable(),
   type: z.string(),
@@ -112,6 +132,21 @@ const browserNetworkRequestSchema = z.object({
   status: z.number().nullable(),
   mime_type: z.string().nullable(),
   encoded_data_length: z.number().min(0).nullable(),
+  redirects: z
+    .array(
+      z.object({
+        url: z.string(),
+        response_url: z.string(),
+        method: z.string(),
+        resource_type: z.string().nullable(),
+        status: z.number().nullable(),
+        mime_type: z.string().nullable(),
+        encoded_data_length: z.number().min(0).nullable(),
+        request_timestamp: z.number().nullable(),
+        redirect_event_timestamp: z.number().nullable(),
+      }),
+    )
+    .optional(),
   initiator: z.object({
     type: z.string(),
     url: z.string().nullable(),
@@ -119,13 +154,7 @@ const browserNetworkRequestSchema = z.object({
     column: z.number().int().min(0).nullable(),
   }),
   body_shapes: z.object({
-    status: z.enum([
-      "not_approved",
-      "included",
-      "partial",
-      "unavailable",
-      "truncated",
-    ]),
+    status: z.enum(["not_approved", "included", "partial", "unavailable"]),
     request: jsonShapeSchema.nullable(),
     response: jsonShapeSchema.nullable(),
   }),
@@ -138,7 +167,7 @@ const browserConsoleEventSchema = z.object({
   line: z.number().int().min(0).nullable(),
   column: z.number().int().min(0).nullable(),
   text_capture: z.object({
-    status: z.enum(["not_approved", "included", "truncated"]),
+    status: z.enum(["not_approved", "included"]),
     values: z.array(
       z.object({
         argument_index: z.number().int().min(0),
@@ -147,21 +176,23 @@ const browserConsoleEventSchema = z.object({
       }),
     ),
     retained_bytes: z.number().int().min(0),
-    truncated_values: z.number().int().min(0),
   }),
 });
-const browserWebSocketEventSchema = z.object({
-  request_id: z.string(),
+const browserWebSocketFrameSchema = z.object({
   direction: z.enum(["sent", "received"]),
   opcode: z.number().int().min(0),
-  payload_bytes: z.number().int().min(0),
+  payload_bytes: z.number().int().min(0).nullable(),
   payload_shape: z
     .object({
       format: z.enum(["json", "text", "binary"]),
       json_shape: jsonShapeSchema.nullable(),
-      truncated: z.boolean(),
     })
     .nullable(),
+});
+const browserWebSocketConnectionSchema = z.object({
+  request_id: z.string(),
+  url: z.string(),
+  events: z.array(browserWebSocketFrameSchema),
 });
 const browserWorkerSchema = z.object({
   target_id: z.string(),
@@ -245,7 +276,6 @@ const browserSafeMetadataSchema = z.object({
 
 /** Provider-neutral normalized result for one passive web-page observation. */
 export const webPageInspectionSchema = z.object({
-  schema_version: z.literal(2),
   browser: browserVersionSchema,
   target: browserTargetSchema,
   capture_window: z.object({
@@ -262,10 +292,9 @@ export const webPageInspectionSchema = z.object({
   accessibility: z.object({
     total_nodes: z.number().int().min(0),
     text_capture: z.object({
-      status: z.enum(["not_approved", "included", "truncated", "unavailable"]),
+      status: z.enum(["not_approved", "included", "unavailable"]),
       retained_bytes: z.number().int().min(0),
       excluded_fields: z.number().int().min(0),
-      truncated_fields: z.number().int().min(0),
     }),
     nodes: z.array(browserAxNodeSchema),
   }),
@@ -276,7 +305,7 @@ export const webPageInspectionSchema = z.object({
   resources: z.array(browserResourceSchema),
   network: z.object({
     requests: z.array(browserNetworkRequestSchema),
-    websocket_events: z.array(browserWebSocketEventSchema),
+    websocket_connections: z.array(browserWebSocketConnectionSchema),
     coverage_started_at: z.iso.datetime(),
     prior_activity_available: z.literal(false),
   }),
@@ -295,6 +324,28 @@ export const webPageInspectionSchema = z.object({
     session_storage_keys: z.array(z.string()),
     indexed_db_names: z.array(z.string()),
     cache_names: z.array(z.string()),
+    content_fingerprints: z
+      .array(
+        z.object({
+          scope: z.enum([
+            "cookie",
+            "local_storage",
+            "session_storage",
+            "indexed_db_schema",
+            "indexed_db_record",
+            "cache_entry",
+          ]),
+          identity_sha256: z.string().regex(/^[a-f0-9]{64}$/u),
+          value_sha256: z
+            .string()
+            .regex(/^[a-f0-9]{64}$/u)
+            .nullable(),
+          complete: z.boolean(),
+        }),
+      )
+      .default([]),
+    fingerprint_algorithm: z.literal("sha256").default("sha256"),
+    fingerprints_complete: z.boolean().default(false),
     values_redacted: z.literal(true),
   }),
   limitations: z.array(z.string()),

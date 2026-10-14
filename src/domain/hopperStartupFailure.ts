@@ -1,14 +1,7 @@
-export type HopperStartupFailureCode =
-  | "private_display_unavailable"
-  | "x11_authorization_failed"
-  | "unsupported_hopper_build"
-  | "invalid_launch_command"
-  | "process_ownership_mismatch"
-  | "hopper_exited_during_startup"
-  | "unsupported_demo_dialog"
-  | "unexpected_display_geometry"
-  | "x11_input_failed"
-  | "runtime_dependency_unavailable";
+export type HopperPrivateDisplayStrategy =
+  | "direct"
+  | "user-mount-namespace"
+  | "unavailable";
 
 const failures = [
   [
@@ -39,7 +32,7 @@ const failures = [
   [
     75,
     "hopper_exited_during_startup",
-    "Hopper exited before the REA bridge was ready. Run rea doctor and retry the analysis.",
+    "Hopper exited before the REA bridge was ready. In CI, run rea doctor --provider hopper --json; if Hopper showed a UI or license prompt, complete it in the runner user session, otherwise close stale Hopper sessions and retry.",
   ],
   [
     76,
@@ -61,7 +54,54 @@ const failures = [
     "runtime_dependency_unavailable",
     "A Linux demo-session dependency is unavailable. Rerun rea setup --yes --install-hopper, then rea doctor.",
   ],
+  [
+    80,
+    "x11_socket_directory_unusable",
+    "REA cannot use the host X11 socket directory for a private display. Run rea doctor --provider hopper for exact mount and namespace diagnostics.",
+  ],
 ] as const;
+
+export type HopperStartupFailureCode = (typeof failures)[number][1];
+
+interface HopperStartupDiagnosticContext {
+  readonly component: "hopper_private_display";
+  readonly operation: "probe" | "launch";
+  readonly reason: string;
+  readonly socket_directory: "/tmp/.X11-unix";
+  readonly socket_directory_mode: string | null;
+  readonly mount_read_only: boolean | null;
+  readonly effective_socket_directory_mode: string | null;
+  readonly effective_mount_read_only: boolean | null;
+  readonly wsl: boolean;
+  readonly strategy: HopperPrivateDisplayStrategy;
+  readonly fallback_reason: string | null;
+  readonly xvfb_stderr_bytes: number;
+}
+
+/** Non-secret facts emitted by the Linux private-display adapter. */
+export type HopperStartupDiagnostic = HopperStartupDiagnosticContext &
+  (
+    | {
+        readonly status: "ready";
+        readonly failure_code: null;
+      }
+    | {
+        readonly status: "error";
+        readonly failure_code: HopperStartupFailureCode;
+      }
+  );
+
+/** A parsed Linux private-display diagnostic that reports startup failure. */
+export type HopperStartupFailureDiagnostic = Extract<
+  HopperStartupDiagnostic,
+  { readonly status: "error" }
+>;
+
+/** A parsed Linux private-display diagnostic that reports readiness. */
+export type HopperStartupReadyDiagnostic = Extract<
+  HopperStartupDiagnostic,
+  { readonly status: "ready" }
+>;
 
 const HOPPER_STARTUP_FAILURES = new Map<
   number,
@@ -71,3 +111,15 @@ const HOPPER_STARTUP_FAILURES = new Map<
 /** Return the stable public failure associated with a Linux demo adapter exit. */
 export const hopperStartupFailure = (exitCode: number | null) =>
   exitCode === null ? undefined : HOPPER_STARTUP_FAILURES.get(exitCode);
+
+/** Return the adapter exit associated with one stable startup failure code. */
+export const hopperStartupExitCode = (
+  code: HopperStartupFailureCode,
+): number | undefined =>
+  failures.find(([, candidate]) => candidate === code)?.[0];
+
+/** Narrow an untrusted diagnostic field to the public startup code union. */
+export const isHopperStartupFailureCode = (
+  value: string,
+): value is HopperStartupFailureCode =>
+  failures.some(([, candidate]) => candidate === value);

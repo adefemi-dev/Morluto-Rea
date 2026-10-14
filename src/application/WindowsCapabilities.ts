@@ -4,15 +4,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  windowsNativeCapabilities,
+  type WindowsNativeCapabilitySet,
+} from "../process/WindowsAuthority.js";
+import {
   probeProcessCaptureCapability,
   type ProcessCaptureCapability,
-} from "./ProcessCaptureCapability.js";
+} from "../process/capture/ProcessCaptureCapability.js";
 
 /** One named Windows host observation without inferred authority. */
-interface WindowsCapabilityOutcome {
-  readonly available: boolean;
-  readonly reason: string | null;
-}
+export type WindowsCapabilityOutcome =
+  | { readonly available: true; readonly reason: null }
+  | { readonly available: false; readonly reason: string };
 
 /** Injectable host probes used by CI and deterministic unit tests. */
 export interface WindowsCapabilityDependencies {
@@ -23,6 +26,7 @@ export interface WindowsCapabilityDependencies {
   probePrivateAcl(): WindowsCapabilityOutcome;
   probeUnixDomainSocket(): WindowsCapabilityOutcome;
   probePty(): Promise<ProcessCaptureCapability>;
+  nativeCapabilities?(): WindowsNativeCapabilitySet;
 }
 
 /** Machine-readable facts for features that need Windows-specific security. */
@@ -36,6 +40,8 @@ export interface WindowsCapabilityReport {
     unix_domain_socket: WindowsCapabilityOutcome;
     pty: WindowsCapabilityOutcome;
   }>;
+  /** Security controls that are unavailable until native authority exists. */
+  readonly security: WindowsNativeCapabilitySet;
 }
 
 /** Probe named prerequisites without converting missing controls into support. */
@@ -54,11 +60,13 @@ export const probeWindowsCapabilities = async (
       no_follow_open: dependencies.probeNoFollowOpen(),
       private_acl: dependencies.probePrivateAcl(),
       unix_domain_socket: dependencies.probeUnixDomainSocket(),
-      pty: {
-        available: pty.available,
-        reason: pty.available ? null : pty.reason,
-      },
+      pty: pty.available
+        ? { available: true, reason: null }
+        : { available: false, reason: pty.reason },
     },
+    security:
+      dependencies.nativeCapabilities?.() ??
+      windowsNativeCapabilities(dependencies.platform),
   };
 };
 
@@ -68,10 +76,9 @@ const systemDependencies = (): WindowsCapabilityDependencies => ({
   probeSymlinkCreation,
   probeNoFollowOpen: () =>
     systemNoFollowOpenCapability(process.platform, constants.O_NOFOLLOW),
-  probePrivateAcl: () => ({
-    available: false,
-    reason: "Windows ACL enforcement is not implemented by this REA build",
-  }),
+  probePrivateAcl: () =>
+    windowsNativeCapabilities(process.platform).private_runtime_dacl,
+  nativeCapabilities: () => windowsNativeCapabilities(process.platform),
   probeUnixDomainSocket: () =>
     process.platform === "win32"
       ? {
@@ -90,7 +97,8 @@ export const systemNoFollowOpenCapability = (
   if (platform === "win32")
     return {
       available: false,
-      reason: "Windows reparse-safe handle admission is not implemented",
+      reason:
+        "Node pathname O_NOFOLLOW is not Windows handle authority; native admission is reported separately in security.",
     };
   return typeof noFollow === "number"
     ? { available: true, reason: null }
@@ -121,9 +129,10 @@ const probeSymlinkCreation = async (): Promise<WindowsCapabilityOutcome> => {
   } finally {
     try {
       await rm(root, { recursive: true, force: true });
-    } catch {
+    } catch (cause: unknown) {
       // Cleanup failure must not replace the machine-readable probe outcome.
       // The probe root lives beneath the OS temporary directory and is unique.
+      void cause;
     }
   }
 };

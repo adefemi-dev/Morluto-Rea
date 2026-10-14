@@ -1,45 +1,71 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import { Client } from "@modelcontextprotocol/client";
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { access, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { CdpBrowserProvider } from "../dist/browser/CdpBrowserProvider.js";
 import { waitForBrowserDevtoolsPort } from "../dist/browser/BrowserProcessStartup.js";
+import { createBrowserScenarioProvider } from "../dist/composition/browserScenario.js";
 import {
   inspectWebPageInputSchema,
   listBrowserTargetsInputSchema,
 } from "../dist/domain/browserObservation.js";
-import { analyzeWebBundleInputSchema } from "../dist/domain/webBundleAnalysis.js";
 import { observeWebSessionInputSchema } from "../dist/domain/browserSession.js";
-import { compareWebCapturesInputSchema } from "../dist/domain/webCaptureDiff.js";
+import { compareWebCapturesInputSchema } from "../dist/domain/webCaptureDiffSchemas.js";
 import {
   captureWebScreenshotInputSchema,
   compareWebScreenshotsInputSchema,
 } from "../dist/domain/webScreenshot.js";
 import { startBrowserVerifierSite } from "./fixtures/browser-verifier-site.mjs";
 import { startPageCdpProxy } from "./fixtures/page-cdp-proxy.mjs";
-import { sourceMapSummary } from "./lib/browser-verifier-assertions.mjs";
+import {
+  assertBundleAnalysis,
+  assertObservation,
+  assertSensitiveShapes,
+} from "./lib/browser-verifier-assertions.mjs";
+import {
+  assertScenarioCapture,
+  browserScenario,
+  runScenarioCli,
+  scenarioProfiles,
+  verifyScenarioFailureEvidence,
+} from "./lib/browser-scenario-verifier.mjs";
+import { completeVerifierRun, createVerifierRun } from "./lib/verifier-run.mjs";
+import { verifyLargeScreenshotE2e } from "./lib/browser-screenshot-e2e.mjs";
+import { verifyPopupEventCoverage } from "./lib/browser-popup-e2e.mjs";
+import { verifyBrowserNetworkEvidence } from "./lib/browser-network-e2e.mjs";
+import { verifyBrowserScriptExport } from "./lib/browser-script-export-e2e.mjs";
+import { verifyBrowserModules } from "./lib/browser-module-e2e.mjs";
+import { verifyBrowserDomDestinations } from "./lib/browser-dom-destinations-e2e.mjs";
+import { verifyBrowserCaptureMetadataBudget } from "./lib/browser-capture-metadata-budget-e2e.mjs";
+import { artifactCliEvidence, artifactMcpResult } from "./lib/artifact-e2e.mjs";
+import { verifyScenarioEnvironment } from "./lib/browser-scenario-environment-e2e.mjs";
+import { verifyScenarioStorage } from "./lib/browser-scenario-storage-e2e.mjs";
 
-const SECRET_VALUES = [
-  "network-secret-value",
-  "console-secret-value",
-  "storage-secret-value",
-  "websocket-secret-value",
-  "ax-private-label-value",
-];
+const REAL_BROWSER_STARTUP_TIMEOUT_MS = 60_000;
+const SCENARIO_SECRET_VALUE = "rea-browser-verifier-secret";
+const SCENARIO_URL_SECRET_VALUE = "rea-browser-url-verifier-secret";
+process.env.REA_BROWSER_VERIFIER_SECRET = SCENARIO_SECRET_VALUE;
+process.env.REA_BROWSER_VERIFIER_URL = SCENARIO_URL_SECRET_VALUE;
+const verifierRun = createVerifierRun();
 
 const executable = await browserExecutable();
 const profile = await mkdtemp(join(tmpdir(), "rea-real-browser-"));
 const site = await startBrowserVerifierSite();
 let browser;
 let pageProxy;
+let report;
 try {
   browser = spawn(
     executable,
     [
       "--headless=new",
+      "--password-store=basic",
       ...(process.env.REA_BROWSER_NO_SANDBOX === "true"
         ? ["--no-sandbox"]
         : []),
@@ -66,44 +92,60 @@ try {
     executable,
     activePortPath: join(profile, "DevToolsActivePort"),
     stderr: () => stderr,
+    timeoutMs: REAL_BROWSER_STARTUP_TIMEOUT_MS,
   });
   const endpoint = `http://127.0.0.1:${String(port)}`;
   const provider = new CdpBrowserProvider();
-  const target = await pageTarget(provider, endpoint, site.origin);
+  const target = await pageTarget(provider, endpoint);
   const observed = await provider.inspectPage(
     inspectWebPageInputSchema.parse({
       cdp_endpoint: endpoint,
       allowed_origins: [site.origin],
-      approved: true,
       target_id: target,
       observation_ms: 1_000,
       include_storage_keys: true,
+      include_storage_fingerprints: true,
     }),
   );
   if (!observed.ok) throw observed.error;
   assertObservation(observed.value, site.origin);
+  const domDestinations = await verifyBrowserDomDestinations({
+    cdp_endpoint: endpoint,
+    target_id: target,
+  });
   const serialized = JSON.stringify(observed.value);
-  for (const secret of [...SECRET_VALUES, "browser-secret-value"])
+  if (
+    !observed.value.target.url.includes("startup=browser-secret-value") ||
+    !observed.value.network.requests.some((request) =>
+      request.url.includes("token=network-secret-value"),
+    )
+  )
+    throw new Error(
+      "Passive browser result did not preserve ordinary URL queries",
+    );
+  for (const secret of [
+    "request-secret-value",
+    "request-body-secret-value",
+    "response-secret-value",
+    "storage-secret-value",
+    "websocket-secret-value",
+  ])
     if (serialized.includes(secret))
       throw new Error(
-        `Passive browser result retained redacted value: ${secret}`,
+        `Passive browser result included unselected structured data: ${secret}`,
       );
 
   const withSource = await provider.inspectPage(
     inspectWebPageInputSchema.parse({
       cdp_endpoint: endpoint,
       allowed_origins: [site.origin],
-      approved: true,
       target_id: target,
-      observation_ms: 200,
+      observation_ms: 1_000,
       include_accessibility_text: true,
       include_script_sources: true,
       include_console_text: true,
-      console_text_approved: true,
       include_json_body_shapes: true,
-      json_body_schema_approved: true,
       include_websocket_shapes: true,
-      websocket_shape_approved: true,
     }),
   );
   if (!withSource.ok) throw withSource.error;
@@ -126,20 +168,7 @@ try {
     );
   assertSensitiveShapes(withSource.value);
 
-  const bundle = await provider.analyzeBundle(
-    analyzeWebBundleInputSchema.parse({
-      cdp_endpoint: endpoint,
-      allowed_origins: [site.origin],
-      approved: true,
-      target_id: target,
-      observation_ms: 200,
-      source_capture_approved: true,
-      fetch_source_maps: true,
-      source_map_fetch_approved: true,
-    }),
-  );
-  if (!bundle.ok) throw bundle.error;
-  assertBundleAnalysis(bundle.value);
+  const bundle = await verifyPublicBundle(endpoint, target, site.origin);
 
   const captureDiff = await provider.compareCaptures(
     compareWebCapturesInputSchema.parse({
@@ -158,8 +187,6 @@ try {
     captureWebScreenshotInputSchema.parse({
       cdp_endpoint: endpoint,
       allowed_origins: [site.origin],
-      approved: true,
-      screenshot_approved: true,
       target_id: target,
     }),
   );
@@ -187,7 +214,6 @@ try {
     observeWebSessionInputSchema.parse({
       cdp_endpoint: endpoint,
       allowed_origins: [site.origin],
-      approved: true,
       target_id: target,
       observation_ms: 1_500,
     }),
@@ -206,29 +232,171 @@ try {
 
   pageProxy = await startPageCdpProxy(endpoint);
   await verifyPageScopedTransport(provider, pageProxy, site.origin);
-
-  process.stdout.write(
-    `${JSON.stringify({
-      browser: observed.value.browser.product,
-      endpoint,
-      target,
-      domNodes: observed.value.dom.nodes.length,
-      accessibilityNodes: observed.value.accessibility.nodes.length,
-      scripts: observed.value.scripts.items.length,
-      networkRequests: observed.value.network.requests.length,
-      consoleEvents: observed.value.console.events.length,
-      websocketEvents: observed.value.network.websocket_events.length,
-      bundleScripts: bundle.value.capture.scripts_analyzed,
-      sourceMaps: bundle.value.observations.source_maps.processed,
-      sessionEvents: session.value.timeline.length,
-      pageScopedTransport: true,
-      screenshotBytes: screenshot.value.artifact.bytes,
-      verified: true,
-    })}\n`,
+  const attachedScenarioInput = browserScenario(
+    {
+      mode: "connect",
+      cdp_endpoint: endpoint,
+      target_id: target,
+    },
+    site.origin,
   );
+  let attachedScenario;
+  try {
+    attachedScenario = await runScenarioCli(attachedScenarioInput);
+  } catch (cliError) {
+    const direct = await createBrowserScenarioProvider(
+      process.env,
+    ).captureScenario(attachedScenarioInput);
+    if (!direct.ok) {
+      const underlying = direct.error.cause;
+      const details =
+        underlying instanceof Error
+          ? `${underlying.name}: ${underlying.message}`
+          : String(underlying ?? direct.error.message);
+      throw new Error(
+        `Attached browser scenario failed through both CLI and provider: ${details}`,
+        { cause: cliError },
+      );
+    }
+    throw new Error(
+      "Attached browser scenario failed through CLI, but direct provider capture succeeded",
+      { cause: cliError },
+    );
+  }
+  if (
+    attachedScenario.normalized_result?.browser?.cleanup !==
+      "disconnected-external" ||
+    attachedScenario.normalized_result?.browser?.process_ownership !==
+      "external"
+  )
+    throw new Error(
+      "Scenario CLI did not report external disconnect ownership",
+    );
+  const versionResponse = await fetch(`${endpoint}/json/version`);
+  if (!versionResponse.ok || browser.exitCode !== null)
+    throw new Error("Scenario attachment terminated its external browser");
+
+  const profilesBefore = await scenarioProfiles();
+  process.stderr.write("Browser verifier: scenario environment\n");
+  const scenarioEnvironment = await verifyScenarioEnvironment(
+    endpoint,
+    target,
+    site.origin,
+  );
+  process.stderr.write("Browser verifier: scenario storage\n");
+  const scenarioStorage = await verifyScenarioStorage({
+    executable,
+    endpoint,
+    targetId: target,
+  });
+  const launchedScenario = await createBrowserScenarioProvider(
+    process.env,
+  ).captureScenario(
+    browserScenario(
+      {
+        mode: "launch",
+        executable_path: executable,
+      },
+      site.origin,
+    ),
+  );
+  if (!launchedScenario.ok) throw launchedScenario.error;
+  if (
+    launchedScenario.value.browser.cleanup !== "terminated-owned-process" ||
+    launchedScenario.value.browser.process_ownership !== "provider-owned"
+  )
+    throw new Error("Scenario launch did not report owned-process cleanup");
+  const profilesAfter = await scenarioProfiles();
+  if ([...profilesAfter].some((entry) => !profilesBefore.has(entry)))
+    throw new Error("Scenario launch retained a temporary browser profile");
+  assertScenarioCapture(launchedScenario.value);
+  const scenarioFailure = await verifyScenarioFailureEvidence(
+    executable,
+    site.origin,
+  );
+  const scenarioResults = JSON.stringify([
+    attachedScenario,
+    launchedScenario.value,
+  ]);
+  for (const retainedValue of [
+    "token=network-secret-value",
+    "token=websocket-url-secret",
+    "authorization=Bearer console-secret-value",
+    "websocket-secret-value",
+  ])
+    if (!scenarioResults.includes(retainedValue))
+      throw new Error(
+        `Browser scenario did not preserve selected value: ${retainedValue}`,
+      );
+  for (const unselectedValue of [
+    SCENARIO_SECRET_VALUE,
+    SCENARIO_URL_SECRET_VALUE,
+    "request-secret-value",
+    "request-body-secret-value",
+    "response-secret-value",
+    "storage-secret-value",
+  ])
+    if (scenarioResults.includes(unselectedValue))
+      throw new Error(
+        `Browser scenario included unselected structured value: ${unselectedValue}`,
+      );
+
+  process.stderr.write("Browser verifier: large screenshot\n");
+  const largeScreenshot = await verifyLargeScreenshotE2e(endpoint, site.origin);
+  process.stderr.write("Browser verifier: popup coverage\n");
+  const popupEvents = await verifyPopupEventCoverage(executable);
+  const networkEvidence = await verifyBrowserNetworkEvidence(
+    executable,
+    undefined,
+    { cdp_endpoint: endpoint, target_id: target },
+  );
+  const scriptExport = await verifyBrowserScriptExport(executable, undefined, {
+    cdp_endpoint: endpoint,
+    target_id: target,
+  });
+  const moduleTrace = await verifyBrowserModules(executable);
+  const captureMetadata = await verifyBrowserCaptureMetadataBudget(endpoint);
+  report = {
+    browser: observed.value.browser.product,
+    endpoint,
+    target,
+    domNodes: observed.value.dom.nodes.length,
+    accessibilityNodes: observed.value.accessibility.nodes.length,
+    scripts: observed.value.scripts.items.length,
+    networkRequests: observed.value.network.requests.length,
+    consoleEvents: observed.value.console.events.length,
+    websocketConnections: observed.value.network.websocket_connections.length,
+    websocketFrames: observed.value.network.websocket_connections.reduce(
+      (total, connection) => total + connection.events.length,
+      0,
+    ),
+    bundleScripts: bundle.capture.scripts_analyzed,
+    sourceMaps: bundle.observations.source_maps.processed,
+    bundle_cli_and_stdio_mcp: true,
+    sessionEvents: session.value.timeline.length,
+    pageScopedTransport: true,
+    screenshotBytes: screenshot.value.artifact.bytes,
+    largeScreenshot,
+    popupEvents,
+    networkEvidence,
+    scriptExport,
+    moduleTrace,
+    captureMetadata,
+    domDestinations,
+    browserScenarioCli: true,
+    browserScenarioAttachCleanup: "disconnected-external",
+    browserScenarioLaunchCleanup: "terminated-owned-process",
+    scenarioFailure,
+    scenarioEnvironment,
+    scenarioStorage,
+    verified: true,
+  };
 } finally {
+  process.stderr.write("Browser verifier cleanup: closing page proxy\n");
   if (pageProxy !== undefined) await pageProxy.close();
+  process.stderr.write("Browser verifier cleanup: stopping owned Chrome\n");
   if (browser !== undefined) await stopProcess(browser);
+  process.stderr.write("Browser verifier cleanup: closing fixture site\n");
   await site.close();
   await rm(profile, {
     recursive: true,
@@ -237,13 +405,55 @@ try {
     retryDelay: 100,
   });
 }
+process.stdout.write(
+  `${JSON.stringify({
+    verifier_run: await completeVerifierRun(verifierRun),
+    ...report,
+  })}\n`,
+);
+
+async function verifyPublicBundle(endpoint, target, origin) {
+  const evidence = await artifactCliEvidence("analyze-web-bundle", endpoint, [
+    target,
+    "--allowed-origins",
+    origin,
+    "--fetch-source-maps",
+    "--observation-ms",
+    "200",
+  ]);
+  assertBundleAnalysis(evidence.normalized_result);
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [fileURLToPath(new URL("./rea.mjs", import.meta.url)), "mcp"],
+    env: { PATH: process.env.PATH ?? "", REA_LOG_LEVEL: "silent" },
+    stderr: "pipe",
+  });
+  const client = new Client({ name: "browser-bundle-e2e", version: "1" });
+  try {
+    await client.connect(transport);
+    const result = await artifactMcpResult(client, "analyze_web_bundle", {
+      cdp_endpoint: endpoint,
+      target_id: target,
+      allowed_origins: [origin],
+      fetch_source_maps: true,
+      observation_ms: 200,
+    });
+    assertBundleAnalysis(result);
+  } finally {
+    try {
+      await client.close();
+    } finally {
+      await transport.close();
+    }
+  }
+  return evidence.normalized_result;
+}
 
 async function verifyPageScopedTransport(provider, proxy, origin) {
-  const target = await pageTarget(provider, proxy.endpoint, origin);
+  const target = await pageTarget(provider, proxy.endpoint);
   const input = inspectWebPageInputSchema.parse({
     cdp_endpoint: proxy.endpoint,
     allowed_origins: [origin],
-    approved: true,
     target_id: target,
     observation_ms: 100,
   });
@@ -273,13 +483,19 @@ async function verifyPageScopedTransport(provider, proxy, origin) {
     observeWebSessionInputSchema.parse({
       cdp_endpoint: proxy.endpoint,
       allowed_origins: [origin],
-      approved: true,
       target_id: target,
       observation_ms: 5_000,
     }),
+    {
+      progress: {
+        report(event) {
+          if (event.phase === "browser_observation" && event.completed === 1)
+            proxy.disconnectClients();
+          return Promise.resolve();
+        },
+      },
+    },
   );
-  await delay(100);
-  proxy.disconnectClients();
   const disconnected = await disconnectedPromise;
   if (
     !disconnected.ok ||
@@ -318,180 +534,18 @@ async function browserExecutable() {
   );
 }
 
-async function pageTarget(provider, endpoint, origin) {
+async function pageTarget(provider, endpoint) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const listed = await provider.listTargets(
       listBrowserTargetsInputSchema.parse({
         cdp_endpoint: endpoint,
-        allowed_origins: [origin],
-        approved: true,
       }),
     );
-    if (listed.ok && listed.value.targets.items[0] !== undefined)
-      return listed.value.targets.items[0].target_id;
+    if (listed.ok && listed.value.targets[0] !== undefined)
+      return listed.value.targets[0].target_id;
     await delay(25);
   }
   throw new Error("Real Chrome did not expose the local test page target");
-}
-
-function assertObservation(result, origin) {
-  assertObservationInventory(result, origin);
-  assertObservationEvents(result);
-  assertObservationPrivacy(result);
-  assertObservationMetadata(result);
-}
-
-function assertObservationInventory(result, origin) {
-  if (result.target.origin !== origin)
-    throw new Error("Real Chrome target origin was not preserved exactly");
-  if (result.frames.length < 1 || result.dom.nodes.length < 1)
-    throw new Error(
-      `Real Chrome DOM/frame observation was empty: ${JSON.stringify({ frames: result.frames.length, domTotal: result.dom.total_nodes, domReturned: result.dom.nodes.length, limitations: result.limitations })}`,
-    );
-  if (result.accessibility.nodes.length < 1)
-    throw new Error("Real Chrome accessibility observation was empty");
-  if (
-    result.accessibility.text_capture.status !== "not_approved" ||
-    result.accessibility.nodes.some(
-      (node) => node.name !== null || node.description !== null,
-    )
-  )
-    throw new Error("Accessibility text was retained without approval");
-  if (!result.scripts.items.some((script) => script.url.includes("/app.js")))
-    throw new Error("Real Chrome script metadata was missing");
-  if (!result.resources.some((resource) => resource.url.includes("/app.js")))
-    throw new Error("Real Chrome resource metadata was missing");
-}
-
-function assertObservationEvents(result) {
-  if (!result.network.requests.some((request) => request.url.includes("/api")))
-    throw new Error(
-      "Real Chrome attach-window network observation was missing",
-    );
-  const initiatedRequest = result.network.requests.find((request) =>
-    request.url.includes("/api"),
-  );
-  if (
-    !initiatedRequest?.initiator.url?.includes("/app.js") ||
-    initiatedRequest.initiator.line === null ||
-    initiatedRequest.initiator.column === null
-  )
-    throw new Error("Real Chrome script initiator stack was not normalized");
-  if (result.console.events.length < 1)
-    throw new Error(
-      "Real Chrome attach-window console observation was missing",
-    );
-  if (result.network.websocket_events.length < 1)
-    throw new Error("Real Chrome WebSocket metadata was missing");
-}
-
-function assertObservationPrivacy(result) {
-  if (
-    result.console.events.some(
-      (event) => event.text_capture.status !== "not_approved",
-    ) ||
-    result.network.requests.some(
-      (request) => request.body_shapes.status !== "not_approved",
-    ) ||
-    result.network.websocket_events.some(
-      (event) => event.payload_shape !== null,
-    )
-  )
-    throw new Error(
-      "Sensitive text or payload shapes were retained without approval",
-    );
-}
-
-function assertObservationMetadata(result) {
-  if (!result.storage.local_storage_keys.includes("rea-storage-key"))
-    throw new Error("Real Chrome local-storage key inventory was missing");
-  if (!result.storage.indexed_db_names.includes("rea-browser-db"))
-    throw new Error("Real Chrome IndexedDB name inventory was missing");
-  if (!result.storage.cache_names.includes("rea-browser-cache"))
-    throw new Error("Real Chrome cache name inventory was missing");
-  if (
-    !result.metadata.responses.some(({ csp }) =>
-      csp.directives.some(({ name }) => name === "default-src"),
-    ) ||
-    !result.metadata.agent_hints.some(
-      ({ declaration }) => declaration === "service-desc",
-    )
-  )
-    throw new Error("Real Chrome safe response metadata was missing");
-}
-
-function assertBundleAnalysis(result) {
-  if (
-    result.capture.scripts_analyzed < 1 ||
-    !result.observations.routes.some(({ value }) =>
-      value.includes("/verified-route"),
-    ) ||
-    !result.observations.endpoints.some(({ value }) => value.includes("/api"))
-  )
-    throw new Error("Real Chrome static bundle findings were missing");
-  if (
-    result.observations.source_maps.status !== "included" ||
-    !result.observations.source_maps.items.some(
-      ({ status, original_sources, original_module_edges, mappings }) =>
-        status === "included" &&
-        original_sources.some(({ source }) =>
-          source.includes("/src/main.ts"),
-        ) &&
-        original_module_edges.some(
-          ({ specifier }) => specifier === "./dependency.ts",
-        ) &&
-        mappings.length > 0,
-    )
-  )
-    throw new Error(
-      `Real Chrome approved source-map reconstruction was missing: ${JSON.stringify(sourceMapSummary(result.observations.source_maps))}`,
-    );
-}
-
-function assertSensitiveShapes(result) {
-  const request = result.network.requests.find((item) =>
-    item.url.includes("/api"),
-  );
-  const requestPaths = request?.body_shapes.request?.properties.map(
-    ({ path }) => path,
-  );
-  const responsePaths = request?.body_shapes.response?.properties.map(
-    ({ path }) => path,
-  );
-  if (!requestPaths?.includes("/token") || !responsePaths?.includes("/secret"))
-    throw new Error("Real Chrome JSON request/response shapes were missing");
-  const consoleText = result.console.events.flatMap(
-    (event) => event.text_capture.values,
-  );
-  if (
-    !consoleText.some(({ text }) => text.includes("[REDACTED]")) ||
-    consoleText.some(({ text }) => text.includes("console-secret-value"))
-  )
-    throw new Error(
-      "Real Chrome approved console text was not safely redacted",
-    );
-  if (
-    !result.network.websocket_events.some(
-      (event) =>
-        event.payload_shape?.format === "json" &&
-        event.payload_shape.json_shape?.properties.some(
-          ({ path }) => path === "/token",
-        ),
-    )
-  )
-    throw new Error("Real Chrome WebSocket JSON shape was missing");
-  const serialized = JSON.stringify({
-    console: result.console,
-    network: result.network,
-  });
-  for (const secret of [
-    "request-body-secret-value",
-    "response-secret-value",
-    "websocket-secret-value",
-    "console-secret-value",
-  ])
-    if (serialized.includes(secret))
-      throw new Error(`Approved shape capture retained raw value: ${secret}`);
 }
 
 function delay(milliseconds) {

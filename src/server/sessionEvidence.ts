@@ -1,50 +1,16 @@
-import type { BinarySessionPort } from "../application/BinarySession.js";
-import {
-  EvidenceIntegrityError,
-  EvidenceReferenceError,
-} from "../domain/errors.js";
+import type { EvidenceWriter } from "../application/investigation/InvestigationRecordPort.js";
+import { EvidenceIntegrityError } from "../domain/evidenceErrors.js";
 import type { Evidence } from "../domain/evidence.js";
-import { err, ok, type Result } from "../domain/result.js";
+import { ok, type Result } from "../domain/result.js";
 
-type EvidenceAuthorityResult = Result<Evidence[], EvidenceIntegrityError>;
-
-/** Resolve bounded IDs to authoritative records with exact semantic identity. */
-export const resolveSessionEvidenceIds = (
-  session: BinarySessionPort,
-  evidenceIds: readonly string[],
-  expected: { readonly operation: string; readonly predicate: string },
-): EvidenceAuthorityResult => {
-  const records: Evidence[] = [];
-  for (const evidenceId of evidenceIds) {
-    const record = session.evidenceById(evidenceId);
-    if (record === undefined)
-      return err(
-        new EvidenceReferenceError(
-          evidenceId,
-          "missing",
-          expected.operation,
-          null,
-        ),
-      );
-    if (record.operation !== expected.operation)
-      return err(
-        new EvidenceReferenceError(
-          evidenceId,
-          "wrong_operation",
-          expected.operation,
-          record.operation,
-        ),
-      );
-    if (record.predicate_type !== expected.predicate)
-      return err(
-        new EvidenceReferenceError(
-          evidenceId,
-          "wrong_predicate",
-          expected.predicate,
-          record.predicate_type,
-        ),
-      );
-    records.push(record);
+/** Record source evidence in order, stopping at the first session rejection. */
+export const recordSessionEvidenceSources = (
+  recordEvidence: EvidenceWriter["recordEvidence"] | undefined,
+  sources: readonly Evidence[],
+): Result<null, EvidenceIntegrityError> => {
+  for (const source of sources) {
+    const recorded = recordEvidence?.(source);
+    if (recorded !== undefined && !recorded.ok) return recorded;
   }
-  return ok(records);
+  return ok(null);
 };

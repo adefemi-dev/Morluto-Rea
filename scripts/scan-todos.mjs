@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
-import { readFileSync } from "node:fs";
-import { globSync } from "node:fs";
+import { globSync, readFileSync } from "node:fs";
 import { relative, resolve } from "node:path";
 
 const root = resolve(import.meta.dirname, "..");
@@ -12,7 +11,7 @@ const sourceFiles = globSync(
   [
     "src/**/*.ts",
     "tests/**/*.ts",
-    "scripts/**/*.mjs",
+    "scripts/**/*.{cjs,cts,js,jsx,mjs,mts,ts,tsx}",
     "bridge/**/*.py",
     "bridge/**/*.java",
   ],
@@ -46,7 +45,7 @@ for (const file of sourceFiles) {
 
 if (count > 0) {
   console.log(`\n${count} tech-debt marker(s) found.`);
-  process.exitCode = 0;
+  process.exitCode = 1;
 } else {
   console.log("No tech-debt markers found.");
 }

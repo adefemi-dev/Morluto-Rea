@@ -3,6 +3,9 @@ name: Real Hopper E2E
 on:
   workflow_dispatch:
 
+env:
+  HUSKY: "0"
+
 permissions:
   contents: read
 
@@ -18,8 +21,6 @@ jobs:
           node-version-file: .nvmrc
           cache: npm
       - run: npm ci
-      - name: Build source-owned Hopper conformance fixtures
-        run: npm run verify:fixtures
       - name: Install packed CLI in isolation
         shell: bash
         run: |

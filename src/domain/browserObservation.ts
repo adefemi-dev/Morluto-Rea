@@ -1,17 +1,14 @@
 import { z } from "zod";
 
-export {
-  browserTargetListSchema,
-  webPageInspectionSchema,
-  type BrowserTargetList,
-  type WebPageInspection,
-} from "./browserObservationSchemas.js";
+import { urlDeclaresQueryOrFragment } from "./urlComponents.js";
 
 const parseExactOrigin = (value: string): string | undefined => {
   let url: URL;
   try {
     url = new URL(value);
-  } catch {
+  } catch (cause: unknown) {
+    // Invalid input is represented by the undefined return.
+    void cause;
     return undefined;
   }
   if (
@@ -20,23 +17,16 @@ const parseExactOrigin = (value: string): string | undefined => {
     url.username !== "" ||
     url.password !== "" ||
     url.pathname !== "/" ||
-    url.search !== "" ||
-    url.hash !== ""
+    urlDeclaresQueryOrFragment(url)
   )
     return undefined;
   return url.origin;
 };
 
-const MAX_BROWSER_URL_CHARS = 65_536;
-const MAX_SANITIZED_BROWSER_URL_CHARS = 131_072;
-const MAX_QUERY_PARAMETER_NAMES = 256;
-const MAX_QUERY_PARAMETER_NAME_CHARS = 256;
-
 /** Exact normalized HTTP(S) authority used for browser observation scope. */
 export const browserOriginSchema = z
   .string()
   .min(1)
-  .max(2_048)
   .transform((value, context) => {
     const origin = parseExactOrigin(value);
     if (origin === undefined) {
@@ -57,12 +47,13 @@ export const isLiteralLoopbackHostname = (hostname: string): boolean =>
 export const browserEndpointSchema = z
   .string()
   .min(1)
-  .max(2_048)
   .transform((value, context) => {
     let url: URL;
     try {
       url = new URL(value);
-    } catch {
+    } catch (cause: unknown) {
+      // Invalid input is reported through the zod issue.
+      void cause;
       context.addIssue({ code: "custom", message: "Invalid CDP endpoint URL" });
       return z.NEVER;
     }
@@ -73,8 +64,7 @@ export const browserEndpointSchema = z
       url.username !== "" ||
       url.password !== "" ||
       url.pathname !== "/" ||
-      url.search !== "" ||
-      url.hash !== ""
+      urlDeclaresQueryOrFragment(url)
     ) {
       context.addIssue({
         code: "custom",
@@ -88,265 +78,151 @@ export const browserEndpointSchema = z
 
 export const browserAllowedOriginsSchema = z
   .array(browserOriginSchema)
-  .min(1)
-  .max(32)
-  .transform((origins) => [...new Set(origins)].sort());
+  .transform((origins) => Array.from(new Set(origins)).sort())
+  .default([]);
 
-const approvedBrowserInput = {
+const browserInput = {
   cdp_endpoint: browserEndpointSchema,
   allowed_origins: browserAllowedOriginsSchema,
-  approved: z
-    .literal(true)
-    .describe("Explicit approval for browser observation"),
 };
 
-/** Public input for bounded discovery of allowed page targets. */
-export const listBrowserTargetsInputSchema = z.object({
-  ...approvedBrowserInput,
-  offset: z.number().int().min(0).default(0),
-  limit: z.number().int().min(1).max(200).default(100),
+/** Public input for complete discovery, optionally filtered by exact origin. */
+export const listBrowserTargetsInputSchema = z.strictObject({
+  ...browserInput,
 });
 
-const browserInspectionLimitsSchema = z.object({
-  max_frames: z.number().int().min(1).max(1_000).default(200),
-  max_dom_nodes: z.number().int().min(1).max(10_000).default(2_000),
-  max_ax_nodes: z.number().int().min(1).max(10_000).default(2_000),
-  max_ax_text_field_bytes: z
-    .number()
-    .int()
-    .min(1)
-    .max(16 * 1_024)
-    .default(1_024),
-  max_total_ax_text_bytes: z
-    .number()
-    .int()
-    .min(1)
-    .max(1_024 * 1_024)
-    .default(64 * 1_024),
-  max_scripts: z.number().int().min(1).max(1_000).default(200),
-  max_resources: z.number().int().min(1).max(10_000).default(2_000),
-  max_workers: z.number().int().min(1).max(5_000).default(500),
-  max_storage_keys: z.number().int().min(1).max(10_000).default(1_000),
-  max_script_source_bytes: z
-    .number()
-    .int()
-    .min(1)
-    .max(4 * 1_024 * 1_024)
-    .default(1_024 * 1_024),
-  max_total_script_source_bytes: z
-    .number()
-    .int()
-    .min(1)
-    .max(16 * 1_024 * 1_024)
-    .default(4 * 1_024 * 1_024),
-  max_network_events: z.number().int().min(1).max(10_000).default(1_000),
-  max_console_events: z.number().int().min(1).max(2_000).default(200),
-  max_console_text_field_bytes: z
-    .number()
-    .int()
-    .min(1)
-    .max(16 * 1_024)
-    .default(1_024),
-  max_total_console_text_bytes: z
-    .number()
-    .int()
-    .min(1)
-    .max(1_024 * 1_024)
-    .default(64 * 1_024),
-  max_json_body_bytes: z
-    .number()
-    .int()
-    .min(1)
-    .max(4 * 1_024 * 1_024)
-    .default(1_024 * 1_024),
-  max_total_json_body_bytes: z
-    .number()
-    .int()
-    .min(1)
-    .max(16 * 1_024 * 1_024)
-    .default(4 * 1_024 * 1_024),
-  max_json_shape_nodes: z.number().int().min(1).max(100_000).default(5_000),
-  max_json_shape_depth: z.number().int().min(1).max(100).default(20),
-  max_websocket_events: z.number().int().min(1).max(5_000).default(500),
-  max_websocket_shape_bytes: z
-    .number()
-    .int()
-    .min(1)
-    .max(1_024 * 1_024)
-    .default(64 * 1_024),
-  max_total_websocket_shape_bytes: z
-    .number()
-    .int()
-    .min(1)
-    .max(16 * 1_024 * 1_024)
-    .default(1_024 * 1_024),
-});
-
-const DEFAULT_BROWSER_INSPECTION_LIMITS = {
-  max_frames: 200,
-  max_dom_nodes: 2_000,
-  max_ax_nodes: 2_000,
-  max_ax_text_field_bytes: 1_024,
-  max_total_ax_text_bytes: 64 * 1_024,
-  max_scripts: 200,
-  max_resources: 2_000,
-  max_workers: 500,
-  max_storage_keys: 1_000,
-  max_script_source_bytes: 1_024 * 1_024,
-  max_total_script_source_bytes: 4 * 1_024 * 1_024,
-  max_network_events: 1_000,
-  max_console_events: 200,
-  max_console_text_field_bytes: 1_024,
-  max_total_console_text_bytes: 64 * 1_024,
-  max_json_body_bytes: 1_024 * 1_024,
-  max_total_json_body_bytes: 4 * 1_024 * 1_024,
-  max_json_shape_nodes: 5_000,
-  max_json_shape_depth: 20,
-  max_websocket_events: 500,
-  max_websocket_shape_bytes: 64 * 1_024,
-  max_total_websocket_shape_bytes: 1_024 * 1_024,
+const inspectWebPageInputFacts = {
+  ...browserInput,
+  target_id: z.string().trim().min(1),
+  observation_ms: z.number().int().min(0).default(500),
+  include_accessibility_text: z.boolean().default(false),
+  include_console_text: z.boolean().default(false),
+  include_json_body_shapes: z.boolean().default(false),
+  include_websocket_shapes: z.boolean().default(false),
+  include_storage_keys: z.boolean().default(false),
+  include_storage_fingerprints: z.boolean().default(false),
 } as const;
 
-/** Public input for one passive, bounded inspection of an existing page. */
-export const inspectWebPageInputSchema = z
-  .object({
-    ...approvedBrowserInput,
-    target_id: z.string().trim().min(1).max(256),
-    observation_ms: z.number().int().min(0).max(10_000).default(500),
-    include_accessibility_text: z.boolean().default(false),
-    include_console_text: z.boolean().default(false),
-    console_text_approved: z.boolean().default(false),
-    include_json_body_shapes: z.boolean().default(false),
-    json_body_schema_approved: z.boolean().default(false),
-    include_websocket_shapes: z.boolean().default(false),
-    websocket_shape_approved: z.boolean().default(false),
-    include_script_sources: z.boolean().default(false),
-    include_storage_keys: z.boolean().default(false),
-    limits: browserInspectionLimitsSchema.default(
-      DEFAULT_BROWSER_INSPECTION_LIMITS,
-    ),
-  })
-  .superRefine((input, context) => {
-    if (
-      input.limits.max_script_source_bytes >
-      input.limits.max_total_script_source_bytes
-    )
-      context.addIssue({
-        code: "custom",
-        path: ["limits", "max_script_source_bytes"],
-        message: "Per-script source limit cannot exceed the total source limit",
-      });
-    for (const [include, approved, path, message] of [
-      [
-        input.include_console_text,
-        input.console_text_approved,
-        "console_text_approved",
-        "Console text capture requires separate approval",
-      ],
-      [
-        input.include_json_body_shapes,
-        input.json_body_schema_approved,
-        "json_body_schema_approved",
-        "JSON body schema capture requires separate approval",
-      ],
-      [
-        input.include_websocket_shapes,
-        input.websocket_shape_approved,
-        "websocket_shape_approved",
-        "WebSocket shape capture requires separate approval",
-      ],
-    ] as const)
-      if (include && !approved)
-        context.addIssue({ code: "custom", path: [path], message });
-    if (
-      input.limits.max_console_text_field_bytes >
-      input.limits.max_total_console_text_bytes
-    )
-      context.addIssue({
-        code: "custom",
-        path: ["limits", "max_console_text_field_bytes"],
-        message:
-          "Per-field console text limit cannot exceed the total text limit",
-      });
-    if (
-      input.limits.max_json_body_bytes > input.limits.max_total_json_body_bytes
-    )
-      context.addIssue({
-        code: "custom",
-        path: ["limits", "max_json_body_bytes"],
-        message: "Per-body JSON limit cannot exceed the total body limit",
-      });
-    if (
-      input.limits.max_websocket_shape_bytes >
-      input.limits.max_total_websocket_shape_bytes
-    )
-      context.addIssue({
-        code: "custom",
-        path: ["limits", "max_websocket_shape_bytes"],
-        message:
-          "Per-frame WebSocket limit cannot exceed the total frame limit",
-      });
-    if (
-      input.limits.max_ax_text_field_bytes >
-      input.limits.max_total_ax_text_bytes
-    )
-      context.addIssue({
-        code: "custom",
-        path: ["limits", "max_ax_text_field_bytes"],
-        message:
-          "Per-field accessibility text limit cannot exceed the total text limit",
-      });
-  });
+const inspectWebPageWithoutSourceSchema = z.strictObject({
+  ...inspectWebPageInputFacts,
+  include_script_sources: z.literal(false).optional().default(false),
+});
+
+const inspectWebPageWithSourceShapeSchema = z.strictObject({
+  ...inspectWebPageInputFacts,
+  include_script_sources: z.literal(true).default(true),
+});
+
+type InspectWebPageShape =
+  | z.output<typeof inspectWebPageWithoutSourceSchema>
+  | z.output<typeof inspectWebPageWithSourceShapeSchema>;
+
+const refineInspectWebPageInput = (
+  input: InspectWebPageShape,
+  context: z.RefinementCtx,
+): void => {
+  if (input.include_storage_fingerprints && !input.include_storage_keys)
+    context.addIssue({
+      code: "custom",
+      path: ["include_storage_fingerprints"],
+      message: "Storage fingerprints require storage key capture",
+    });
+};
+
+/** Caller schema for source-capturing inspection and bundle analysis. */
+export const inspectWebPageWithSourceInputSchema =
+  inspectWebPageWithSourceShapeSchema.superRefine(refineInspectWebPageInput);
+
+/** Caller-visible schema for one passive inspection. */
+export const inspectWebPageInputSchema = z.discriminatedUnion(
+  "include_script_sources",
+  [
+    inspectWebPageWithoutSourceSchema.superRefine(refineInspectWebPageInput),
+    inspectWebPageWithSourceShapeSchema
+      .extend({
+        include_script_sources: z.literal(true),
+      })
+      .superRefine(refineInspectWebPageInput),
+  ],
+);
 
 export type ListBrowserTargetsInput = z.infer<
   typeof listBrowserTargetsInputSchema
 >;
 export type InspectWebPageInput = z.infer<typeof inspectWebPageInputSchema>;
 
-const sanitizedBrowserUrlSchema = z.object({
-  url: z.string().max(MAX_SANITIZED_BROWSER_URL_CHARS),
-  origin: z.string().max(2_048).nullable(),
-  query_parameter_names: z
-    .array(z.string().max(MAX_QUERY_PARAMETER_NAME_CHARS))
-    .max(MAX_QUERY_PARAMETER_NAMES),
+export const sanitizedBrowserUrlSchema = z.object({
+  url: z.string(),
+  origin: z.string().nullable(),
+  query_parameter_names: z.array(z.string()),
   redacted: z.boolean(),
 });
 export type SanitizedBrowserUrl = z.infer<typeof sanitizedBrowserUrlSchema>;
 
-/** Remove credentials and query values before a browser URL becomes durable. */
+/** Preserve local URL data while removing only URL userinfo credentials. */
 export const sanitizeBrowserUrl = (value: string): SanitizedBrowserUrl => {
   let parsed: URL;
-  const wasTruncated = value.length > MAX_BROWSER_URL_CHARS;
   try {
-    parsed = new URL(value.slice(0, MAX_BROWSER_URL_CHARS));
-  } catch {
+    parsed = new URL(value);
+  } catch (cause: unknown) {
+    // Unparseable input is preserved verbatim in the sanitized result.
+    void cause;
     return {
-      url: "[unsupported-url]",
+      url: value,
       origin: null,
       query_parameter_names: [],
-      redacted: true,
+      redacted: false,
     };
   }
   const hadCredentials = parsed.username !== "" || parsed.password !== "";
-  const hadFragment = parsed.hash !== "";
-  const names = [
-    ...new Set(
-      [...parsed.searchParams.keys()].map((name) =>
-        name.slice(0, MAX_QUERY_PARAMETER_NAME_CHARS),
-      ),
-    ),
-  ]
-    .sort()
-    .slice(0, MAX_QUERY_PARAMETER_NAMES);
-  parsed.username = "";
-  parsed.password = "";
-  parsed.hash = "";
-  parsed.search = "";
-  for (const name of names) parsed.searchParams.append(name, "[REDACTED]");
+  const names = [...parsed.searchParams.keys()];
+  const sanitizedUrl = hadCredentials
+    ? removeUrlUserInfo(value, parsed)
+    : value;
   return {
-    url: parsed.href,
+    url: sanitizedUrl,
     origin: parsed.origin === "null" ? null : parsed.origin,
     query_parameter_names: names,
-    redacted: wasTruncated || hadCredentials || hadFragment || names.length > 0,
+    redacted: hadCredentials,
   };
+};
+
+const removeUrlUserInfo = (value: string, parsed: URL): string => {
+  const schemeSeparator = value.indexOf("://");
+  const authorityStart =
+    schemeSeparator < 0
+      ? value.startsWith("//")
+        ? 2
+        : -1
+      : schemeSeparator + 3;
+  if (authorityStart < 0) return credentialFreeHref(parsed);
+  const remaining = value.slice(authorityStart);
+  const delimiter = remaining.search(/[/?#]/u);
+  const authorityEnd =
+    delimiter < 0 ? value.length : authorityStart + delimiter;
+  const authority = value.slice(authorityStart, authorityEnd);
+  const userInfoEnd = authority.lastIndexOf("@");
+  if (userInfoEnd < 0) return credentialFreeHref(parsed);
+  const candidate = `${value.slice(0, authorityStart)}${authority.slice(userInfoEnd + 1)}${value.slice(authorityEnd)}`;
+  try {
+    const candidateUrl = new URL(candidate);
+    return candidateUrl.username === "" && candidateUrl.password === ""
+      ? candidate
+      : credentialFreeHref(parsed);
+  } catch (cause: unknown) {
+    // Fallback to the already-sanitized href when the candidate is invalid.
+    void cause;
+    return credentialFreeHref(parsed);
+  }
+};
+
+const credentialFreeHref = (parsed: URL): string => {
+  parsed.username = "";
+  parsed.password = "";
+  return parsed.href;
+};
+
+/** Normalize endpoint candidates without discarding local query or fragment data. */
+export const sanitizeEndpointCandidate = (value: string): string => {
+  return sanitizeBrowserUrl(value).url;
 };

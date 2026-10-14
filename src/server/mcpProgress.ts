@@ -1,22 +1,12 @@
+import type { ServerContext } from "@modelcontextprotocol/server";
 import type { ProgressReporter } from "../application/ProgressReporter.js";
 import {
   createProgressReporter,
   silentProgressReporter,
 } from "../application/ProgressReporter.js";
 
-interface McpProgressContext {
-  readonly mcpReq: {
-    readonly _meta?: { readonly progressToken?: string | number | undefined };
-    notify(notification: {
-      readonly method: "notifications/progress";
-      readonly params: {
-        readonly progressToken: string | number;
-        readonly progress: number;
-        readonly total?: number;
-        readonly message?: string;
-      };
-    }): Promise<void>;
-  };
+export interface McpProgressContext {
+  readonly mcpReq: Pick<ServerContext["mcpReq"], "_meta" | "notify">;
 }
 
 /** Adapt the request's negotiated MCP progress token to application progress. */
@@ -32,13 +22,16 @@ export const mcpProgressReporter = (
           method: "notifications/progress",
           params: {
             progressToken: token,
-            progress: update.completed,
-            ...(update.total === null ? {} : { total: update.total }),
+            // Status phases can repeat their work count while waiting. The
+            // protocol requires every notification to advance; count emitted
+            // observations without inventing a total amount of analysis work.
+            progress: update.sequence,
             message: `${update.phase}: ${update.message}`,
           },
         });
-      } catch {
+      } catch (cause: unknown) {
         // Progress is observational; transport failure cannot change tool truth.
+        void cause;
       }
     },
     { minimumIntervalMs: 100 },

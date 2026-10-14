@@ -1,16 +1,20 @@
-import { createHash } from "node:crypto";
 import { posix } from "node:path";
 
-import canonicalize from "canonicalize";
 import { z } from "zod";
 
-const MAX_PATH = 4_096;
-const digestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
-const boundedTextSchema = z.string().min(1).max(1_024);
+import { canonicalJson } from "./comparisonSemantics.js";
+import { digestCanonicalValue } from "./canonicalDigest.js";
+import {
+  createReferenceSourcePathLookup,
+  isPortableAbsoluteReferenceTarget,
+} from "./referenceSourcePathIdentity.js";
+import { compareUnicodeCodePoints } from "./unicodeCodePointOrder.js";
+import { digestSchema } from "./../domain/digests.js";
+import { prefixedDigestSchema } from "./../domain/digests.js";
+const boundedTextSchema = z.string().min(1);
 const relativePathSchema = z
   .string()
   .min(1)
-  .max(MAX_PATH)
   .refine(
     (path) =>
       !path.startsWith("/") &&
@@ -34,41 +38,35 @@ const classificationSchema = z.enum([
 
 const entryBaseShape = {
   path: relativePathSchema,
-  classifications: z.array(classificationSchema).min(1).max(8),
-  limitations: z.array(boundedTextSchema).max(100),
+  classifications: z.array(classificationSchema).min(1),
+  limitations: z.array(boundedTextSchema),
 };
 
-const sourceFileSchema = z
-  .strictObject({
-    ...entryBaseShape,
-    kind: z.literal("file"),
-    sha256: digestSchema.nullable(),
+const sourceFileBaseShape = {
+  ...entryBaseShape,
+  kind: z.literal("file"),
+  language: z.string().min(1).nullable(),
+};
+
+const sourceFileSchema = z.union([
+  z.strictObject({
+    ...sourceFileBaseShape,
+    sha256: digestSchema,
+    size: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+    content_state: z.literal("hashed"),
+  }),
+  z.strictObject({
+    ...sourceFileBaseShape,
+    sha256: z.null(),
     size: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).nullable(),
-    language: z.string().min(1).max(100).nullable(),
     content_state: z.enum([
-      "hashed",
       "redacted-secret",
       "excluded",
       "unreadable",
-      "too-large",
       "unknown",
     ]),
-  })
-  .superRefine((file, context) => {
-    checkSortedUnique(file.classifications, "classifications", context);
-    if ((file.content_state === "hashed") !== (file.sha256 !== null))
-      context.addIssue({
-        code: "custom",
-        message: "Only hashed files have a content digest",
-        path: ["sha256"],
-      });
-    if (file.content_state === "hashed" && file.size === null)
-      context.addIssue({
-        code: "custom",
-        message: "Hashed files require a byte size",
-        path: ["size"],
-      });
-  });
+  }),
+]);
 
 const sourceDirectorySchema = z.strictObject({
   ...entryBaseShape,
@@ -85,30 +83,31 @@ const sourceDirectorySchema = z.strictObject({
 const symlinkTargetSchema = z
   .string()
   .min(1)
-  .max(MAX_PATH)
   .refine(
     (target) =>
-      target === "<outside-root>" ||
+      isPortableAbsoluteReferenceTarget(target) ||
       (!target.startsWith("/") &&
         !target.includes("\\") &&
         posix.normalize(target) === target),
     "Expected a normalized POSIX symlink target",
   );
 
-const sourceSymlinkSchema = z.strictObject({
-  ...entryBaseShape,
-  kind: z.literal("symlink"),
-  target: symlinkTargetSchema,
-  target_state: z.enum([
-    "internal",
-    "external",
-    "missing",
-    "unreadable",
-    "unknown",
-  ]),
-});
+const sourceSymlinkSchema = z.union([
+  z.strictObject({
+    ...entryBaseShape,
+    kind: z.literal("symlink"),
+    target: symlinkTargetSchema,
+    target_state: z.enum(["internal", "external", "missing"]),
+  }),
+  z.strictObject({
+    ...entryBaseShape,
+    kind: z.literal("symlink"),
+    target: z.null(),
+    target_state: z.enum(["unreadable", "unknown"]),
+  }),
+]);
 
-const sourceEntrySchema = z.discriminatedUnion("kind", [
+const sourceEntrySchema = z.union([
   sourceFileSchema,
   sourceDirectorySchema,
   sourceSymlinkSchema,
@@ -116,7 +115,7 @@ const sourceEntrySchema = z.discriminatedUnion("kind", [
 
 const sourceRelationshipSchema = z.strictObject({
   from_path: relativePathSchema,
-  to: z.string().min(1).max(MAX_PATH),
+  to: z.string().min(1),
   kind: z.enum(["imports", "requires", "references", "declares-module"]),
   resolution: z.enum(["internal", "external", "unresolved", "unknown"]),
   parse_state: z.enum(["parsed", "partial", "unknown"]),
@@ -124,21 +123,26 @@ const sourceRelationshipSchema = z.strictObject({
 
 const parseFailureSchema = z.strictObject({
   path: relativePathSchema,
-  parser: z.string().min(1).max(100),
+  parser: z.string().min(1),
   reason: boundedTextSchema,
 });
 
-const exclusionSchema = z.strictObject({
-  path: relativePathSchema,
-  reason: z.enum([
-    "configured-secret",
-    "symlink-escape",
-    "size-limit",
-    "inventory-limit",
-    "unreadable",
-    "caller-excluded",
-  ]),
-});
+const exclusionSchema = z.discriminatedUnion("reason", [
+  z.strictObject({
+    path: relativePathSchema,
+    reason: z.enum([
+      "configured-secret",
+      "project-ignored",
+      "default-ignored",
+      "caller-excluded",
+    ]),
+    pattern: boundedTextSchema,
+  }),
+  z.strictObject({
+    path: relativePathSchema,
+    reason: z.enum(["symlink-escape", "unreadable"]),
+  }),
+]);
 
 const vcsSchema = z
   .discriminatedUnion("kind", [
@@ -161,28 +165,27 @@ const vcsSchema = z
   .nullable();
 
 const graphShape = {
-  schema: z.literal("HistoricalSourceGraph/v1"),
+  schema: z.literal("HistoricalSourceGraph"),
   authority: z.literal("historical-reference"),
   root_alias: z.literal("$REFERENCE_ROOT"),
   root_sha256: digestSchema,
   inventory_state: z.enum(["complete", "partial", "unknown"]),
-  entries: z.array(sourceEntrySchema).max(100_000),
-  relationships: z.array(sourceRelationshipSchema).max(200_000),
-  parse_failures: z.array(parseFailureSchema).max(10_000),
-  exclusions: z.array(exclusionSchema).max(100_000),
-  languages: z.array(z.string().min(1).max(100)).max(1_000),
-  manifests: z.array(relativePathSchema).max(10_000),
+  entries: z.array(sourceEntrySchema),
+  relationships: z.array(sourceRelationshipSchema),
+  parse_failures: z.array(parseFailureSchema),
+  exclusions: z.array(exclusionSchema),
+  languages: z.array(z.string().min(1)),
+  manifests: z.array(relativePathSchema),
   vcs: vcsSchema,
   provenance: z.strictObject({
-    importer: z.string().min(1).max(100),
-    importer_version: z.string().min(1).max(100).nullable(),
+    importer: z.string().min(1),
+    importer_version: z.string().min(1).nullable(),
     caller: z
       .string()
       .min(1)
-      .max(200)
-      .regex(/^[\w .:@/+-]+$/u),
+      .regex(/^[\w .:@\x2f+\x2d]+$/u),
   }),
-  limitations: z.array(boundedTextSchema).max(1_000),
+  limitations: z.array(boundedTextSchema),
 };
 
 const historicalSourceGraphStructureSchema = z
@@ -207,14 +210,14 @@ const historicalSourceGraphInputSchema = z.strictObject({
 });
 
 const historicalSourceManifestBaseSchema = z.strictObject({
-  schema: z.literal("HistoricalSourceManifest/v1"),
+  schema: z.literal("HistoricalSourceManifest"),
   authority: z.literal("historical-reference"),
-  manifest_id: z.string().regex(/^hsm_[a-f0-9]{64}$/u),
+  manifest_id: prefixedDigestSchema("hsm"),
   graph_sha256: digestSchema,
   root_sha256: digestSchema,
   inventory_state: z.enum(["complete", "partial", "unknown"]),
-  entry_count: z.number().int().min(0).max(100_000),
-  relationship_count: z.number().int().min(0).max(200_000),
+  entry_count: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  relationship_count: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
 });
 
 export type HistoricalSourceGraph = z.infer<typeof historicalSourceGraphSchema>;
@@ -230,23 +233,10 @@ export const historicalSourceParseFailureKey = (
   failure: HistoricalSourceGraphInput["parse_failures"][number],
 ): string => `${failure.path}\u0000${failure.parser}\u0000${failure.reason}`;
 
-const canonicalJson = (value: unknown): string => {
-  const serialized = canonicalize(value);
-  if (serialized === undefined)
-    throw new TypeError("RFC 8785 canonicalization rejected a graph value");
-  return serialized;
-};
-
-const digestCanonical = (value: unknown): string =>
-  createHash("sha256").update(canonicalJson(value)).digest("hex");
-
 const relationshipKey = (
   relationship: z.infer<typeof sourceRelationshipSchema>,
 ): string =>
   `${relationship.from_path}\u0000${relationship.to}\u0000${relationship.kind}\u0000${relationship.resolution}\u0000${relationship.parse_state}`;
-
-const compareCodePoints = (left: string, right: string): number =>
-  left < right ? -1 : left > right ? 1 : 0;
 
 const checkSortedUnique = (
   values: readonly string[],
@@ -254,7 +244,10 @@ const checkSortedUnique = (
   context: z.RefinementCtx,
 ): void => {
   for (let index = 1; index < values.length; index += 1)
-    if (compareCodePoints(values[index - 1] ?? "", values[index] ?? "") >= 0) {
+    if (
+      compareUnicodeCodePoints(values[index - 1] ?? "", values[index] ?? "") >=
+      0
+    ) {
       context.addIssue({
         code: "custom",
         message: `${field} must be sorted and unique by Unicode code point`,
@@ -264,7 +257,8 @@ const checkSortedUnique = (
     }
 };
 
-const expectedLanguages = (
+/** Derive the canonical language index from inventoried source files. */
+export const historicalSourceLanguages = (
   entries: readonly z.infer<typeof sourceEntrySchema>[],
 ): string[] =>
   [
@@ -275,9 +269,10 @@ const expectedLanguages = (
           : [],
       ),
     ),
-  ].sort(compareCodePoints);
+  ].sort(compareUnicodeCodePoints);
 
-const expectedManifests = (
+/** Derive the canonical manifest path index from inventoried source files. */
+export const historicalSourceManifests = (
   entries: readonly z.infer<typeof sourceEntrySchema>[],
 ): string[] =>
   entries
@@ -286,7 +281,7 @@ const expectedManifests = (
         ? [entry.path]
         : [],
     )
-    .sort(compareCodePoints);
+    .sort(compareUnicodeCodePoints);
 
 type GraphStructure = z.infer<typeof historicalSourceGraphStructureSchema>;
 
@@ -324,23 +319,30 @@ const checkSymlinks = (
   paths: ReadonlySet<string>,
   context: z.RefinementCtx,
 ): void => {
+  const lookupPath = createReferenceSourcePathLookup(paths);
   for (const [index, entry] of graph.entries.entries()) {
     if (entry.kind !== "symlink") continue;
+    if (entry.target === null) continue;
+    const absolute = isPortableAbsoluteReferenceTarget(entry.target);
     if (
-      (entry.target_state === "external") !==
-      (entry.target === "<outside-root>")
+      (entry.target_state === "external" && !absolute) ||
+      (entry.target_state === "internal" && absolute)
     )
       context.addIssue({
         code: "custom",
-        message:
-          "External symlink targets must use the sanitized <outside-root> sentinel",
+        message: "Symlink target path does not match its target state",
         path: ["entries", index, "target"],
       });
     if (entry.target_state !== "internal") continue;
     const resolved = posix.normalize(
       posix.join(posix.dirname(entry.path), entry.target),
     );
-    if (resolved.startsWith("../") || resolved === ".." || !paths.has(resolved))
+    if (
+      resolved.startsWith("../") ||
+      resolved === ".." ||
+      // The inventory root is implicit rather than an entry with path ".".
+      (resolved !== "." && lookupPath.resolve(resolved) === undefined)
+    )
       context.addIssue({
         code: "custom",
         message: "Internal symlink target must resolve to an inventoried entry",
@@ -410,14 +412,20 @@ function checkGraphInvariants(
     context,
   );
   checkSortedUnique(
-    graph.exclusions.map(({ path, reason }) => `${path}\u0000${reason}`),
+    graph.exclusions.map(
+      (exclusion) =>
+        `${exclusion.path}\u0000${exclusion.reason}\u0000${"pattern" in exclusion ? exclusion.pattern : ""}`,
+    ),
     "exclusions",
     context,
   );
 
   if (
-    canonicalJson(graph.languages) !==
-    canonicalJson(expectedLanguages(graph.entries))
+    canonicalJson(graph.languages, "Reference source graph") !==
+    canonicalJson(
+      historicalSourceLanguages(graph.entries),
+      "Reference source graph",
+    )
   )
     context.addIssue({
       code: "custom",
@@ -425,8 +433,11 @@ function checkGraphInvariants(
       path: ["languages"],
     });
   if (
-    canonicalJson(graph.manifests) !==
-    canonicalJson(expectedManifests(graph.entries))
+    canonicalJson(graph.manifests, "Reference source graph") !==
+    canonicalJson(
+      historicalSourceManifests(graph.entries),
+      "Reference source graph",
+    )
   )
     context.addIssue({
       code: "custom",
@@ -475,7 +486,11 @@ const rootCommitment = (
 const computeRootSha256 = (
   entries: readonly z.infer<typeof sourceEntrySchema>[],
   exclusions: readonly z.infer<typeof exclusionSchema>[],
-): string => digestCanonical(rootCommitment(entries, exclusions));
+): string =>
+  digestCanonicalValue(
+    rootCommitment(entries, exclusions),
+    "Reference source graph",
+  );
 
 /** Build and internally commit a normalized historical source graph. */
 export const createHistoricalSourceGraph = (
@@ -495,7 +510,10 @@ export const parseHistoricalSourceGraph = (
 
 /** Compute a deterministic graph commitment containing no absolute root path. */
 export const computeHistoricalSourceGraphSha256 = (input: unknown): string =>
-  digestCanonical(parseHistoricalSourceGraph(input));
+  digestCanonicalValue(
+    parseHistoricalSourceGraph(input),
+    "Reference source graph",
+  );
 
 /** Build a deterministic, relocation-independent manifest for a source graph. */
 export const createHistoricalSourceManifest = (
@@ -503,7 +521,7 @@ export const createHistoricalSourceManifest = (
 ): HistoricalSourceManifest => {
   const graph = parseHistoricalSourceGraph(input);
   const semantic = {
-    schema: "HistoricalSourceManifest/v1" as const,
+    schema: "HistoricalSourceManifest" as const,
     authority: "historical-reference" as const,
     graph_sha256: computeHistoricalSourceGraphSha256(graph),
     root_sha256: graph.root_sha256,
@@ -513,7 +531,7 @@ export const createHistoricalSourceManifest = (
   };
   return historicalSourceManifestBaseSchema.parse({
     ...semantic,
-    manifest_id: `hsm_${digestCanonical(semantic)}`,
+    manifest_id: `hsm_${digestCanonicalValue(semantic, "Reference source graph")}`,
   });
 };
 
@@ -523,7 +541,10 @@ export const parseHistoricalSourceManifest = (
 ): HistoricalSourceManifest => {
   const manifest = historicalSourceManifestBaseSchema.parse(input);
   const { manifest_id: manifestId, ...semantic } = manifest;
-  if (`hsm_${digestCanonical(semantic)}` !== manifestId)
+  if (
+    `hsm_${digestCanonicalValue(semantic, "Reference source graph")}` !==
+    manifestId
+  )
     throw new TypeError("Historical source manifest identifier does not match");
   return manifest;
 };

@@ -4,18 +4,20 @@ import type {
   WebScreenshot,
 } from "../domain/webScreenshot.js";
 import { createWebScreenshotArtifact } from "../domain/webScreenshot.js";
-import { BrowserObservationError } from "../domain/errors.js";
+import { BrowserObservationError } from "../domain/browserObservationError.js";
+import { isMainFrameNavigation } from "./CdpCaptureEventHelpers.js";
 import type { CdpEndpointDiscovery, CdpEndpointTarget } from "./CdpEndpoint.js";
 import type { CdpConnection, CdpEvent } from "./CdpConnection.js";
 import {
   allowedSanitizedUrl,
   recordValue,
-  stringValue,
+  cdpStringValue,
 } from "./CdpCaptureValues.js";
 import { mainFrameUrl } from "./CdpCaptureDocuments.js";
 import { captureFrames } from "./CdpCaptureDocuments.js";
 import { CdpCaptureCompleteness } from "./CdpCaptureCompleteness.js";
 import { decodeCanonicalBase64 } from "../domain/webScreenshot.js";
+import { readPngHeaderDimensions } from "../domain/pngHeader.js";
 
 interface ScreenshotContext {
   readonly connection: CdpConnection;
@@ -55,7 +57,15 @@ export const captureCdpScreenshot = async (
   const mainFrame = captureFrames(before, origins, 1).items[0];
   if (authorized === undefined || mainFrame === undefined)
     throw new BrowserObservationError("inspect_web_page", "target_not_allowed");
-  const navigation = { changed: false, leftScope: false };
+  const initialFrame = recordValue(
+    recordValue(recordValue(before)?.frameTree)?.frame,
+  );
+  const navigation = {
+    changed: false,
+    leftScope: false,
+    url: beforeUrl,
+    loaderId: cdpStringValue(initialFrame?.loaderId),
+  };
   const removeListener = context.connection.onEvent((event) => {
     if (event.sessionId !== context.sessionId) return;
     observeScreenshotNavigation(event, mainFrame.frame_id, origins, navigation);
@@ -80,15 +90,14 @@ export const captureCdpScreenshot = async (
   } finally {
     removeListener();
   }
-  const encoded = stringValue(result?.data);
+  const encoded = cdpStringValue(result?.data);
   const bytes =
     encoded === undefined ? undefined : decodeCanonicalBase64(encoded);
-  if (
-    bytes === undefined ||
-    bytes.byteLength > context.input.maximum_image_bytes
-  )
+  if (bytes === undefined)
     throw new BrowserObservationError("inspect_web_page", "payload_limit");
-  const dimensions = pngDimensions(bytes);
+  const dimensions = readPngHeaderDimensions(bytes);
+  if (dimensions === undefined)
+    throw new BrowserObservationError("inspect_web_page", "protocol_error");
   if (navigation.leftScope)
     throw new BrowserObservationError("inspect_web_page", "target_not_allowed");
   const afterUrl = mainFrameUrl(after);
@@ -106,7 +115,6 @@ export const captureCdpScreenshot = async (
     terminal: true,
   });
   return {
-    schema_version: 1,
     browser: context.discovery.version,
     target: {
       target_id: context.target.id,
@@ -118,7 +126,7 @@ export const captureCdpScreenshot = async (
     artifact: createWebScreenshotArtifact(bytes),
     completeness: new CdpCaptureCompleteness().snapshot(),
     limitations: [
-      "The screenshot contains the visible viewport and may include sensitive on-screen content; capture requires separate approval.",
+      "The screenshot contains the visible viewport, including on-screen content.",
       "REA does not scroll, evaluate JavaScript, or capture beyond the current viewport.",
     ],
   };
@@ -128,37 +136,28 @@ const observeScreenshotNavigation = (
   event: CdpEvent,
   mainFrameId: string,
   origins: ReadonlySet<string>,
-  state: { changed: boolean; leftScope: boolean },
+  state: {
+    changed: boolean;
+    leftScope: boolean;
+    readonly url: string | undefined;
+    readonly loaderId: string | undefined;
+  },
 ): void => {
+  if (!isMainFrameNavigation(event, mainFrameId)) return;
   const params = recordValue(event.params);
   if (params === undefined) return;
   const frame =
     event.method === "Page.frameNavigated" ? recordValue(params.frame) : params;
   if (
-    (event.method !== "Page.frameNavigated" &&
-      event.method !== "Page.navigatedWithinDocument") ||
-    (stringValue(frame?.id) ?? stringValue(frame?.frameId)) !== mainFrameId
+    event.method === "Page.frameNavigated" &&
+    state.loaderId !== undefined &&
+    state.loaderId !== "" &&
+    cdpStringValue(frame?.loaderId) === state.loaderId &&
+    cdpStringValue(frame?.url) === state.url
   )
     return;
+
   state.changed = true;
   if (allowedSanitizedUrl(frame?.url, origins) === undefined)
     state.leftScope = true;
 };
-
-const pngDimensions = (
-  bytes: Buffer,
-): { readonly width: number; readonly height: number } => {
-  if (
-    bytes.byteLength < 24 ||
-    !bytes.subarray(0, 8).equals(PNG_SIGNATURE) ||
-    bytes.subarray(12, 16).toString("ascii") !== "IHDR"
-  )
-    throw new BrowserObservationError("inspect_web_page", "protocol_error");
-  const width = bytes.readUInt32BE(16);
-  const height = bytes.readUInt32BE(20);
-  if (width === 0 || height === 0 || width * height > 32_000_000)
-    throw new BrowserObservationError("inspect_web_page", "payload_limit");
-  return { width, height };
-};
-
-const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);

@@ -1,13 +1,27 @@
+import {
+  admitManagedProjection,
+  type ManagedDecodeBudget,
+} from "./ManagedDecodeBudget.js";
 import type { ManagedPeLayout } from "./ManagedPeReader.js";
-import type {
-  ManagedMemberInspectionLimits,
-  ManagedMethodBody,
-} from "./ManagedMemberInspectorCore.js";
+import type { ManagedMethodBody } from "./ManagedMemberInspectorCore.js";
 import {
   decodeInstructions,
   parseExceptionRegions,
 } from "./ManagedMemberInstructionDecoder.js";
+import { validateExceptionRegionRanges } from "./ManagedExceptionRegionValidation.js";
 import { sha256Bytes } from "./ManagedMetadataHeaps.js";
+import { ManagedReaderFailure } from "./ManagedReaderFailure.js";
+
+const bodyStatus = (
+  decodedIssue: string | null,
+  truncatedInstructions: number,
+  exceptionRegions: ReturnType<typeof parseExceptionRegions> | null,
+): "malformed" | "partial" | "present" => {
+  if (decodedIssue !== null || exceptionRegions?.status === "malformed")
+    return "malformed";
+  if (truncatedInstructions > 0) return "partial";
+  return "present";
+};
 
 interface MethodBodyHeader {
   readonly format: "tiny" | "fat";
@@ -52,32 +66,56 @@ const readMethodBodyHeader = (
   };
 };
 
+/** Decode admitted managed CIL, retaining unavailable implementation metadata as partial. */
 export const methodBody = (
   bytes: Buffer,
   pe: ManagedPeLayout,
   rva: number,
-  limits: ManagedMemberInspectionLimits,
+  implementation: { readonly implFlags: number; readonly flags: number } = {
+    implFlags: 0,
+    flags: 0,
+  },
+  budget?: ManagedDecodeBudget,
 ): ManagedMethodBody => {
   if (rva === 0) return emptyMethodBody(rva, "absent", null);
+  if (
+    (implementation.implFlags & 7) !== 0 ||
+    (implementation.flags & 0x2000) !== 0
+  )
+    return emptyMethodBody(
+      rva,
+      "partial",
+      "CIL decoding is unavailable for native, runtime, unmanaged, or P/Invoke implementations",
+    );
   try {
     const offset = pe.rvaToOffset(rva, 1, "method.body");
+    const methodExtent = pe.rvaAvailableBytes(rva, "method.body");
     const header = readMethodBodyHeader(bytes, offset);
-    if (header.ilSize > limits.maxMethodBodyBytes)
-      return oversizedMethodBody(header, rva, offset, limits);
+    if (
+      header.size > methodExtent ||
+      header.ilSize > methodExtent - header.size
+    )
+      throw new RangeError("Method body leaves file-backed PE section data");
     const ilOffset = offset + header.size;
     if (ilOffset > bytes.length - header.ilSize)
       throw new RangeError("Method IL bytes leave artifact");
     const il = bytes.subarray(ilOffset, ilOffset + header.ilSize);
-    const decoded = decodeInstructions(il, limits.maxMethodInstructions);
+    // Bound the actual instruction records before allocating them. One raw
+    // byte is only an upper bound on count; wide operands do not create a
+    // separate instruction for every byte. Retained output is charged below.
+    const decoded = decodeInstructions(
+      il,
+      budget === undefined
+        ? undefined
+        : (start) => budget.admitTransient(256, ilOffset + start),
+    );
     const opcodeCounts: Record<string, number> = {};
     for (const instruction of decoded.parsed)
       opcodeCounts[instruction.opcode] =
         (opcodeCounts[instruction.opcode] ?? 0) + 1;
     const anchors = decoded.parsed
-      .map((instruction, index) => ({ instruction, index }))
-      .filter(({ instruction }) => instruction.operandKind !== "none")
-      .slice(0, limits.instructionAnchorLimit)
-      .map(({ instruction }) => ({
+      .filter((instruction) => instruction.operandKind !== "none")
+      .map((instruction) => ({
         il_offset: instruction.offset,
         opcode: instruction.opcode,
         operand_kind: instruction.operandKind,
@@ -94,14 +132,26 @@ export const methodBody = (
       "utf8",
     );
     const methodEnd = ilOffset + header.ilSize;
-    const sectionOffset = (methodEnd + 3) & ~3;
-    const status =
-      decoded.issue !== null
-        ? "malformed"
-        : decoded.truncated > 0
-          ? "partial"
-          : "present";
-    return {
+    const sectionOffset = Math.ceil(methodEnd / 4) * 4;
+    const exceptionRegions =
+      header.format === "fat" && (header.flags & 8) !== 0
+        ? validateExceptionRegionRanges(
+            parseExceptionRegions(
+              bytes,
+              sectionOffset,
+              offset + methodExtent,
+              budget,
+            ),
+            header.ilSize,
+            decoded.instructionStarts,
+          )
+        : null;
+    const status = bodyStatus(
+      decoded.issue,
+      decoded.truncated,
+      exceptionRegions,
+    );
+    const body: ManagedMethodBody = {
       status,
       header_format: header.format,
       rva,
@@ -121,28 +171,42 @@ export const methodBody = (
       truncated_instructions: decoded.truncated,
       opcode_counts: opcodeCounts,
       anchors,
-      exception_regions:
-        header.format === "fat" && (header.flags & 8) !== 0
-          ? parseExceptionRegions(bytes, sectionOffset, bytes.length)
-          : [],
+      exception_regions: exceptionRegions?.regions ?? [],
       issue:
         decoded.issue ??
+        (exceptionRegions?.status === "malformed"
+          ? exceptionRegions.issue
+          : null) ??
         (decoded.truncated > 0
-          ? `Instruction decode reached max_method_instructions ${String(limits.maxMethodInstructions)} before the end of the method body`
+          ? "Instruction decoding stopped before the end of the method body"
           : null),
     };
+    return budget === undefined ? body : admitManagedProjection(body, budget);
   } catch (cause: unknown) {
+    if (
+      cause instanceof ManagedReaderFailure &&
+      cause.issue.code === "resource-limit"
+    )
+      throw cause;
+    if (
+      !(cause instanceof ManagedReaderFailure) &&
+      !(cause instanceof RangeError)
+    )
+      throw cause;
     return emptyMethodBody(
       rva,
       "malformed",
       cause instanceof Error ? cause.message : "Method body parse failed",
     );
+  } finally {
+    // IL and exception-section bookkeeping coexist until the body is built.
+    budget?.releaseTransient();
   }
 };
 
 const emptyMethodBody = (
   rva: number,
-  status: "absent" | "malformed",
+  status: "absent" | "malformed" | "partial",
   issue: string | null,
 ): ManagedMethodBody => ({
   status,
@@ -162,32 +226,4 @@ const emptyMethodBody = (
   anchors: [],
   exception_regions: [],
   issue,
-});
-
-const oversizedMethodBody = (
-  header: MethodBodyHeader,
-  rva: number,
-  offset: number,
-  limits: ManagedMemberInspectionLimits,
-): ManagedMethodBody => ({
-  status: "too-large",
-  header_format: header.format,
-  rva,
-  file_offset: offset,
-  max_stack: header.maxStack,
-  init_locals: (header.flags & 0x10) !== 0,
-  local_var_sig_token:
-    header.localSig === 0
-      ? null
-      : `0x${header.localSig.toString(16).padStart(8, "0")}`,
-  il_size: header.ilSize,
-  il_sha256: null,
-  normalized_il_sha256: null,
-  instruction_count: 0,
-  decoded_instruction_count: 0,
-  truncated_instructions: 0,
-  opcode_counts: {},
-  anchors: [],
-  exception_regions: [],
-  issue: `Method body exceeds max_method_body_bytes ${String(limits.maxMethodBodyBytes)}`,
 });

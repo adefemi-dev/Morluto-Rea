@@ -1,6 +1,3 @@
-import { createHash } from "node:crypto";
-import { readFile, stat } from "node:fs/promises";
-
 import {
   createAnalysisExecution,
   type AnalysisClient,
@@ -10,69 +7,52 @@ import {
   type ExecutionOptions,
   type ProviderIdentity,
 } from "../application/AnalysisProvider.js";
+import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
+import { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
+import { managedStaticCapabilities } from "./ManagedStaticProviderMetadata.js";
 import { MANAGED_STATIC_PROVIDER } from "../application/InvestigationProviders.js";
 import {
   MANAGED_TOOL_CONTRACTS,
-  managedArtifactInputSchema,
-  managedMemberInputSchema,
-  managedNativeBoundaryInputSchema,
+  managedMembersInputSchema,
+  managedTargetInputSchema,
   type ManagedToolName,
-} from "../contracts/managedToolContracts.js";
-import type { BinaryTarget } from "../domain/binaryTarget.js";
+} from "../contracts/managed/managedToolContracts.js";
+import { AnalysisError } from "../domain/analysisErrorBase.js";
+import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
 import {
   AnalysisCancelledError,
   AnalysisCapabilityUnavailableError,
-  EvidenceIntegrityError,
-  ProviderAdapterError,
-} from "../domain/errors.js";
+  AnalysisInputError,
+} from "../domain/analysisErrorCore.js";
+import { EvidenceIntegrityError } from "../domain/evidenceErrors.js";
+import { ProviderAdapterError } from "../domain/providerAdapterError.js";
+import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 import type { EvidenceLocation } from "../domain/evidence.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 import type {
   ManagedArtifactInspection,
   ManagedMemberInspection,
   ManagedNativeBoundaryInspection,
-} from "../domain/managedArtifact.js";
-import { err, ok } from "../domain/result.js";
+} from "../domain/managed/managedArtifact.js";
+import { err, ok, type Result } from "../domain/result.js";
 import { inspectManagedArtifactBytes } from "./ManagedArtifactInspector.js";
 import { inspectManagedMembersBytes } from "./ManagedMemberInspector.js";
 import { inspectManagedNativeBoundariesBytes } from "./ManagedNativeBoundaryInspector.js";
-
-const IDENTITY: ProviderIdentity = Object.freeze(MANAGED_STATIC_PROVIDER);
+import { RegularFileCleanupFailure } from "../application/RegularFileRead.js";
+import { ManagedReaderFailure } from "./ManagedReaderFailure.js";
+import {
+  hashManagedSource,
+  managedCleanupError,
+  readManagedSnapshot,
+} from "./ManagedSnapshot.js";
 
 /** Execution-free managed PE/CLI auxiliary provider. */
 export class ManagedStaticProvider implements AnalysisProvider {
-  readonly #capabilities: readonly CapabilityDescriptor[] = Object.freeze(
-    MANAGED_TOOL_CONTRACTS.map((contract) =>
-      Object.freeze({
-        provider: IDENTITY,
-        operation: contract.name,
-        inputContractVersion: 1,
-        outputContractVersion: 1,
-        available: true as const,
-        reason: null,
-        pagination: "offset" as const,
-        exhaustive: false,
-        effects: Object.freeze({
-          mutatesArtifact: false,
-          launchesProcess: false,
-          mayShowUi: false,
-          mayAccessNetwork: false,
-          mayWriteFilesystem: false,
-          changesPermissions: false,
-          requiresRoot: false,
-        }),
-        limits: Object.freeze({
-          maxResults: 500,
-          maxPayloadBytes: 4 * 1024 * 1024,
-          timeoutMs: null,
-        }),
-        limitations: limitationsFor(contract.name),
-      }),
-    ),
-  );
+  readonly #capabilities: readonly CapabilityDescriptor[] =
+    managedStaticCapabilities();
 
   identity(): ProviderIdentity {
-    return IDENTITY;
+    return MANAGED_STATIC_PROVIDER;
   }
 
   capabilities(): readonly CapabilityDescriptor[] {
@@ -85,6 +65,9 @@ export class ManagedStaticProvider implements AnalysisProvider {
 }
 
 class ManagedStaticClient implements AnalysisClient {
+  #snapshotBytes: Buffer | undefined;
+  readonly #resources = new ArtifactResourceScope();
+
   constructor(private readonly target: BinaryTarget) {}
 
   async execute(
@@ -93,11 +76,11 @@ class ManagedStaticClient implements AnalysisClient {
     options?: ExecutionOptions,
   ) {
     if (operation === "health")
-      return ok(createAnalysisExecution(null, IDENTITY));
+      return ok(createAnalysisExecution(null, MANAGED_STATIC_PROVIDER));
     if (!isManagedOperation(operation))
       return err(
         new AnalysisCapabilityUnavailableError(
-          IDENTITY.id,
+          MANAGED_STATIC_PROVIDER.id,
           operation,
           "Operation is not implemented by the managed static provider.",
         ),
@@ -105,7 +88,7 @@ class ManagedStaticClient implements AnalysisClient {
     if (this.target.format !== "pe")
       return err(
         new AnalysisCapabilityUnavailableError(
-          IDENTITY.id,
+          MANAGED_STATIC_PROVIDER.id,
           operation,
           `Managed static triage requires a PE target; observed ${this.target.format}.`,
         ),
@@ -113,35 +96,27 @@ class ManagedStaticClient implements AnalysisClient {
     try {
       if (options?.signal?.aborted === true)
         return err(new AnalysisCancelledError(operation));
-      const maxFileBytes = maxRequestedFileBytes(operation, parameters);
-      const metadata = await stat(this.target.path);
-      if (metadata.size > maxFileBytes)
-        return err(
-          new AnalysisCapabilityUnavailableError(
-            IDENTITY.id,
-            operation,
-            `Artifact size ${String(metadata.size)} exceeds max_file_bytes ${String(maxFileBytes)}.`,
-          ),
-        );
-      const bytes = await readFile(
-        this.target.path,
-        options?.signal === undefined ? undefined : { signal: options.signal },
-      );
-      if (bytes.length > maxFileBytes)
-        return err(
-          new AnalysisCapabilityUnavailableError(
-            IDENTITY.id,
-            operation,
-            `Artifact grew beyond max_file_bytes ${String(maxFileBytes)} while it was read.`,
-          ),
-        );
-      const observedDigest = createHash("sha256").update(bytes).digest("hex");
-      if (observedDigest !== this.target.sha256)
+      const snapshot = this.#snapshotBytes;
+      const observed =
+        snapshot === undefined
+          ? await readManagedSnapshot(this.target.path, operation, {
+              signal: options?.signal,
+              resources: this.#resources,
+            })
+          : await hashManagedSource(this.target.path, operation, {
+              signal: options?.signal,
+              resources: this.#resources,
+            });
+      if (observed.sha256 !== this.target.sha256)
         return err(
           new EvidenceIntegrityError(
-            `Managed artifact digest changed after open: expected ${this.target.sha256}, observed ${observedDigest} at ${this.target.path}`,
+            `Managed artifact digest changed after open: expected ${this.target.sha256}, observed ${observed.sha256} at ${this.target.path}`,
           ),
         );
+      const bytes = snapshot ?? observed.bytes;
+      if (bytes === undefined)
+        throw new TypeError("Managed snapshot bytes are unavailable");
+      this.#snapshotBytes = bytes;
       const result = inspectManagedOperation(
         operation,
         parameters,
@@ -149,7 +124,7 @@ class ManagedStaticClient implements AnalysisClient {
         this.target,
       );
       return ok(
-        createAnalysisExecution(result, IDENTITY, {
+        createAnalysisExecution(result, MANAGED_STATIC_PROVIDER, {
           rawResult: null,
           limitations: result.limitations,
           subject: this.target,
@@ -157,50 +132,69 @@ class ManagedStaticClient implements AnalysisClient {
         }),
       );
     } catch (cause: unknown) {
+      if (isCleanupFailure(cause))
+        return err(this.#cleanupError(operation, cause));
+      if (cause instanceof AnalysisError) return err(cause);
       if (options?.signal?.aborted === true)
         return err(new AnalysisCancelledError(operation));
-      return err(new ProviderAdapterError(IDENTITY.id, operation, { cause }));
+      // A PE header or section table the reader cannot map is malformed input.
+      if (
+        cause instanceof ManagedReaderFailure &&
+        cause.issue.code !== "resource-limit"
+      )
+        return err(
+          new AnalysisInputError(operation, { cause }, [
+            {
+              path: ["path"],
+              reason: "invalid_format",
+              message: `Selected artifact ${this.target.path}: ${cause.issue.detail}`,
+            },
+          ]),
+        );
+      return err(
+        new ProviderAdapterError(MANAGED_STATIC_PROVIDER.id, operation, {
+          cause,
+        }),
+      );
     }
   }
 
-  close(): Promise<void> {
-    return Promise.resolve();
+  async close(): Promise<Result<null, AnalysisError>> {
+    this.#snapshotBytes = undefined;
+    try {
+      await this.#resources.close();
+      return ok(null);
+    } catch (cause: unknown) {
+      return err(this.#cleanupError("close", cause));
+    }
+  }
+
+  #cleanupError(operation: string, cause: unknown): ProviderCleanupError {
+    const failure = managedCleanupError(cause, this.target.path, operation);
+    if (failure instanceof ProviderCleanupError) return failure;
+    const cleanup =
+      cause instanceof ArtifactReaderFailure ? cause.cleanup : undefined;
+    return new ProviderCleanupError(
+      MANAGED_STATIC_PROVIDER.id,
+      cleanup?.resources ?? [this.target.path],
+      {
+        reason:
+          cleanup?.reason ??
+          (cause instanceof Error ? cause.message : String(cause)),
+      },
+      { cause, operation },
+    );
   }
 }
+
+const isCleanupFailure = (cause: unknown): boolean =>
+  cause instanceof RegularFileCleanupFailure ||
+  (cause instanceof ArtifactReaderFailure && cause.cleanup !== undefined);
 
 const isManagedOperation = (
   operation: AnalysisOperation,
 ): operation is ManagedToolName =>
   MANAGED_TOOL_CONTRACTS.some(({ name }) => name === operation);
-
-const limitationsFor = (operation: ManagedToolName): readonly string[] =>
-  Object.freeze(
-    operation === "inspect_managed_artifact"
-      ? [
-          "This capability inventories PE/CLI identity only; inspect_managed_members admits bounded metadata members, signatures, and CIL anchors.",
-          "It never loads the target assembly, resolves dependencies through a CLR, decompiles C#, or executes target code.",
-        ]
-      : operation === "inspect_managed_native_boundaries"
-        ? [
-            "This capability inventories managed declarations for native boundaries only; native exports, thunks, and addresses require separate native-provider evidence.",
-            "It never loads the target assembly, resolves dependencies through a CLR, decompiles C#, or executes target code.",
-          ]
-        : [
-            "This capability decodes bounded PE/CLI metadata members, signatures, and file-backed method bodies; decompiled C# and cross-build matching are separate future contracts.",
-            "It never loads the target assembly, resolves dependencies through a CLR, decompiles C#, or executes target code.",
-          ],
-  );
-
-const maxRequestedFileBytes = (
-  operation: ManagedToolName,
-  parameters: Readonly<Record<string, JsonValue>>,
-): number => {
-  if (operation === "inspect_managed_artifact")
-    return managedArtifactInputSchema.parse(parameters).max_file_bytes;
-  if (operation === "inspect_managed_native_boundaries")
-    return managedNativeBoundaryInputSchema.parse(parameters).max_file_bytes;
-  return managedMemberInputSchema.parse(parameters).max_file_bytes;
-};
 
 const inspectManagedOperation = (
   operation: ManagedToolName,
@@ -211,53 +205,20 @@ const inspectManagedOperation = (
   | ManagedArtifactInspection
   | ManagedMemberInspection
   | ManagedNativeBoundaryInspection => {
+  if (operation === "inspect_managed_members") {
+    const { type_names: typeNames } =
+      managedMembersInputSchema.parse(parameters);
+    return inspectManagedMembersBytes(
+      bytes,
+      target,
+      typeNames === undefined ? {} : { typeNames },
+    );
+  }
+  managedTargetInputSchema.parse(parameters);
   if (operation === "inspect_managed_artifact") {
-    const input = managedArtifactInputSchema.parse(parameters);
-    return inspectManagedArtifactBytes(bytes, target, {
-      referenceOffset: input.reference_offset,
-      referenceLimit: input.reference_limit,
-      resourceOffset: input.resource_offset,
-      resourceLimit: input.resource_limit,
-      attributeOffset: input.attribute_offset,
-      attributeLimit: input.attribute_limit,
-      maxMetadataBytes: input.max_metadata_bytes,
-      maxTableRows: input.max_table_rows,
-      maxHeapItemBytes: input.max_heap_item_bytes,
-    });
+    return inspectManagedArtifactBytes(bytes, target);
   }
-  if (operation === "inspect_managed_native_boundaries") {
-    const input = managedNativeBoundaryInputSchema.parse(parameters);
-    return inspectManagedNativeBoundariesBytes(bytes, target, {
-      moduleRefOffset: input.module_ref_offset,
-      moduleRefLimit: input.module_ref_limit,
-      importOffset: input.import_offset,
-      importLimit: input.import_limit,
-      implementationOffset: input.implementation_offset,
-      implementationLimit: input.implementation_limit,
-      maxMetadataBytes: input.max_metadata_bytes,
-      maxTableRows: input.max_table_rows,
-      maxHeapItemBytes: input.max_heap_item_bytes,
-    });
-  }
-  const input = managedMemberInputSchema.parse(parameters);
-  return inspectManagedMembersBytes(bytes, target, {
-    typeOffset: input.type_offset,
-    typeLimit: input.type_limit,
-    methodOffset: input.method_offset,
-    methodLimit: input.method_limit,
-    fieldOffset: input.field_offset,
-    fieldLimit: input.field_limit,
-    memberRefOffset: input.member_ref_offset,
-    memberRefLimit: input.member_ref_limit,
-    edgeOffset: input.edge_offset,
-    edgeLimit: input.edge_limit,
-    instructionAnchorLimit: input.instruction_anchor_limit,
-    maxMetadataBytes: input.max_metadata_bytes,
-    maxTableRows: input.max_table_rows,
-    maxHeapItemBytes: input.max_heap_item_bytes,
-    maxMethodBodyBytes: input.max_method_body_bytes,
-    maxMethodInstructions: input.max_method_instructions,
-  });
+  return inspectManagedNativeBoundariesBytes(bytes, target);
 };
 
 const managedLocations = (
@@ -287,9 +248,8 @@ const managedLocations = (
       ...(result.module === null
         ? [{ kind: "file-offset" as const, offset: 0 }]
         : [{ kind: "file-offset" as const, offset: result.module.row_offset }]),
-      ...result.methods.items
+      ...result.methods
         .filter((method) => method.body.file_offset !== null)
-        .slice(0, 8)
         .map((method) => ({
           kind: "file-offset" as const,
           offset: method.body.file_offset ?? 0,
@@ -299,7 +259,7 @@ const managedLocations = (
     ...(result.module === null
       ? [{ kind: "file-offset" as const, offset: 0 }]
       : [{ kind: "file-offset" as const, offset: result.module.row_offset }]),
-    ...result.pinvoke_imports.items.slice(0, 8).map((mapping) => ({
+    ...result.pinvoke_imports.map((mapping) => ({
       kind: "file-offset" as const,
       offset: mapping.row_offset,
     })),

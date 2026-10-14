@@ -6,7 +6,7 @@ import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 export async function loadRealHopperFixtureTargets(manifestPath) {
   const canonicalManifest = await realpath(manifestPath);
   const manifest = JSON.parse(await readFile(canonicalManifest, "utf8"));
-  if (manifest?.schemaVersion !== 1 || !Array.isArray(manifest.fixtures))
+  if (!Array.isArray(manifest?.fixtures))
     throw new Error("Invalid conformance fixture manifest");
   const primary = fixtureEntry(manifest.fixtures, "c");
   const secondary = fixtureEntry(manifest.fixtures, "version-v2");
@@ -21,12 +21,26 @@ export async function loadRealHopperFixtureTargets(manifestPath) {
       bindFixtureArtifact(root, large),
     ],
   );
-  requireDistinctArtifacts([primaryArtifact, secondaryArtifact, largeArtifact]);
+  const objc = manifest.fixtures.find((fixture) => fixture?.name === "objc");
+  const unicodeArtifact =
+    objc === undefined
+      ? undefined
+      : await bindFixtureArtifact(
+          root,
+          fixtureEntry(manifest.fixtures, "objc"),
+        );
+  requireDistinctArtifacts([
+    primaryArtifact,
+    secondaryArtifact,
+    largeArtifact,
+    ...(unicodeArtifact === undefined ? [] : [unicodeArtifact]),
+  ]);
   return {
     manifestPath: canonicalManifest,
     primary: primaryArtifact,
     secondary: secondaryArtifact,
     large: largeArtifact,
+    ...(unicodeArtifact === undefined ? {} : { unicode: unicodeArtifact }),
     oracle,
     largeOracle,
   };
@@ -69,7 +83,7 @@ function requireLargeOracle(largeOracle) {
     largeOracle.symbolCount !== largeOracle.stringCount ||
     largeOracle.symbolCount <= 0
   )
-    throw new Error("Large fixture omitted its exact pagination oracle");
+    throw new Error("Large fixture omitted its complete-inventory oracle");
   return largeOracle;
 }
 

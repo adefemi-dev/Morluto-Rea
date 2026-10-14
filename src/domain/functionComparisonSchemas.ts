@@ -1,14 +1,10 @@
 import { z } from "zod";
+import { evidenceSchema } from "./evidence.js";
+import { digestSchema } from "./../domain/digests.js";
+import { prefixedDigestSchema } from "./../domain/digests.js";
 
-const comparisonStatusSchema = z.enum([
-  "unchanged",
-  "added",
-  "removed",
-  "changed",
-  "truncated",
-  "unknown",
-]);
-const dimensionNameSchema = z.enum([
+const comparisonStatusSchema = z.enum(["unchanged", "changed", "unknown"]);
+export const functionComparisonDimensionNameSchema = z.enum([
   "identity",
   "pseudocode",
   "assembly",
@@ -18,16 +14,12 @@ const dimensionNameSchema = z.enum([
   "strings_names",
   "cfg",
 ]);
-const evidenceIdSchema = z.string().regex(/^ev_[a-f0-9]{64}$/u);
-const digestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
+const evidenceIdSchema = prefixedDigestSchema("ev");
 
-/** Strict bounded input for explicit function-to-function comparison. */
+/** Inputs for explicit function-to-function comparison. */
 export const functionComparisonInputSchema = z.strictObject({
-  left_evidence_ids: z.array(evidenceIdSchema).min(1).max(100),
-  right_evidence_ids: z.array(evidenceIdSchema).min(1).max(100),
-  offset: z.number().int().min(0).default(0),
-  limit: z.number().int().min(1).max(100).default(100),
-  unknown_registry_approved: z.literal(true).optional(),
+  left: evidenceSchema,
+  right: evidenceSchema,
 });
 
 const textDeltaSchema = z.object({
@@ -36,48 +28,69 @@ const textDeltaSchema = z.object({
   hunks: z.number().int().min(0),
 });
 
-const functionDimensionSchema = z.object({
-  dimension: dimensionNameSchema,
-  status: comparisonStatusSchema,
-  left_digest: digestSchema.nullable(),
-  right_digest: digestSchema.nullable(),
+const functionDimensionContextShape = {
+  dimension: functionComparisonDimensionNameSchema,
   left_count: z.number().int().min(0).nullable(),
   right_count: z.number().int().min(0).nullable(),
-  text_delta: textDeltaSchema.nullable(),
-  conclusion_kind: z.enum([
-    "derived_relationship",
-    "contradiction",
-    "unresolved_branch",
-  ]),
-  evidence_links: z.array(evidenceIdSchema).min(2).max(200),
+  evidence_links: z.array(evidenceIdSchema).min(2),
   limitations: z.array(z.string()),
-});
+};
+
+const functionDimensionSchema = z.union([
+  z.object({
+    ...functionDimensionContextShape,
+    status: z.literal("unchanged"),
+    left_digest: digestSchema,
+    right_digest: digestSchema,
+    text_delta: textDeltaSchema.nullable(),
+    conclusion_kind: z.literal("derived_relationship"),
+  }),
+  z.object({
+    ...functionDimensionContextShape,
+    status: z.literal("changed"),
+    left_digest: digestSchema,
+    right_digest: digestSchema,
+    text_delta: textDeltaSchema.nullable(),
+    conclusion_kind: z.enum(["derived_relationship", "contradiction"]),
+  }),
+  z.object({
+    ...functionDimensionContextShape,
+    status: z.literal("unknown"),
+    left_digest: z.null(),
+    right_digest: z.null(),
+    text_delta: z.null(),
+    conclusion_kind: z.literal("unresolved_branch"),
+  }),
+]);
+
+const functionMatchSchema = z.union([
+  z.object({
+    status: z.literal("matched"),
+    method: z.literal("symbol"),
+    left_name: z.string(),
+    right_name: z.string(),
+  }),
+  z.object({
+    status: z.enum(["mismatched", "ambiguous"]),
+    method: z.literal("explicit"),
+    left_name: z.string(),
+    right_name: z.string(),
+  }),
+]);
 
 /** Deterministic dimension-classified function comparison Evidence payload. */
 export const functionComparisonResultSchema = z.object({
   status: comparisonStatusSchema,
-  function_match: z.object({
-    status: z.enum(["matched", "mismatched", "ambiguous", "unknown"]),
-    method: z.enum(["explicit", "symbol"]),
-    left_name: z.string(),
-    right_name: z.string(),
-  }),
+  function_match: functionMatchSchema,
   left_subject_sha256: digestSchema,
   right_subject_sha256: digestSchema,
   summary: z.object({
     unchanged: z.number().int().min(0),
     changed: z.number().int().min(0),
-    truncated: z.number().int().min(0),
     unknown: z.number().int().min(0),
   }),
   dimensions: z.array(functionDimensionSchema).length(8),
-  changes: z.object({
-    items: z.array(functionDimensionSchema).max(100),
-    offset: z.number().int().min(0),
-    limit: z.number().int().min(1).max(100),
-    total: z.number().int().min(0),
-    next_offset: z.number().int().min(0).nullable(),
-  }),
+  changes: z.array(functionDimensionSchema),
   limitations: z.array(z.string()),
 });
 
@@ -85,4 +98,6 @@ export type FunctionComparisonResult = z.infer<
   typeof functionComparisonResultSchema
 >;
 export type FunctionDimension = z.infer<typeof functionDimensionSchema>;
-export type DimensionName = z.infer<typeof dimensionNameSchema>;
+export type DimensionName = z.infer<
+  typeof functionComparisonDimensionNameSchema
+>;

@@ -1,19 +1,8 @@
-import { format } from "prettier";
+import { formatGeneratedFile } from "./format-generated-file.mjs";
 
-import { assertSameNames, loadSources } from "./catalog-core.mjs";
-import {
-  createCliInventory,
-  cliCommandDescriptionIssues,
-  cliCommandOptionNames,
-} from "./catalog-cli.mjs";
+import { assertSameNames, digest, loadSources } from "./catalog-core.mjs";
+import { createCliInventory } from "./catalog-cli.mjs";
 import { providerCatalog, toolFamilyCatalog } from "./catalog-builders.mjs";
-import { schemaCatalog } from "./catalog-schemas.mjs";
-
-export {
-  createCliInventory,
-  cliCommandDescriptionIssues,
-  cliCommandOptionNames,
-};
 
 /** Project current runtime contracts into deterministic, machine-readable facts. */
 export const createProductCatalog = async (root) => {
@@ -22,12 +11,12 @@ export const createProductCatalog = async (root) => {
   assertSameNames(
     "Primary CLI inventory",
     cli.primary,
-    sources.catalogIdentity.CLI_COMMAND_NAMES,
+    sources.cliCommandNames.CLI_COMMAND_NAMES,
   );
   const tools = toolFamilyCatalog(sources);
+  const providers = providerCatalog(sources);
   const metadata = sources.packageMetadata.PACKAGE_METADATA;
   return {
-    catalog_schema_version: 1,
     package: {
       name: metadata.name,
       version: metadata.version,
@@ -39,7 +28,7 @@ export const createProductCatalog = async (root) => {
       skill_version: metadata.skillVersion,
     },
     tools,
-    providers: providerCatalog(sources),
+    providers,
     setup_clients: sources.supportedClients.SUPPORTED_CLIENT_DEFINITIONS.map(
       ({ name, displayName, format }) => ({
         id: name,
@@ -48,7 +37,6 @@ export const createProductCatalog = async (root) => {
         configuration: format === "unsupported" ? "detect-only" : "managed",
       }),
     ),
-    schemas: schemaCatalog(sources),
     cli: {
       primary_count: cli.primary.length,
       commands: cli.primary,
@@ -56,11 +44,17 @@ export const createProductCatalog = async (root) => {
     },
     runtime_catalog: {
       counts: sources.catalogIdentity.CATALOG_IDENTITY.counts,
-      digests: sources.catalogIdentity.CATALOG_IDENTITY.digests,
+      digests: {
+        // Full runtime schema digests belong to server identity, not this facts projection.
+        providers_sha256: digest(providers),
+      },
     },
   };
 };
 
-/** Stable checked-in representation of the product catalog. */
+/** Stable build-generated representation of the product catalog. */
 export const serializeProductCatalog = (catalog) =>
-  format(JSON.stringify(catalog, null, 2), { parser: "json" });
+  formatGeneratedFile(
+    "docs/public/product-catalog.json",
+    JSON.stringify(catalog, null, 2),
+  );

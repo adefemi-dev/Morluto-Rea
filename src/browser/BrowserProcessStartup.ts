@@ -39,7 +39,7 @@ export class BrowserStartupError extends Error {
   }
 }
 
-/** Owned child process and bounded startup policy for Chrome CDP discovery. */
+/** Owned child process and startup policy for Chrome CDP discovery. */
 export interface BrowserStartupOptions {
   readonly child: ChildProcess;
   readonly executable: string;
@@ -129,7 +129,7 @@ const startupError = (
       elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
       exitCode: options.child.exitCode,
       signalCode: options.child.signalCode,
-      stderr: boundedStderr(options.stderr()),
+      stderr: options.stderr(),
     },
     state.failure === "spawn-error" ? { cause: state.cause } : undefined,
   );
@@ -141,13 +141,12 @@ const readDevtoolsPort = async (path: string): Promise<number | null> => {
     return Number.isSafeInteger(port) && port > 0 && port <= 65_535
       ? port
       : null;
-  } catch {
+  } catch (cause: unknown) {
+    // Missing or unreadable port files mean the port is unknown.
+    void cause;
     return null;
   }
 };
-
-const boundedStderr = (stderr: string): string =>
-  stderr.length <= 65_536 ? stderr : stderr.slice(-65_536);
 
 const delay = (milliseconds: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, milliseconds));

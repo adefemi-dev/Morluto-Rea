@@ -2,14 +2,16 @@ import type { BrowserObservationPort } from "../application/BrowserObservationPo
 import type { ProviderIdentity } from "../application/AnalysisProvider.js";
 import type { ExecutionOptions } from "../application/AnalysisProvider.js";
 import {
-  browserTargetListSchema,
   sanitizeBrowserUrl,
-  webPageInspectionSchema,
-  type BrowserTargetList,
   type InspectWebPageInput,
   type ListBrowserTargetsInput,
-  type WebPageInspection,
 } from "../domain/browserObservation.js";
+import {
+  browserTargetListSchema,
+  webPageInspectionSchema,
+  type BrowserTargetList,
+  type WebPageInspection,
+} from "../domain/browserObservationSchemas.js";
 import { analyzeCapturedWebBundle } from "../domain/webBundleAnalyzer.js";
 import {
   webBundleAnalysisSchema,
@@ -27,11 +29,11 @@ import {
   type WebMcpDiscovery,
 } from "../domain/webMcpDiscovery.js";
 import {
-  compareWebCaptures,
-  webCaptureDiffSchema,
-  type CompareWebCapturesInput,
-  type WebCaptureDiff,
-} from "../domain/webCaptureDiff.js";
+  browserCaptureComparisonSchema,
+  compareBrowserCaptures,
+  type BrowserCaptureComparison,
+  type BrowserCaptureComparisonInput,
+} from "../domain/browserCaptureComparison.js";
 import {
   webScreenshotDiffSchema,
   webScreenshotSchema,
@@ -40,12 +42,11 @@ import {
   type WebScreenshot,
   type WebScreenshotDiff,
 } from "../domain/webScreenshot.js";
-import {
-  AnalysisError,
-  BrowserObservationError,
-  ProviderAdapterError,
-  type BrowserObservationOperation,
-} from "../domain/errors.js";
+import { AnalysisError } from "../domain/analysisErrorBase.js";
+import { AnalysisInputError } from "../domain/analysisErrorCore.js";
+import { BrowserObservationError } from "../domain/browserObservationError.js";
+import { ProviderAdapterError } from "../domain/providerAdapterError.js";
+import type { BrowserObservationOperation } from "../domain/browserObservationErrors.js";
 import { err, ok, type Result } from "../domain/result.js";
 import {
   discoverCdpEndpoint,
@@ -60,24 +61,20 @@ import {
 } from "./CdpTargetSession.js";
 import { capturePage, type CapturedPage } from "./CdpPageCapture.js";
 import { fetchWebSourceMaps } from "./WebSourceMapFetcher.js";
+import { authorizeCdpTarget } from "./CdpAuthorizedTarget.js";
 import { observeCdpSession } from "./CdpObservationSession.js";
 import { discoverWebMcp } from "./CdpWebMcpDiscovery.js";
 import { captureCdpScreenshot } from "./CdpScreenshot.js";
 import { comparePngScreenshots } from "./PngVisualDiff.js";
 
-/** Public identity committed by passive browser observations. */
-export const CDP_BROWSER_PROVIDER_IDENTITY: ProviderIdentity = Object.freeze({
-  id: "rea-cdp-browser",
-  name: "REA Chrome DevTools Protocol observation provider",
-  version: "2",
-});
-const IDENTITY = CDP_BROWSER_PROVIDER_IDENTITY;
+import { CDP_BROWSER_PROVIDER_IDENTITY } from "./providerIdentities.js";
+import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 const CLEANUP_DOMAINS = ["Network", "Debugger", "Runtime", "Page"] as const;
 
-/** Passive, origin-scoped browser observation through a user-owned CDP endpoint. */
+/** Passive browser observation through a selected user-owned CDP endpoint. */
 export class CdpBrowserProvider implements BrowserObservationPort {
   identity(): ProviderIdentity {
-    return IDENTITY;
+    return CDP_BROWSER_PROVIDER_IDENTITY;
   }
 
   async listTargets(
@@ -90,34 +87,31 @@ export class CdpBrowserProvider implements BrowserObservationPort {
         "list_browser_targets",
         options.signal,
       );
-      const allowedOrigins = new Set(input.allowed_origins);
-      const selected = selectTargets(discovery, allowedOrigins);
-      const items = selected.allowed.slice(
-        input.offset,
-        input.offset + input.limit,
+      const selected = selectTargets(
+        discovery,
+        input.allowed_origins.length === 0
+          ? undefined
+          : new Set(input.allowed_origins),
       );
-      const nextOffset = input.offset + items.length;
       return ok(
         browserTargetListSchema.parse({
-          schema_version: 1,
           browser: discovery.version,
-          targets: {
-            items,
-            offset: input.offset,
-            limit: input.limit,
-            total: selected.allowed.length,
-            next_offset:
-              nextOffset < selected.allowed.length ? nextOffset : null,
-            has_more: nextOffset < selected.allowed.length,
-          },
+          targets: selected.allowed,
           excluded: selected.excluded,
           limitations: [
-            "Only page targets whose current URL matches an approved exact origin are listed.",
+            input.allowed_origins.length === 0
+              ? "All page targets with supported HTTP(S) URLs are listed."
+              : "Only page targets whose current URL matches an explicitly requested exact origin are listed.",
             ...(selected.unconnectable === 0
               ? []
               : [
                   `${String(selected.unconnectable)} otherwise allowed page target(s) lacked a validated direct CDP WebSocket and were excluded.`,
                 ]),
+            ...(selected.allowed.some((target) => target.attached === null)
+              ? [
+                  "CDP discovery omitted attachment state for one or more targets; attached is reported as unknown.",
+                ]
+              : []),
           ],
         }),
       );
@@ -151,13 +145,19 @@ export class CdpBrowserProvider implements BrowserObservationPort {
       const sourceMaps = input.fetch_source_maps
         ? await fetchWebSourceMaps(
             captured.sourceMapRequests,
-            input,
+            {
+              ...input,
+              allowed_origins:
+                input.allowed_origins.length > 0
+                  ? input.allowed_origins
+                  : [captured.inspection.target.origin],
+            },
             options.signal,
           )
         : undefined;
       return ok(
         webBundleAnalysisSchema.parse(
-          analyzeCapturedWebBundle(captured.inspection, input, sourceMaps),
+          analyzeCapturedWebBundle(captured.inspection, sourceMaps),
         ),
       );
     } catch (cause: unknown) {
@@ -177,6 +177,7 @@ export class CdpBrowserProvider implements BrowserObservationPort {
         options.signal,
       );
       const target = authorizeTarget(discovery, input);
+      const scopedInput = scopeToTargetOrigin(input, target);
       targetSession = await openCdpTargetSession(
         discovery,
         target,
@@ -190,7 +191,7 @@ export class CdpBrowserProvider implements BrowserObservationPort {
             sessionId: targetSession.sessionId,
             discovery,
             target,
-            input,
+            input: scopedInput,
             ...(options.signal === undefined ? {} : { signal: options.signal }),
             ...(options.progress === undefined
               ? {}
@@ -202,7 +203,11 @@ export class CdpBrowserProvider implements BrowserObservationPort {
       return err(providerError(cause, "observe_web_session"));
     } finally {
       if (targetSession !== undefined)
-        await closeCdpTargetSession(targetSession, CLEANUP_DOMAINS);
+        await closeCdpTargetSession(
+          targetSession,
+          CLEANUP_DOMAINS,
+          options.signal,
+        );
     }
   }
 
@@ -218,6 +223,7 @@ export class CdpBrowserProvider implements BrowserObservationPort {
         options.signal,
       );
       const target = authorizeTarget(discovery, input);
+      const scopedInput = scopeToTargetOrigin(input, target);
       targetSession = await openCdpTargetSession(
         discovery,
         target,
@@ -231,7 +237,7 @@ export class CdpBrowserProvider implements BrowserObservationPort {
             sessionId: targetSession.sessionId,
             discovery,
             target,
-            input,
+            input: scopedInput,
             ...(options.signal === undefined ? {} : { signal: options.signal }),
             ...(options.progress === undefined
               ? {}
@@ -243,15 +249,21 @@ export class CdpBrowserProvider implements BrowserObservationPort {
       return err(providerError(cause, "discover_webmcp_tools"));
     } finally {
       if (targetSession !== undefined)
-        await closeCdpTargetSession(targetSession, CLEANUP_DOMAINS);
+        await closeCdpTargetSession(
+          targetSession,
+          CLEANUP_DOMAINS,
+          options.signal,
+        );
     }
   }
 
   async compareCaptures(
-    input: CompareWebCapturesInput,
-  ): Promise<Result<WebCaptureDiff, AnalysisError>> {
+    input: BrowserCaptureComparisonInput,
+  ): Promise<Result<BrowserCaptureComparison, AnalysisError>> {
     try {
-      return ok(webCaptureDiffSchema.parse(compareWebCaptures(input)));
+      return ok(
+        browserCaptureComparisonSchema.parse(compareBrowserCaptures(input)),
+      );
     } catch (cause: unknown) {
       return err(providerError(cause, "compare_web_captures"));
     }
@@ -269,6 +281,7 @@ export class CdpBrowserProvider implements BrowserObservationPort {
         options.signal,
       );
       const target = authorizeTarget(discovery, input);
+      const scopedInput = scopeToTargetOrigin(input, target);
       targetSession = await openCdpTargetSession(
         discovery,
         target,
@@ -282,7 +295,7 @@ export class CdpBrowserProvider implements BrowserObservationPort {
             sessionId: targetSession.sessionId,
             discovery,
             target,
-            input,
+            input: scopedInput,
             ...(options.signal === undefined ? {} : { signal: options.signal }),
             ...(options.progress === undefined
               ? {}
@@ -294,7 +307,11 @@ export class CdpBrowserProvider implements BrowserObservationPort {
       return err(providerError(cause, "capture_web_screenshot"));
     } finally {
       if (targetSession !== undefined)
-        await closeCdpTargetSession(targetSession, CLEANUP_DOMAINS);
+        await closeCdpTargetSession(
+          targetSession,
+          CLEANUP_DOMAINS,
+          options.signal,
+        );
     }
   }
 
@@ -304,6 +321,12 @@ export class CdpBrowserProvider implements BrowserObservationPort {
     try {
       return ok(webScreenshotDiffSchema.parse(comparePngScreenshots(input)));
     } catch (cause: unknown) {
+      if (cause instanceof TypeError)
+        return err(
+          new AnalysisInputError("compare_web_screenshots", { cause }, [
+            { path: [], reason: "invalid_format", message: cause.message },
+          ]),
+        );
       return err(providerError(cause, "compare_web_screenshots"));
     }
   }
@@ -321,6 +344,7 @@ export class CdpBrowserProvider implements BrowserObservationPort {
         options.signal,
       );
       const target = authorizeTarget(discovery, input);
+      const scopedInput = scopeToTargetOrigin(input, target);
       targetSession = await openCdpTargetSession(
         discovery,
         target,
@@ -333,7 +357,7 @@ export class CdpBrowserProvider implements BrowserObservationPort {
         operation,
         discovery,
         target,
-        input,
+        input: scopedInput,
         ...(options.signal === undefined ? {} : { signal: options.signal }),
         ...(options.progress === undefined
           ? {}
@@ -341,16 +365,20 @@ export class CdpBrowserProvider implements BrowserObservationPort {
       });
     } finally {
       if (targetSession !== undefined)
-        await closeCdpTargetSession(targetSession, CLEANUP_DOMAINS);
+        await closeCdpTargetSession(
+          targetSession,
+          CLEANUP_DOMAINS,
+          options.signal,
+        );
     }
   }
 }
 
 const selectTargets = (
   discovery: CdpEndpointDiscovery,
-  allowedOrigins: ReadonlySet<string>,
+  allowedOrigins: ReadonlySet<string> | undefined,
 ): {
-  readonly allowed: readonly BrowserTargetList["targets"]["items"][number][];
+  readonly allowed: readonly BrowserTargetList["targets"][number][];
   readonly excluded: BrowserTargetList["excluded"];
   readonly unconnectable: number;
 } => {
@@ -369,7 +397,7 @@ const selectTargets = (
       unsupportedUrl += 1;
       continue;
     }
-    if (!allowedOrigins.has(url.origin)) {
+    if (allowedOrigins !== undefined && !allowedOrigins.has(url.origin)) {
       disallowedOrigin += 1;
       continue;
     }
@@ -380,13 +408,15 @@ const selectTargets = (
     allowed.push({
       target_id: target.id,
       type: target.type,
-      title: target.title.slice(0, 16_384),
+      title: target.title,
       url: url.url,
       origin: url.origin,
       attached: target.attached,
     });
   }
-  allowed.sort((left, right) => left.target_id.localeCompare(right.target_id));
+  allowed.sort((left, right) =>
+    compareUnicodeCodePoints(left.target_id, right.target_id),
+  );
   return {
     allowed,
     excluded: {
@@ -402,19 +432,18 @@ const authorizeTarget = (
   discovery: CdpEndpointDiscovery,
   input: Pick<InspectWebPageInput, "target_id" | "allowed_origins">,
 ): CdpEndpointTarget => {
-  const target = discovery.targets.find(
-    (candidate) => candidate.id === input.target_id,
-  );
-  if (target === undefined)
-    throw new BrowserObservationError("inspect_web_page", "target_not_found");
+  return authorizeCdpTarget(discovery, input, "inspect_web_page").target;
+};
+
+const scopeToTargetOrigin = <T extends { allowed_origins: readonly string[] }>(
+  input: T,
+  target: CdpEndpointTarget,
+): T => {
+  if (input.allowed_origins.length > 0) return input;
   const origin = sanitizeBrowserUrl(target.url).origin;
-  if (
-    target.type !== "page" ||
-    origin === null ||
-    !input.allowed_origins.includes(origin)
-  )
+  if (origin === null)
     throw new BrowserObservationError("inspect_web_page", "target_not_allowed");
-  return target;
+  return { ...input, allowed_origins: [origin] };
 };
 
 const providerError = (
@@ -425,4 +454,6 @@ const providerError = (
     ? new BrowserObservationError(operation, cause.reason, { cause })
     : cause instanceof AnalysisError
       ? cause
-      : new ProviderAdapterError(IDENTITY.id, operation, { cause });
+      : new ProviderAdapterError(CDP_BROWSER_PROVIDER_IDENTITY.id, operation, {
+          cause,
+        });

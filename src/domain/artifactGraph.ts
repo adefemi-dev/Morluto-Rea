@@ -1,16 +1,16 @@
 import { z } from "zod";
+import { prefixedDigestSchema } from "./../domain/digests.js";
 
 const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/u);
-const artifactIdSchema = z.string().regex(/^art_[a-f0-9]{64}$/u);
-const occurrenceIdSchema = z.string().regex(/^occ_[a-f0-9]{64}$/u);
-const edgeIdSchema = z.string().regex(/^edge_[a-f0-9]{64}$/u);
-const manifestIdSchema = z.string().regex(/^agm_[a-f0-9]{64}$/u);
-const extractionIdSchema = z.string().regex(/^aex_[a-f0-9]{64}$/u);
-const contradictionIdSchema = z.string().regex(/^ic_[a-f0-9]{64}$/u);
+const artifactIdSchema = prefixedDigestSchema("art");
+const occurrenceIdSchema = prefixedDigestSchema("occ");
+const edgeIdSchema = prefixedDigestSchema("edge");
+const manifestIdSchema = prefixedDigestSchema("agm");
+const extractionIdSchema = prefixedDigestSchema("aex");
+const contradictionIdSchema = prefixedDigestSchema("ic");
 const boundedRelativePathSchema = z
   .string()
   .min(1)
-  .max(4_096)
   .refine(
     (path) =>
       !path.startsWith("/") &&
@@ -48,10 +48,18 @@ const artifactFormatSchema = z.enum([
   "mach-o",
   "elf",
   "pe",
+  "dos-mz",
+  "dos-com",
+  "raw-binary",
   "hopper",
   "analysis-database",
   "ipa",
   "apk",
+  "msix",
+  "appx",
+  "hap",
+  "hsp",
+  "app-pack",
   "plist",
   "entitlements",
   "directory",
@@ -59,15 +67,19 @@ const artifactFormatSchema = z.enum([
   "unknown",
 ]);
 
-/** Exact bounded policy applied while discovering or extracting artifacts. */
-const artifactTraversalLimitsSchema = z.object({
-  max_entries: z.number().int().min(1).max(1_000_000),
-  max_total_bytes: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
-  max_entry_bytes: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
-  max_compression_ratio: z.number().min(1).max(100_000),
-  max_depth: z.number().int().min(0).max(100),
-  max_path_bytes: z.number().int().min(1).max(65_535),
-});
+/** Formats established from bytes or a virtual directory tree, independent of path roles. */
+const artifactContentFormatSchema = artifactFormatSchema.extract([
+  "zip",
+  "mach-o-universal",
+  "mach-o",
+  "elf",
+  "pe",
+  "dos-mz",
+  "plist",
+  "directory",
+  "file",
+  "unknown",
+]);
 
 /** File byte interval for an artifact derived without writing it to disk. */
 const artifactByteRangeSchema = z.object({
@@ -75,40 +87,40 @@ const artifactByteRangeSchema = z.object({
   length: z.number().int().min(0),
 });
 
-/** Bounded external command provenance, including observable side effects. */
+/** External command provenance, including observable side effects. */
 const artifactCommandSchema = z.object({
   tool: z.string().min(1),
-  arguments: z.array(z.string().max(4_096)).max(1_024),
+  arguments: z.array(z.string()),
   tool_version: z.string().nullable(),
   executable_sha256: sha256Schema.nullable(),
   exit_code: z.number().int().nullable(),
-  effects: z.array(z.enum(["read", "write", "mount"])).max(3),
+  effects: z.array(z.enum(["read", "write", "mount"])),
 });
 
-/** Parsed bounded artifact-producing command provenance. */
+/** Parsed artifact-producing command provenance. */
 export type ArtifactCommand = z.infer<typeof artifactCommandSchema>;
 
 /** One content-addressed application artifact in deterministic manifest order. */
-const artifactNodeSchema = z.object({
+export const artifactNodeSchema = z.object({
   artifact_id: artifactIdSchema,
-  kind: artifactKindSchema,
-  format: artifactFormatSchema,
+  format: artifactContentFormatSchema,
   sha256: sha256Schema,
   size: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
   media_type: z.string().min(1).nullable(),
   architecture: z.string().min(1).nullable(),
-  executable: z.boolean(),
   content_state: z.enum(["materialized", "embedded", "virtual"]),
   limitations: z.array(z.string()),
 });
 
 /** One path or virtual location where an artifact occurs in its parent. */
-const artifactOccurrenceSchema = z.object({
+export const artifactOccurrenceSchema = z.object({
   occurrence_id: occurrenceIdSchema,
   artifact_id: artifactIdSchema.nullable(),
   parent_occurrence_id: occurrenceIdSchema.nullable(),
   logical_path: boundedRelativePathSchema,
   entry_kind: z.enum(["file", "directory", "symlink", "slice"]),
+  artifact_kind: artifactKindSchema,
+  artifact_format: artifactFormatSchema,
   declared_size: z
     .number()
     .int()
@@ -123,18 +135,13 @@ const artifactOccurrenceSchema = z.object({
     .nullable(),
   executable: z.boolean(),
   encrypted: z.boolean(),
-  hash_status: z.enum([
-    "verified",
-    "mismatched",
-    "not-hashed-limit",
-    "unavailable",
-  ]),
+  hash_status: z.enum(["verified", "mismatched", "not-hashed", "unavailable"]),
   source_location: artifactByteRangeSchema.nullable(),
   limitations: z.array(z.string()),
 });
 
 /** Observed bytes that contradict a container's declared integrity identity. */
-const integrityContradictionSchema = z.object({
+export const integrityContradictionSchema = z.object({
   contradiction_id: contradictionIdSchema,
   occurrence_id: occurrenceIdSchema,
   parent_artifact_id: artifactIdSchema,
@@ -148,12 +155,14 @@ const integrityContradictionSchema = z.object({
   limitations: z.array(z.string()).min(1),
 });
 
-/** Parent-child derivation relation between two content-addressed artifacts. */
-const artifactEdgeSchema = z.object({
+/**
+ * Parent-child derivation relation between two content-addressed artifacts.
+ * The child artifact and its logical path are those of the edge's occurrence.
+ */
+export const artifactEdgeSchema = z.object({
   edge_id: edgeIdSchema,
   ordinal: z.number().int().min(0),
   parent_artifact_id: artifactIdSchema,
-  child_artifact_id: artifactIdSchema,
   relation: z.enum([
     "contains",
     "extracts",
@@ -164,13 +173,11 @@ const artifactEdgeSchema = z.object({
     "derived-from",
   ]),
   occurrence_id: occurrenceIdSchema,
-  logical_path: boundedRelativePathSchema.nullable(),
   producer: artifactCommandSchema.nullable(),
 });
 
 /** Stable cryptographic commitment and counts for a complete artifact graph. */
-const artifactGraphManifestSchema = z.object({
-  schema_version: z.literal(1),
+export const artifactGraphManifestSchema = z.object({
   manifest_id: manifestIdSchema,
   root_artifact_id: artifactIdSchema,
   root_sha256: sha256Schema,
@@ -181,30 +188,33 @@ const artifactGraphManifestSchema = z.object({
   edge_count: z.number().int().min(0),
 });
 
-/** Independently bounded offset page used for deterministic graph traversal. */
-const artifactPageSchema = <Item extends z.ZodType>(item: Item) =>
-  z.object({
-    items: z.array(item).max(500),
-    offset: z.number().int().min(0),
-    limit: z.number().int().min(1).max(500),
-    total: z.number().int().min(0),
-    next_offset: z.number().int().min(0).nullable(),
-  });
+/** Whether the inventory producer covered its modeled child-entry scope. */
+export const artifactInventoryCoverageSchema = z.enum(["complete", "partial"]);
+export type ArtifactInventoryCoverage = z.infer<
+  typeof artifactInventoryCoverageSchema
+>;
 
-/** Inventory observation containing stable manifest identity and bounded pages. */
+/** Complete inventory observation containing the stable artifact graph. */
 export const artifactInventoryResultSchema = z.object({
   manifest: artifactGraphManifestSchema,
-  nodes: artifactPageSchema(artifactNodeSchema),
-  occurrences: artifactPageSchema(artifactOccurrenceSchema),
-  edges: artifactPageSchema(artifactEdgeSchema),
-  limits: artifactTraversalLimitsSchema,
-  provenance: z.array(artifactCommandSchema).max(256),
-  integrity_contradictions: z
-    .array(integrityContradictionSchema)
-    .max(100)
-    .default([]),
+  nodes: z.array(artifactNodeSchema),
+  occurrences: z.array(artifactOccurrenceSchema),
+  edges: z.array(artifactEdgeSchema),
+  provenance: z.array(artifactCommandSchema),
+  integrity_contradictions: z.array(integrityContradictionSchema).default([]),
   limitations: z.array(z.string()),
+  /** Optional only for persisted inventory Evidence written before this field. */
+  coverage_status: artifactInventoryCoverageSchema.optional(),
 });
+
+/** Current inventory producers always classify the coverage they examined. */
+export const artifactInventoryOutputSchema =
+  artifactInventoryResultSchema.extend({
+    coverage_status: artifactInventoryCoverageSchema,
+  });
+export type ArtifactInventoryOutput = z.infer<
+  typeof artifactInventoryOutputSchema
+>;
 
 /** One safely materialized artifact beneath caller-approved output root. */
 const extractedArtifactSchema = z.object({
@@ -217,10 +227,9 @@ const extractedArtifactSchema = z.object({
 
 /** Path-independent commitment to one selected extraction operation. */
 const artifactExtractionManifestSchema = z.object({
-  schema_version: z.literal(1),
   extraction_id: extractionIdSchema,
   source_manifest_id: manifestIdSchema,
-  selected_occurrence_ids: z.array(occurrenceIdSchema).min(1).max(500),
+  selected_occurrence_ids: z.array(occurrenceIdSchema),
   files_sha256: sha256Schema,
   output_root_alias: z.literal("$OUTPUT_ROOT"),
 });
@@ -230,15 +239,15 @@ export const artifactExtractionResultSchema = z.object({
   manifest: artifactGraphManifestSchema,
   extraction_manifest: artifactExtractionManifestSchema,
   output_root: z.string().min(1),
-  artifacts: artifactPageSchema(extractedArtifactSchema),
+  artifacts: z.array(extractedArtifactSchema),
   containment_verified: z.boolean(),
   cleanup: z.object({
     attempted: z.boolean(),
     verified: z.boolean(),
-    residual_paths: z.array(boundedRelativePathSchema).max(500),
+    residual_paths: z.array(boundedRelativePathSchema),
   }),
-  limits: artifactTraversalLimitsSchema,
-  provenance: z.array(artifactCommandSchema).max(256),
+  provenance: z.array(artifactCommandSchema),
+  integrity_contradictions: z.array(integrityContradictionSchema),
   limitations: z.array(z.string()),
 });
 

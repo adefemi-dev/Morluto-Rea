@@ -1,27 +1,25 @@
+import { createAndroidAnalysisProvider } from "../composition/android.js";
+import type { AndroidAnalysisPort } from "../application/android/AndroidAnalysisPort.js";
 import type { StdioServerHandle } from "@modelcontextprotocol/server/stdio";
 
-import type { BinarySession } from "../application/BinarySession.js";
-import type { CdpBrowserProvider } from "../browser/CdpBrowserProvider.js";
-import type { CdpElectronProvider } from "../browser/CdpElectronProvider.js";
-import type { PermissionAuthority } from "../application/PermissionAuthority.js";
-import type { Logger } from "../logger.js";
+import type { BinarySession } from "../application/binary/BinarySession.js";
+import type { Logger } from "pino";
 import { createServer } from "../server/createServer.js";
+import type { ToolResultDelivery } from "../server/toolResult.js";
 import type { RuntimeDependencies } from "./types.js";
-import type { RuntimeState } from "./state.js";
+import type { OptionalProviderLoadResult } from "../application/OptionalObservationProviders.js";
+import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
 import {
   MCP_CONNECTION_LOST,
   MCP_CONNECTION_START_FAILED,
 } from "./messages.js";
 
-type McpServerInstance = ReturnType<typeof createServer>;
-
 interface ServerContext {
+  readonly environment: Readonly<NodeJS.ProcessEnv>;
+  readonly delivery: ToolResultDelivery;
   readonly logger: Logger;
   readonly serverLogger: Logger;
-  readonly browserObservation: CdpBrowserProvider;
-  readonly electronObservation: CdpElectronProvider;
-  readonly permissionAuthority: PermissionAuthority;
-  readonly runtimeState: RuntimeState;
+  readonly loadOptionalProviders: () => Promise<OptionalProviderLoadResult>;
 }
 
 export const startMcpTransport = async (
@@ -32,68 +30,81 @@ export const startMcpTransport = async (
   | {
       readonly ok: true;
       readonly handle: StdioServerHandle;
-      readonly liveServers: Set<McpServerInstance>;
+      readonly closeAndroid: () => Promise<void>;
+      readonly closeOptionalProviders: () => Promise<void>;
     }
   | { readonly ok: false }
 > => {
-  const liveServers = new Set<McpServerInstance>();
   const { serverLogger } = serverContext;
+  let optionalProviders: OptionalProviderLoadResult = {};
+  try {
+    optionalProviders = await serverContext.loadOptionalProviders();
+  } catch (cause: unknown) {
+    serverLogger.warn(
+      {
+        error: cause instanceof Error ? cause.message : String(cause),
+      },
+      "Optional MCP providers could not load; affected tools remain unavailable",
+    );
+  }
+  for (const failure of Object.values(
+    optionalProviders.optionalProviderLoadFailures ?? {},
+  )) {
+    serverLogger.warn(
+      { providerId: failure.providerId, error: failure.reason },
+      "Optional MCP adapter could not load; its peers remain available",
+    );
+  }
+  const androidProviders: AndroidAnalysisPort[] = [];
+  const servers = new Set<ReturnType<typeof createServer>>();
+  const closeServers = async (): Promise<void> => {
+    const results = await Promise.allSettled(
+      [...servers].map((server) => server.close()),
+    );
+    const failures = results.flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : [],
+    );
+    if (failures.length > 0)
+      throw new AggregateError(failures, "REA server cleanup failed");
+  };
+  const closeAndroid = async (): Promise<void> => {
+    const results = await Promise.allSettled(
+      androidProviders.map((provider) => provider.close()),
+    );
+    for (const result of results)
+      if (result.status === "rejected") throw result.reason;
+  };
+  // Optional providers are shared by every server instance the SDK creates,
+  // including a discarded discovery probe, so only process shutdown closes them.
+  const closeOptionalProviders = async (): Promise<void> => {
+    await optionalProviders.browserScenarioCapture?.close?.();
+  };
   let handle: StdioServerHandle;
   try {
     handle = dependencies.serve(
       () => {
+        // The SDK can discard a discovery probe and construct a replacement server.
+        const android = createAndroidAnalysisProvider(
+          serverContext.environment,
+        );
+        androidProviders.push(android);
         const server = (dependencies.createServer ?? createServer)(
-          session,
-          session,
+          { kind: "session", session },
           {
             logger: serverContext.logger,
-            processPolicy: serverContext.runtimeState.processPolicy,
-            evidenceFilePolicy: serverContext.runtimeState.evidencePolicy,
-            investigationInputRoots:
-              serverContext.runtimeState.investigationRoots,
-            analysisSnapshotFilePolicy:
-              serverContext.runtimeState.snapshotPolicy,
-            permissionAuthority: serverContext.permissionAuthority,
-            browserObservation: serverContext.browserObservation,
-            electronObservation: serverContext.electronObservation,
-            artifactIntegrityContinueEnabled: () =>
-              serverContext.runtimeState.currentConfig
-                .artifactIntegrityContinueEnabled,
-            javascriptReplayPolicy:
-              serverContext.runtimeState.javascriptReplayPolicy,
-            managedRuntimePolicy:
-              serverContext.runtimeState.managedRuntimePolicy,
-            availabilityPolicy: () => ({
-              processCaptureEnabled:
-                serverContext.runtimeState.currentConfig.processExecutionPolicy
-                  .enabled,
-              evidenceFileRoots:
-                serverContext.runtimeState.currentConfig.evidenceFilePolicy
-                  .roots.length,
-              browserObservationEnabled:
-                serverContext.runtimeState.currentConfig
-                  .browserObservationEnabled &&
-                serverContext.runtimeState.currentConfig.browserCdpEndpoints
-                  .length > 0 &&
-                serverContext.runtimeState.currentConfig.browserAllowedOrigins
-                  .length > 0,
-              electronObservationEnabled:
-                serverContext.runtimeState.currentConfig
-                  .electronObservationEnabled &&
-                serverContext.runtimeState.currentConfig.electronCdpEndpoints
-                  .length > 0 &&
-                serverContext.runtimeState.currentConfig.electronFileRoots
-                  .length > 0,
-              javascriptReplayEnabled:
-                serverContext.runtimeState.currentConfig.javascriptReplayPolicy
-                  .enabled,
-              managedRuntimeEnabled:
-                serverContext.runtimeState.currentConfig.managedRuntimePolicy
-                  .enabled,
-            }),
+            environment: serverContext.environment,
+            delivery: serverContext.delivery,
+            ...optionalProviders,
+            androidAnalysis: android,
           },
         );
-        liveServers.add(server);
+        // The SDK can discard a server even when its provider cleanup failed.
+        servers.add(server);
+        const closeServer = server.close.bind(server);
+        server.close = async () => {
+          await closeServer();
+          servers.delete(server);
+        };
         return server;
       },
       {
@@ -103,11 +114,60 @@ export const startMcpTransport = async (
         },
       },
     );
-  } catch {
-    await session.close();
-    serverLogger.error(MCP_CONNECTION_START_FAILED);
+  } catch (cause: unknown) {
+    const [binaryCleanup, androidCleanup, serverCleanup] =
+      await Promise.allSettled([
+        session.close(),
+        closeAndroid(),
+        closeServers(),
+      ]);
+    serverLogger.error(
+      {
+        error: cause instanceof Error ? cause.message : String(cause),
+      },
+      MCP_CONNECTION_START_FAILED,
+    );
     dependencies.writeStderr(`${MCP_CONNECTION_START_FAILED}\n`);
+    if (binaryCleanup.status === "fulfilled" && !binaryCleanup.value.ok) {
+      const cleanupError = projectAnalysisError(binaryCleanup.value.error);
+      serverLogger.error(
+        { cleanup_error: cleanupError },
+        "Binary provider cleanup failed after MCP startup",
+      );
+      dependencies.writeStderr(`${cleanupError.message}\n`);
+    }
+    for (const cleanup of [binaryCleanup, androidCleanup, serverCleanup]) {
+      if (cleanup.status === "rejected") {
+        const reason =
+          cleanup.reason instanceof Error
+            ? cleanup.reason.message
+            : String(cleanup.reason);
+        serverLogger.error(
+          { cleanup_error: reason },
+          "Provider cleanup rejected after MCP startup",
+        );
+        dependencies.writeStderr(`Provider cleanup failed: ${reason}\n`);
+      }
+    }
     return { ok: false };
   }
-  return { ok: true, handle, liveServers };
+  return {
+    ok: true,
+    handle: {
+      close: async () => {
+        const results = await Promise.allSettled([
+          handle.close(),
+          closeServers(),
+        ]);
+        const failures = results.flatMap((result) =>
+          result.status === "rejected" ? [result.reason] : [],
+        );
+        if (failures.length === 1) throw failures[0];
+        if (failures.length > 1)
+          throw new AggregateError(failures, "REA transport cleanup failed");
+      },
+    },
+    closeAndroid,
+    closeOptionalProviders,
+  };
 };

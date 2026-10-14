@@ -4,15 +4,24 @@ import canonicalize from "canonicalize";
 import { z } from "zod";
 
 import { artifactComparisonResultSchema } from "./artifactComparison.js";
+import { uniqueSorted } from "./canonicalOrdering.js";
+import { compareUnicodeCodePoints } from "./unicodeCodePointOrder.js";
+import { comparisonSourceEvidenceIds } from "./comparisonSourceEvidence.js";
 import { evidenceSchema, parseEvidence, type Evidence } from "./evidence.js";
-import { functionComparisonResultSchema } from "./functionComparison.js";
+import { functionComparisonResultSchema } from "./functionComparisonSchemas.js";
+import {
+  PROCESS_PROVIDER,
+  isProcessEvidenceProvider,
+} from "./process/processEvidenceProvider.js";
 import type { JsonValue } from "./jsonValue.js";
 import {
   comparisonStatusSchema,
   processCaptureComparisonSchema,
-} from "./processCapture.js";
+} from "./process/processComparison.js";
+import { PROCESS_COMPARISON_DIMENSIONS } from "./process/processComparison.js";
+import { prefixedDigestSchema } from "./../domain/digests.js";
 
-const evidenceIdSchema = z.string().regex(/^ev_[a-f0-9]{64}$/u);
+const evidenceIdSchema = prefixedDigestSchema("ev");
 const functionDimensionSchema = z.enum([
   "identity",
   "pseudocode",
@@ -23,15 +32,7 @@ const functionDimensionSchema = z.enum([
   "strings_names",
   "cfg",
 ]);
-const runtimeDimensionSchema = z.enum([
-  "terminal",
-  "interaction",
-  "exit",
-  "filesystem",
-  "protocol",
-  "process",
-  "shim",
-]);
+const runtimeDimensionSchema = z.enum(PROCESS_COMPARISON_DIMENSIONS);
 const expectedPatternSchema = z.enum([
   "cochanged",
   "static_only",
@@ -47,7 +48,7 @@ const observedPatternSchema = z.enum([
 const artifactSelectorSchema = z
   .object({
     kind: z.literal("artifact"),
-    logical_path: z.string().min(1).max(4_096),
+    logical_path: z.string().min(1),
   })
   .strict();
 const functionSelectorSchema = z
@@ -75,27 +76,24 @@ const mappingSchema = z
     side_alignment: z.enum(["left_to_left", "left_to_right"]),
     hypothesis: z
       .object({
-        statement: z.string().trim().min(1).max(500),
+        statement: z.string().trim().min(1),
         expected_pattern: expectedPatternSchema,
       })
       .strict(),
   })
   .strict();
 
-/** Strict bounded input for explicit static/runtime hypothesis correlation. */
+/** Strict input for explicit static/runtime hypothesis correlation. */
 export const staticRuntimeCorrelationInputSchema = z
   .object({
-    static_comparisons: z.array(evidenceSchema).min(1).max(100),
-    runtime_comparisons: z.array(evidenceSchema).min(1).max(100),
-    mappings: z.array(mappingSchema).min(1).max(500),
-    offset: z.number().int().min(0).default(0),
-    limit: z.number().int().min(1).max(100).default(100),
-    unknown_registry_approved: z.literal(true).optional(),
+    static_comparisons: z.array(evidenceSchema).min(1),
+    runtime_comparisons: z.array(evidenceSchema).min(1),
+    mappings: z.array(mappingSchema).min(1),
   })
   .strict();
 
 const correlationItemSchema = z.object({
-  correlation_id: z.string().regex(/^cor_[a-f0-9]{64}$/u),
+  correlation_id: prefixedDigestSchema("cor"),
   static: z.object({
     comparison_evidence_id: evidenceIdSchema,
     selector: staticSelectorSchema,
@@ -113,16 +111,16 @@ const correlationItemSchema = z.object({
   }),
   side_alignment: z.enum(["left_to_left", "left_to_right"]),
   hypothesis: z.object({
-    statement: z.string().min(1).max(500),
+    statement: z.string().min(1),
     expected_pattern: expectedPatternSchema,
   }),
   observed_pattern: observedPatternSchema,
   classification: z.enum(["hypothesis", "contradiction", "unresolved_branch"]),
-  evidence_links: z.array(evidenceIdSchema).min(2).max(20_100),
+  evidence_links: z.array(evidenceIdSchema).min(2),
   limitations: z.array(z.string()),
 });
 
-/** Deterministic, paginated static/runtime correlation payload. */
+/** Deterministic static/runtime correlation payload. */
 export const staticRuntimeCorrelationResultSchema = z.object({
   status: z.enum(["correlated", "contradicted", "unknown", "truncated"]),
   summary: z.object({
@@ -131,13 +129,9 @@ export const staticRuntimeCorrelationResultSchema = z.object({
     unresolved: z.number().int().min(0),
   }),
   correlations: z.object({
-    items: z.array(correlationItemSchema).max(100),
-    offset: z.number().int().min(0),
-    limit: z.number().int().min(1).max(100),
-    total: z.number().int().min(0),
-    next_offset: z.number().int().min(0).nullable(),
+    items: z.array(correlationItemSchema),
   }),
-  evidence_links: z.array(evidenceIdSchema).min(2).max(20_100),
+  evidence_links: z.array(evidenceIdSchema).min(2),
   limitations: z.array(z.string()),
 });
 
@@ -148,23 +142,25 @@ type Mapping = z.infer<typeof mappingSchema>;
 type CorrelationItem = z.infer<typeof correlationItemSchema>;
 type ComparisonStatus = z.infer<typeof comparisonStatusSchema>;
 
-const EXPECTED = {
+type ComparisonIdentity = readonly [string | readonly string[], string, string];
+
+const EXPECTED: Readonly<Record<string, ComparisonIdentity>> = {
   compare_artifacts: [
-    "rea.artifact-comparison/v1",
+    "rea.artifact-comparison",
     "rea-artifact-comparison",
     "REA artifact comparison",
   ],
   compare_functions: [
-    "rea.function-comparison/v1",
+    "rea.function-comparison",
     "rea-function-comparison",
     "REA function comparison",
   ],
   compare_process_captures: [
-    "rea.process-comparison/v3",
-    "rea-process",
-    "REA deterministic process harness",
+    "rea.process-comparison",
+    PROCESS_PROVIDER.id,
+    PROCESS_PROVIDER.name,
   ],
-} as const;
+};
 
 /** Correlate only caller-declared static/runtime hypotheses. */
 export const correlateStaticAndRuntime = (
@@ -180,7 +176,7 @@ export const correlateStaticAndRuntime = (
   const correlations = parsed.mappings
     .map((mapping) => correlate(mapping, staticById, runtimeById))
     .sort((left, right) =>
-      left.correlation_id.localeCompare(right.correlation_id, "en"),
+      compareUnicodeCodePoints(left.correlation_id, right.correlation_id),
     );
   if (
     new Set(correlations.map(({ correlation_id: id }) => id)).size !==
@@ -189,12 +185,9 @@ export const correlateStaticAndRuntime = (
     throw new TypeError(
       "Static/runtime correlation rejects duplicate mappings",
     );
-  const page = correlations.slice(parsed.offset, parsed.offset + parsed.limit);
   const links = uniqueSorted(
     correlations.flatMap(({ evidence_links: evidenceLinks }) => evidenceLinks),
   );
-  if (links.length > 20_100)
-    throw new TypeError("Static/runtime Evidence closure exceeds limit");
   const unresolved = correlations.filter(
     ({ classification }) => classification === "unresolved_branch",
   );
@@ -218,14 +211,7 @@ export const correlateStaticAndRuntime = (
       unresolved: unresolved.length,
     },
     correlations: {
-      items: page,
-      offset: parsed.offset,
-      limit: parsed.limit,
-      total: correlations.length,
-      next_offset:
-        parsed.offset + page.length < correlations.length
-          ? parsed.offset + page.length
-          : null,
+      items: correlations,
     },
     evidence_links: links,
     limitations: [
@@ -307,11 +293,12 @@ const selectStatic = (
     const matches = result.dimensions.filter(
       ({ dimension }) => dimension === selector.dimension,
     );
-    if (matches.length !== 1)
+    const match = matches.at(0);
+    if (matches.length !== 1 || match === undefined)
       throw new TypeError("Function selector must resolve exactly once");
     return {
-      status: matches[0]!.status,
-      conclusion_kind: matches[0]!.conclusion_kind,
+      status: match.status,
+      conclusion_kind: match.conclusion_kind,
     };
   }
   if (evidence.operation !== "compare_artifacts")
@@ -321,22 +308,15 @@ const selectStatic = (
   const result = artifactComparisonResultSchema.parse(
     evidence.normalized_result,
   );
-  if (
-    result.changes.offset !== 0 ||
-    result.changes.next_offset !== null ||
-    result.changes.items.length !== result.changes.total
-  )
-    throw new TypeError(
-      "Static/runtime correlation requires complete artifact comparison pagination",
-    );
-  const matches = result.changes.items.filter(
+  const matches = result.changes.filter(
     ({ logical_path: path }) => path === selector.logical_path,
   );
-  if (matches.length !== 1)
+  const match = matches.at(0);
+  if (matches.length !== 1 || match === undefined)
     throw new TypeError(
       "Artifact selector must resolve exactly one reported delta",
     );
-  const status = matches[0]!.classification;
+  const status = match.classification;
   return {
     status,
     conclusion_kind:
@@ -362,10 +342,9 @@ const parseStatic = (input: unknown): Evidence => {
     const result = artifactComparisonResultSchema.parse(
       evidence.normalized_result,
     );
-    assertCompleteArtifactResult(result);
     assertNestedLinks(
       evidence,
-      result.changes.items.flatMap(({ evidence_links: links }) => links),
+      result.changes.flatMap(({ evidence_links: links }) => links),
     );
   } else {
     const result = functionComparisonResultSchema.parse(
@@ -402,66 +381,32 @@ const parseRuntime = (input: unknown): Evidence => {
 };
 
 const assertComparisonIdentity = (evidence: Evidence): void => {
-  const expected = EXPECTED[evidence.operation as keyof typeof EXPECTED];
+  const expected = EXPECTED[evidence.operation];
   if (
     expected === undefined ||
-    evidence.predicate_type !== expected[0] ||
-    evidence.provider.id !== expected[1] ||
-    evidence.provider.name !== expected[2] ||
-    evidence.provider.version !==
-      (evidence.operation === "compare_process_captures" ? "3" : "1") ||
+    !(Array.isArray(expected[0])
+      ? expected[0].includes(evidence.predicate_type)
+      : evidence.predicate_type === expected[0]) ||
+    (evidence.operation === "compare_process_captures"
+      ? !isProcessEvidenceProvider(evidence.provider)
+      : evidence.provider.id !== expected[1] ||
+        evidence.provider.name !== expected[2] ||
+        evidence.provider.version !== "1") ||
     evidence.confidence !== "derived" ||
     evidence.authority !== "analyst-inference" ||
-    evidence.subject !== null ||
-    evidence.evidence_links.length < 2 ||
-    new Set(evidence.evidence_links).size !== evidence.evidence_links.length
+    evidence.subject !== null
   )
     throw new TypeError(
       "Comparison Evidence operation, predicate, provider, or citations disagree",
     );
-  const parameterLinks = comparisonParameterLinks(evidence);
-  if (!sameSet(parameterLinks, evidence.evidence_links))
-    throw new TypeError(
-      "Comparison Evidence closure disagrees with its source parameters",
-    );
-};
-
-const comparisonParameterLinks = (evidence: Evidence): string[] => {
-  if (evidence.operation === "compare_process_captures") {
-    const parameters = z
-      .object({
-        left_evidence_id: evidenceIdSchema,
-        right_evidence_id: evidenceIdSchema,
-      })
-      .passthrough()
-      .parse(evidence.parameters);
-    return [parameters.left_evidence_id, parameters.right_evidence_id];
-  }
-  const parameters = z
-    .object({
-      left_evidence_ids: z.array(evidenceIdSchema).min(1).max(100),
-      right_evidence_ids: z.array(evidenceIdSchema).min(1).max(100),
-    })
-    .passthrough()
-    .parse(evidence.parameters);
-  return [...parameters.left_evidence_ids, ...parameters.right_evidence_ids];
-};
-
-const sameSet = (left: readonly string[], right: readonly string[]): boolean =>
-  left.length === right.length &&
-  new Set(left).size === left.length &&
-  left.every((item) => right.includes(item));
-
-const assertCompleteArtifactResult = (
-  result: z.infer<typeof artifactComparisonResultSchema>,
-): void => {
+  const expectedLinks = comparisonSourceEvidenceIds(evidence);
+  const actualLinks = uniqueSorted(evidence.evidence_links);
   if (
-    result.changes.offset !== 0 ||
-    result.changes.next_offset !== null ||
-    result.changes.items.length !== result.changes.total
+    expectedLinks.length !== actualLinks.length ||
+    expectedLinks.some((id, index) => id !== actualLinks[index])
   )
     throw new TypeError(
-      "Static/runtime correlation requires complete artifact comparison pagination",
+      "Comparison Evidence closure disagrees with its source parameters",
     );
 };
 
@@ -503,9 +448,6 @@ const assertUnique = (evidence: readonly Evidence[], label: string): void => {
       `Static/runtime correlation rejects duplicate ${label}`,
     );
 };
-
-const uniqueSorted = (values: readonly string[]): string[] =>
-  [...new Set(values)].sort((left, right) => left.localeCompare(right, "en"));
 
 const sha256 = (value: string): string =>
   createHash("sha256").update(value).digest("hex");

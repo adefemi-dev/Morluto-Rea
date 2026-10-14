@@ -1,15 +1,13 @@
-import canonicalize from "canonicalize";
+import { canonicalJson } from "./comparisonSemantics.js";
+import { compareUnicodeCodePoints } from "./unicodeCodePointOrder.js";
 
-import type {
-  FunctionCollection,
-  FunctionSnapshot,
-} from "./functionDossierEvidence.js";
+import type { FunctionSnapshot } from "./functionDossierEvidence.js";
 import type { FunctionComparisonResult } from "./functionComparisonSchemas.js";
 
 export const identityProjection = (snapshot: FunctionSnapshot) => ({
-  name: snapshot.procedure.name,
-  signature: snapshot.procedure.signature,
-  locals: snapshot.procedure.locals
+  name: snapshot.dossier.procedure.name,
+  signature: snapshot.dossier.procedure.signature,
+  locals: snapshot.dossier.procedure.locals
     .map(({ description }) => description)
     .sort(),
 });
@@ -18,52 +16,57 @@ export const functionMatch = (
   left: FunctionSnapshot,
   right: FunctionSnapshot,
 ): FunctionComparisonResult["function_match"] => {
-  if (
-    !isAutoName(left.procedure.name) &&
-    left.procedure.name === right.procedure.name
-  )
+  const leftName = left.dossier.procedure.name;
+  const rightName = right.dossier.procedure.name;
+  const stableNames = !isAutoName(leftName) && !isAutoName(rightName);
+  if (stableNames && leftName === rightName)
     return {
       status: "matched",
       method: "symbol",
-      left_name: left.procedure.name,
-      right_name: right.procedure.name,
+      left_name: leftName,
+      right_name: rightName,
     };
   return {
-    status:
-      left.procedure.name === right.procedure.name ? "ambiguous" : "mismatched",
+    status: stableNames ? "mismatched" : "ambiguous",
     method: "explicit",
-    left_name: left.procedure.name,
-    right_name: right.procedure.name,
+    left_name: leftName,
+    right_name: rightName,
   };
 };
 
 export const normalizeCfg = (
-  blocks: FunctionSnapshot["collections"]["basic_blocks"]["items"],
+  blocks: FunctionSnapshot["dossier"]["basic_blocks"],
 ): readonly unknown[] | null => {
-  const parsed = blocks.map((block) => ({
-    block,
-    start: parseAddress(block.start),
-    end: parseAddress(block.end),
-  }));
-  if (parsed.some(({ start, end }) => start === null || end === null))
-    return null;
+  const parsed: {
+    block: (typeof blocks)[number];
+    start: bigint;
+    end: bigint;
+  }[] = [];
+  for (const block of blocks) {
+    const start = parseAddress(block.start);
+    const end = parseAddress(block.end);
+    if (start === null || end === null || end <= start) return null;
+    parsed.push({ block, start, end });
+  }
   const ordered = parsed.sort((left, right) =>
-    (left.start ?? 0n) < (right.start ?? 0n) ? -1 : 1,
+    left.start < right.start ? -1 : left.start > right.start ? 1 : 0,
   );
-  if (new Set(ordered.map(({ block }) => block.start)).size !== ordered.length)
+  if (new Set(ordered.map(({ start }) => start)).size !== ordered.length)
     return null;
-  if (ordered.some(({ start, end }) => (end ?? 0n) <= (start ?? 0n)))
-    return null;
-  const indices = new Map(
-    ordered.map(({ block }, index) => [block.start, index]),
-  );
+  const indices = new Map(ordered.map(({ start }, index) => [start, index]));
   const graph = [];
   for (const { block, start, end } of ordered) {
-    const successors = block.successors.map((address) => indices.get(address));
-    if (successors.some((index) => index === undefined)) return null;
+    const successors: number[] = [];
+    for (const address of block.successors) {
+      const parsedAddress = parseAddress(address);
+      if (parsedAddress === null) return null;
+      const index = indices.get(parsedAddress);
+      if (index === undefined) return null;
+      successors.push(index);
+    }
     graph.push({
-      size: String((end ?? 0n) - (start ?? 0n)),
-      successors: successors.sort((left, right) => (left ?? 0) - (right ?? 0)),
+      size: String(end - start),
+      successors: successors.sort((left, right) => left - right),
     });
   }
   return graph;
@@ -71,12 +74,12 @@ export const normalizeCfg = (
 
 export const referenceProjection = (snapshot: FunctionSnapshot) =>
   sorted([
-    ...snapshot.collections.incoming_references.items.map((item) => ({
+    ...snapshot.dossier.incoming_references.map((item) => ({
       direction: "in",
       source: item.source_procedure?.name ?? null,
       target: item.target_procedure?.name ?? null,
     })),
-    ...snapshot.collections.outgoing_references.items.map((item) => ({
+    ...snapshot.dossier.outgoing_references.map((item) => ({
       direction: "out",
       source: item.source_procedure?.name ?? null,
       target: item.target_procedure?.name ?? null,
@@ -87,11 +90,11 @@ export const referenceKindProjection = (
   snapshot: FunctionSnapshot,
 ): readonly unknown[] | null => {
   const edges = [
-    ...snapshot.collections.incoming_references.items.map((edge) => ({
+    ...snapshot.dossier.incoming_references.map((edge) => ({
       direction: "in",
       edge,
     })),
-    ...snapshot.collections.outgoing_references.items.map((edge) => ({
+    ...snapshot.dossier.outgoing_references.map((edge) => ({
       direction: "out",
       edge,
     })),
@@ -129,13 +132,11 @@ export const referenceKindProjection = (
 export const commentProjection = (
   snapshot: FunctionSnapshot,
 ): readonly unknown[] | null => {
-  const values = snapshot.collections.comments.items.map(
-    ({ address, kind, text }) => ({
-      offset: relativeAddress(address, snapshot.procedure.address),
-      kind,
-      text,
-    }),
-  );
+  const values = snapshot.dossier.comments.map(({ address, kind, text }) => ({
+    offset: relativeAddress(address, snapshot.dossier.procedure.address),
+    kind,
+    text,
+  }));
   return values.some(({ offset }) => offset === null) ? null : sorted(values);
 };
 
@@ -143,22 +144,22 @@ export const stringAndNameProjection = (
   snapshot: FunctionSnapshot,
 ): readonly unknown[] | null => {
   const values = [
-    ...snapshot.collections.referenced_strings.items.map(
+    ...snapshot.dossier.referenced_strings.map(
       ({ source_address: sourceAddress, value }) => ({
         kind: "string",
         source_offset: relativeAddress(
           sourceAddress,
-          snapshot.procedure.address,
+          snapshot.dossier.procedure.address,
         ),
         value,
       }),
     ),
-    ...snapshot.collections.referenced_names.items.map(
+    ...snapshot.dossier.referenced_names.map(
       ({ source_address: sourceAddress, value }) => ({
         kind: "name",
         source_offset: relativeAddress(
           sourceAddress,
-          snapshot.procedure.address,
+          snapshot.dossier.procedure.address,
         ),
         value,
       }),
@@ -170,30 +171,17 @@ export const stringAndNameProjection = (
 };
 
 export const sorted = (values: readonly unknown[]): readonly unknown[] =>
-  [...values].sort((left, right) =>
-    canonicalJson(left).localeCompare(canonicalJson(right)),
-  );
+  values
+    .map((value) => ({
+      value,
+      json: canonicalJson(value, "Function normalization"),
+    }))
+    .sort((left, right) => compareUnicodeCodePoints(left.json, right.json))
+    .map(({ value }) => value);
 
-export const combineCoverage = <Item>(
-  left: FunctionCollection<Item>,
-  right: FunctionCollection<Item>,
-): FunctionCollection<Item> => ({
-  items: [...left.items, ...right.items],
-  total:
-    left.total === null || right.total === null
-      ? null
-      : left.total + right.total,
-  complete: left.complete && right.complete,
-  truncated: left.truncated || right.truncated,
-});
-
-export const project = <Input, Output>(
-  collection: FunctionCollection<Input>,
-  mapper: (item: Input) => Output,
-): Output[] => collection.items.map(mapper);
-
+/** Recognize address-derived procedure names without excluding named FUN_ symbols. */
 export const isAutoName = (name: string): boolean =>
-  /^(?:sub_[0-9a-f]+|fcn\.)/iu.test(name);
+  /^(?:sub_[0-9a-f]+|fcn\.[0-9a-f]+|FUN_[0-9a-f]+)$/iu.test(name);
 
 const parseAddress = (value: string): bigint | null =>
   /^0x[0-9a-f]+$/iu.test(value) ? BigInt(value) : null;
@@ -204,11 +192,4 @@ const relativeAddress = (value: string, base: string): string | null => {
   return parsed === null || parsedBase === null || parsed < parsedBase
     ? null
     : String(parsed - parsedBase);
-};
-
-const canonicalJson = (value: unknown): string => {
-  const encoded = canonicalize(value);
-  if (encoded === undefined)
-    throw new TypeError("Function normalization could not canonicalize data");
-  return encoded;
 };

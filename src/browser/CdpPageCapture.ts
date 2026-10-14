@@ -1,18 +1,16 @@
-import type {
-  InspectWebPageInput,
-  WebPageInspection,
-} from "../domain/browserObservation.js";
+import type { InspectWebPageInput } from "../domain/browserObservation.js";
+import type { WebPageInspection } from "../domain/browserObservationSchemas.js";
 import type { ProgressReporter } from "../application/ProgressReporter.js";
-import {
-  BrowserObservationError,
-  type BrowserObservationOperation,
-} from "../domain/errors.js";
+import { BrowserObservationError } from "../domain/browserObservationError.js";
+import type { BrowserObservationOperation } from "../domain/browserObservationErrors.js";
 import { stableWebResources } from "../domain/webInventory.js";
 import type { CdpEndpointDiscovery, CdpEndpointTarget } from "./CdpEndpoint.js";
 import { CdpConnection } from "./CdpConnection.js";
 import { CdpCaptureEvents } from "./CdpCaptureEvents.js";
+import { authorizedMainFrame } from "./CdpAuthorizedMainFrame.js";
 import { captureStorage } from "./CdpCaptureStorage.js";
 import { optionalCdpCommand } from "./CdpOptionalCommand.js";
+import { CdpCommandRejection } from "./CdpCommandRejection.js";
 import {
   captureAccessibility,
   captureDom,
@@ -24,7 +22,6 @@ import {
 import {
   allowedSanitizedUrl,
   delayWithCancellation,
-  isHttpUrl,
 } from "./CdpCaptureValues.js";
 import { captureScripts } from "./CdpPageCaptureScripts.js";
 import { captureWorkers } from "./CdpPageCaptureWorkers.js";
@@ -84,9 +81,14 @@ export const capturePage = async (
     allowedOrigins,
     limitations: [
       "Observation starts when REA attaches; prior network and console activity is unavailable.",
-      "Raw network headers, bodies, cookies, storage values, console objects, and WebSocket payloads are never retained; separately approved captures retain only bounded redacted text or value-free shapes.",
+      "Raw network headers, bodies, cookies, storage values, console objects, and WebSocket payloads are never retained; explicitly requested primitive console text is retained verbatim, while payload captures retain value-free shapes.",
       "Source maps are reported only as declarative URLs and are not fetched.",
       "URL-less scripts and console events without an allowed source URL are excluded because their origin cannot be proven.",
+      ...(context.target.attached === null
+        ? [
+            "CDP discovery omitted the target attachment state; attached is reported as unknown.",
+          ]
+        : []),
     ],
     startedAt: new Date().toISOString(),
   };
@@ -104,17 +106,21 @@ const captureAuthorizedPage = async (
   const { connection, sessionId, input, signal } = context;
   await authorizeObservationWindow(state);
   await captureJsonResponseBodies(state);
-  const frameResult = await authorizedFrameTree(context, allowedOrigins);
+  const frameResult = await authorizedMainFrame({
+    connection: context.connection,
+    sessionId: context.sessionId,
+    signal: context.signal,
+    allowedOrigins,
+    operation: context.operation,
+  });
   const attachedUrl = mainFrameUrl(frameResult) ?? "";
   const frameCapture = captureFrames(
     frameResult,
     allowedOrigins,
-    input.limits.max_frames,
+    undefined,
     state.events.completeness,
   );
   const frames = frameCapture.items;
-  if (frameCapture.total > frames.length)
-    state.events.completeness.truncate("frames");
   const captureFrame = frames[0];
   if (captureFrame === undefined)
     throw new BrowserObservationError("inspect_web_page", "target_not_allowed");
@@ -122,19 +128,13 @@ const captureAuthorizedPage = async (
   const resourceCapture = captureResources(
     await connection.send("Page.getResourceTree", {}, sessionId, signal),
     allowedOrigins,
-    input.limits.max_resources,
     state.events.completeness,
   );
-  if (resourceCapture.total > resourceCapture.items.length)
-    state.events.completeness.truncate("resources");
   const resources = stableWebResources(
     resourceCapture.items.map(publicResource),
   );
   const dom = await capturePageDom(state);
-  if (dom.total > dom.nodes.length) state.events.completeness.truncate("dom");
   const accessibility = await accessibilityForFrames(state, frames);
-  if (accessibility.total > accessibility.nodes.length)
-    state.events.completeness.truncate("accessibility");
   const scripts = await captureScripts({
     context,
     events: state.events,
@@ -142,31 +142,35 @@ const captureAuthorizedPage = async (
     resources,
     frameIds: new Set(frames.map((frame) => frame.frame_id)),
   });
-  const workerCapture = await captureWorkers(
+  const workers = await captureWorkers(
     { context, allowedOrigins, limitations, events: state.events },
     new Set(frames.map((frame) => frame.frame_id)),
   );
-  if (workerCapture.total > workerCapture.items.length)
-    state.events.completeness.truncate("workers");
   const storageCapture = await captureStorage(
     context,
-    frames[0]?.origin ?? new URL(attachedUrl).origin,
+    attachedUrl,
     limitations,
   );
-  if (storageCapture.truncated)
-    state.events.completeness.truncate("storage_keys");
   if (!input.include_storage_keys)
     state.events.completeness.exclude("storage_keys", "not_approved", null);
-  const completedFrameResult = await authorizedFrameTree(
-    context,
+  await report(context.progress, 3, "Normalizing browser evidence");
+  const completedFrameResult = await authorizedMainFrame({
+    connection: context.connection,
+    sessionId: context.sessionId,
+    signal: context.signal,
     allowedOrigins,
-  );
+    operation: context.operation,
+  });
   const completedUrl = mainFrameUrl(completedFrameResult) ?? "";
   if (state.events.originViolation)
     throw new BrowserObservationError("inspect_web_page", "target_not_allowed");
   if (state.events.navigationDuringCapture || completedUrl !== attachedUrl)
     throw new BrowserObservationError("inspect_web_page", "target_changed");
-  await report(context.progress, 3, "Normalizing browser evidence");
+  // Body IDs were enumerated before asynchronous CDP reads. Events remain
+  // enabled through the final capture, so account for eligible responses that
+  // arrived while those reads were pending.
+  state.events.settleUnexaminedResponseBodies();
+  state.events.recordScriptMetadataBudgetExclusions();
   return {
     inspection: normalizedInspection(state, {
       attachedUrl,
@@ -175,7 +179,7 @@ const captureAuthorizedPage = async (
       accessibility,
       scripts: scripts.inventory,
       resources,
-      workers: workerCapture.items,
+      workers,
       storage: storageCapture.value,
     }),
     sourceMapRequests: scripts.sourceMapRequests,
@@ -185,21 +189,43 @@ const captureAuthorizedPage = async (
 const captureJsonResponseBodies = async (
   state: CaptureState,
 ): Promise<void> => {
-  const requestIds = state.events.responseBodyRequestIds();
-  for (let index = 0; index < requestIds.length; index += 1) {
-    const requestId = requestIds[index];
-    if (requestId === undefined) continue;
-    const result = await optionalCdpCommand(
-      state.context,
-      "Network.getResponseBody",
-      { requestId },
-      state.limitations,
-    );
-    if (result !== undefined) {
-      state.events.ingestResponseBody(requestId, result);
+  const requests = state.events.responseBodyRequests();
+  for (let index = 0; index < requests.length; index += 1) {
+    const candidate = requests[index];
+    if (candidate === undefined) continue;
+    const current = state.events.currentResponseBodyRequest(candidate);
+    if (current === undefined) continue;
+    if (current.encoded_data_length === null) {
+      state.events.responseBodyUnavailable(candidate);
       continue;
     }
-    for (const remaining of requestIds.slice(index))
+    let result: unknown;
+    try {
+      result = await optionalCdpCommand(
+        state.context,
+        "Network.getResponseBody",
+        { requestId: candidate.requestId },
+        state.limitations,
+      );
+    } catch (cause: unknown) {
+      if (
+        !(cause instanceof CdpCommandRejection) ||
+        cause.command !== "Network.getResponseBody" ||
+        cause.code !== -32_000 ||
+        cause.reportedMessage === null
+      )
+        throw cause;
+      state.events.responseBodyUnavailable(candidate);
+      state.limitations.push(
+        `Response body unavailable for request ${candidate.requestId}: ${cause.userMessage}`,
+      );
+      continue;
+    }
+    if (result !== undefined) {
+      state.events.ingestResponseBody(candidate, result);
+      continue;
+    }
+    for (const remaining of requests.slice(index))
       state.events.responseBodyUnavailable(remaining);
     return;
   }
@@ -212,9 +238,14 @@ const authorizeObservationWindow = async (
   const { connection, sessionId, signal } = context;
   await report(context.progress, 1, "Enabling passive CDP domains");
   await connection.send("Page.enable", {}, sessionId, signal);
-  const initialFrameResult = await authorizedFrameTree(context, allowedOrigins);
-  const mainFrame = captureFrames(initialFrameResult, allowedOrigins, 1)
-    .items[0];
+  const initialFrameResult = await authorizedMainFrame({
+    connection: context.connection,
+    sessionId: context.sessionId,
+    signal: context.signal,
+    allowedOrigins,
+    operation: context.operation,
+  });
+  const mainFrame = captureFrames(initialFrameResult, allowedOrigins).items[0];
   if (mainFrame === undefined)
     throw new BrowserObservationError("inspect_web_page", "target_not_allowed");
   events.beginAuthorizedFrame(mainFrame.frame_id);
@@ -255,7 +286,6 @@ const normalizedInspection = (
   state: CaptureState,
   captured: CapturedSections,
 ): WebPageInspection => ({
-  schema_version: 2,
   browser: state.context.discovery.version,
   target: normalizedTarget(
     state.context.target,
@@ -279,7 +309,7 @@ const normalizedInspection = (
   resources: [...captured.resources],
   network: {
     requests: [...state.events.network.values()],
-    websocket_events: [...state.events.websockets],
+    websocket_connections: [...state.events.webSocketConnectionsById.values()],
     coverage_started_at: state.startedAt,
     prior_activity_available: false,
   },
@@ -303,51 +333,14 @@ const normalizedInspection = (
   limitations: state.limitations,
 });
 
-const authorizedFrameTree = async (
-  context: CaptureContext,
-  allowedOrigins: ReadonlySet<string>,
-): Promise<unknown> => {
-  for (let attempt = 0; attempt < 80; attempt += 1) {
-    const result = await context.connection.send(
-      "Page.getFrameTree",
-      {},
-      context.sessionId,
-      context.signal,
-    );
-    const currentUrl = mainFrameUrl(result);
-    if (allowedSanitizedUrl(currentUrl, allowedOrigins) !== undefined)
-      return result;
-    if (isHttpUrl(currentUrl))
-      throw new BrowserObservationError(
-        "inspect_web_page",
-        "target_not_allowed",
-      );
-    await delayWithCancellation(25, context.operation, context.signal);
-  }
-  throw new BrowserObservationError("inspect_web_page", "target_not_allowed");
-};
-
 const enableObservationDomains = async (
   connection: CdpConnection,
   sessionId: string | undefined,
   signal?: AbortSignal,
 ): Promise<void> => {
   await connection.send("Runtime.enable", {}, sessionId, signal);
-  await connection.send(
-    "Debugger.enable",
-    { maxScriptsCacheSize: 4 * 1_024 * 1_024 },
-    sessionId,
-    signal,
-  );
-  await connection.send(
-    "Network.enable",
-    {
-      maxTotalBufferSize: 4 * 1_024 * 1_024,
-      maxResourceBufferSize: 1_024 * 1_024,
-    },
-    sessionId,
-    signal,
-  );
+  await connection.send("Debugger.enable", {}, sessionId, signal);
+  await connection.send("Network.enable", {}, sessionId, signal);
 };
 
 const accessibilityForFrames = async (
@@ -361,31 +354,24 @@ const accessibilityForFrames = async (
     const result = await optionalCdpCommand(
       context,
       "Accessibility.getFullAXTree",
-      { depth: 32, frameId: frame.frame_id },
+      { frameId: frame.frame_id },
       limitations,
     );
     if (result === undefined) unavailable = true;
     else results.push(result);
   }
   if (unavailable) events.completeness.unavailable("accessibility");
-  const capture = captureAccessibility(
-    results,
-    context.input.limits.max_ax_nodes,
-    {
-      includeText: context.input.include_accessibility_text,
-      maximumFieldBytes: context.input.limits.max_ax_text_field_bytes,
-      maximumTotalBytes: context.input.limits.max_total_ax_text_bytes,
-      ...(results.length === 0 && unavailable ? { unavailable: true } : {}),
-    },
-  );
+  const capture = captureAccessibility(results, {
+    includeText: context.input.include_accessibility_text,
+    ...(results.length === 0 && unavailable ? { unavailable: true } : {}),
+  });
   if (!context.input.include_accessibility_text)
     events.completeness.exclude(
       "accessibility",
       "not_approved",
       capture.textCapture.excluded_fields,
     );
-  if (capture.textCapture.status === "truncated")
-    events.completeness.truncate("accessibility");
+  if (capture.treeIncomplete) events.completeness.truncate("accessibility");
   return capture;
 };
 
@@ -413,7 +399,7 @@ const normalizedTarget = (
   return {
     target_id: target.id,
     type: target.type,
-    title: target.title.slice(0, 16_384),
+    title: target.title,
     url: url?.url ?? "[unsupported-url]",
     origin: url?.origin ?? "",
     attached: target.attached,

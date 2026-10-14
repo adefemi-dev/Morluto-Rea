@@ -1,6 +1,11 @@
 import { createHash } from "node:crypto";
 
-import type { ManagedMetadataLayout } from "./ManagedMetadataLayout.js";
+import { managedDecodeBudget } from "./ManagedDecodeBudget.js";
+
+import {
+  metadataRowOffset,
+  type ManagedMetadataLayout,
+} from "./ManagedMetadataLayout.js";
 import { managedFailure } from "./ManagedReaderFailure.js";
 
 const requireRange = (
@@ -98,12 +103,12 @@ const compressedLength = (
   );
 };
 
-/** Read one bounded UTF-8 value from #Strings. */
+/** Read one UTF-8 value from #Strings within its PE/CLI stream extent. */
 export const readMetadataString = (
   bytes: Buffer,
   layout: ManagedMetadataLayout,
   index: number,
-  maxBytes: number,
+  heapExtent: number,
 ): string => {
   if (index === 0) return "";
   if (index < 0 || index >= layout.strings.size)
@@ -114,24 +119,34 @@ export const readMetadataString = (
       layout.strings.offset + Math.max(index, 0),
     );
   const start = layout.strings.offset + index;
+  const cached = managedDecodeBudget(layout).cachedString(index);
+  if (cached !== undefined && cached.encodedBytes <= heapExtent) {
+    managedDecodeBudget(layout).reserveString(cached.encodedBytes, start);
+    return cached.value;
+  }
   const maximum = Math.min(
     layout.strings.offset + layout.strings.size,
-    start + maxBytes + 1,
+    start + heapExtent + 1,
   );
   let end = start;
   while (end < maximum && bytes[end] !== 0) end += 1;
   if (end === maximum)
     throw managedFailure(
-      "limit-exceeded",
+      "invalid-string",
       "metadata.#Strings",
-      `String heap item exceeds max_heap_item_bytes ${String(maxBytes)}`,
+      "String heap item has no terminator within #Strings",
       start,
     );
+  managedDecodeBudget(layout).reserveString(end - start, start);
   try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(
-      bytes.subarray(start, end),
-    );
-  } catch {
+    const value = new TextDecoder("utf-8", {
+      fatal: true,
+      ignoreBOM: true,
+    }).decode(bytes.subarray(start, end));
+    managedDecodeBudget(layout).cacheString(index, value, end - start);
+    return value;
+  } catch (cause: unknown) {
+    void cause;
     throw managedFailure(
       "invalid-string",
       "metadata.#Strings",
@@ -141,12 +156,12 @@ export const readMetadataString = (
   }
 };
 
-/** Read one bounded item from #Blob without interpreting its contents. */
+/** Read one #Blob item while validating its encoded extent against the heap. */
 export const readMetadataBlob = (
   bytes: Buffer,
   layout: ManagedMetadataLayout,
   index: number,
-  maxBytes: number,
+  heapExtent: number,
 ): Buffer => {
   if (index === 0) return Buffer.alloc(0);
   if (index < 0 || index >= layout.blob.size)
@@ -158,11 +173,11 @@ export const readMetadataBlob = (
     );
   const start = layout.blob.offset + index;
   const decoded = compressedLength(bytes, start, "metadata.#Blob");
-  if (decoded.length > maxBytes)
+  if (decoded.length > heapExtent)
     throw managedFailure(
-      "limit-exceeded",
+      "invalid-blob",
       "metadata.#Blob",
-      `Blob heap item exceeds max_heap_item_bytes ${String(maxBytes)}`,
+      "Blob length exceeds the admitted heap extent",
       start,
     );
   const content = start + decoded.prefix;
@@ -214,8 +229,64 @@ export const metadataToken = (table: number, row: number): string =>
 export const sha256Bytes = (bytes: Buffer): string =>
   createHash("sha256").update(bytes).digest("hex");
 
-/** Derive the conventional strong-name token from a full public key. */
-export const strongNameToken = (publicKey: Buffer): string =>
-  Buffer.from(createHash("sha1").update(publicKey).digest().subarray(-8))
-    .reverse()
-    .toString("hex");
+/** Create a cursor bounded to one admitted metadata table row. */
+export const metadataRowCursor = (
+  bytes: Buffer,
+  layout: ManagedMetadataLayout,
+  table: number,
+  row: number,
+): MetadataRowCursor => {
+  const descriptor = layout.table(table);
+  const start = metadataRowOffset(layout, table, row);
+  if (descriptor === undefined)
+    throw managedFailure(
+      "invalid-row",
+      `metadata.${String(table)}`,
+      "Metadata table is absent",
+      start,
+    );
+  // Temporary cursors may revisit a row while resolving owners or references.
+  // Bind fixed retained bookkeeping to that row's identity, not each lookup.
+  managedDecodeBudget(layout).reserveRow(table, row, start);
+  return new MetadataRowCursor(
+    bytes,
+    start,
+    start + descriptor.rowSize,
+    `metadata.${descriptor.name}`,
+  );
+};
+
+/** Decode a metadata coded index without signed 32-bit coercion. */
+export const metadataCodedToken = (
+  raw: number,
+  bits: number,
+  tables: readonly (number | undefined)[],
+  rowCounts: readonly number[],
+): string | null => {
+  if (raw === 0) return null;
+  const tag = raw & (2 ** bits - 1);
+  const row = Math.floor(raw / 2 ** bits);
+  const table = tables[tag];
+  return table === undefined || row === 0 || row > (rowCounts[table] ?? 0)
+    ? null
+    : metadataToken(table, row);
+};
+
+/** Explain why a non-null coded index cannot name an admitted metadata row. */
+export const metadataCodedTokenInvalidReason = (
+  raw: number,
+  bits: number,
+  tables: readonly (number | undefined)[],
+  rowCounts: readonly number[],
+): string | null => {
+  if (raw === 0) return null;
+  const tag = raw & (2 ** bits - 1);
+  const row = Math.floor(raw / 2 ** bits);
+  const table = tables[tag];
+  if (table === undefined) return `coded index tag ${tag} is not defined`;
+  if (row === 0) return `coded index selects row zero in table ${table}`;
+  const count = rowCounts[table] ?? 0;
+  return row > count
+    ? `coded index selects row ${row} in table ${table}, which has ${count} rows`
+    : null;
+};

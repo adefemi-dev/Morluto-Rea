@@ -1,13 +1,10 @@
-import { createHash } from "node:crypto";
-
-import canonicalize from "canonicalize";
-
+import { digestCanonicalValue } from "../domain/canonicalDigest.js";
 import type { ProgressReporter } from "../application/ProgressReporter.js";
 import type {
   ElectronPageInspection,
   InspectElectronPageInput,
-} from "../domain/electronObservation.js";
-import { BrowserObservationError } from "../domain/errors.js";
+} from "../domain/javascript/electronObservation.js";
+import { BrowserObservationError } from "../domain/browserObservationError.js";
 import type { CdpConnection, CdpEvent } from "./CdpConnection.js";
 import type { CdpEndpointDiscovery, CdpEndpointTarget } from "./CdpEndpoint.js";
 import { CdpCaptureCompleteness } from "./CdpCaptureCompleteness.js";
@@ -17,19 +14,17 @@ import {
   recordValue,
   recordsValue,
   requiredRecord,
-  stringValue,
-  type UnknownRecord,
+  cdpStringValue,
 } from "./CdpCaptureValues.js";
+import { walkFrameTrees } from "./CdpCaptureDocuments.js";
 import {
   ingestElectronScriptEvent,
   type ElectronScriptDraft,
 } from "./CdpElectronScriptEvents.js";
 import { captureElectronScripts } from "./CdpElectronScripts.js";
 import { captureElectronWorkers } from "./CdpElectronWorkers.js";
-import {
-  authorizedElectronFile,
-  canonicalElectronRoots,
-} from "./ElectronFileScope.js";
+import { authorizedElectronFile } from "./ElectronFileScope.js";
+import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 
 interface ElectronContext {
   readonly connection: CdpConnection;
@@ -42,7 +37,6 @@ interface ElectronContext {
 }
 
 interface ElectronInspectionState {
-  readonly roots: readonly string[];
   readonly completeness: CdpCaptureCompleteness;
   readonly scripts: ElectronScriptDraft[];
   readonly executionContextFrames: Map<string, string>;
@@ -51,19 +45,23 @@ interface ElectronInspectionState {
   navigationDuringCapture: boolean;
 }
 
-/** Passively inspect one root-confined Electron file page. */
+/** Passively inspect one Electron file page from the selected CDP endpoint. */
 export const inspectCdpElectronPage = async (
   context: ElectronContext,
 ): Promise<ElectronPageInspection> => {
   const state: ElectronInspectionState = {
-    roots: await canonicalElectronRoots(context.input.allowed_file_roots),
     completeness: new CdpCaptureCompleteness(),
     scripts: [],
     executionContextFrames: new Map(),
     limitations: [
-      "Only canonical file paths contained by an approved root are retained.",
+      "Local file paths exposed by the selected CDP target are retained in the observation.",
       "REA does not evaluate renderer JavaScript, invoke Electron APIs, navigate, click, or close the page.",
-      "Script contents require separate source-capture approval and remain byte bounded.",
+      "Select include_script_sources to retain script contents.",
+      ...(context.target.attached === null
+        ? [
+            "CDP discovery omitted the target attachment state; attached is reported as unknown.",
+          ]
+        : []),
     ],
     mainFrameId: undefined,
     navigationDuringCapture: false,
@@ -99,7 +97,9 @@ const runElectronInspection = async (
   startedAt: string,
 ): Promise<ElectronPageInspection> => {
   const frames = await authorizeInitialFrames(context, state);
-  const main = frames[0]!;
+  const main = frames.at(0);
+  if (main === undefined)
+    throw new BrowserObservationError("inspect_web_page", "target_not_allowed");
   state.mainFrameId = main.frame_id;
   await enableElectronCapture(context);
   await delayWithCancellation(
@@ -111,12 +111,11 @@ const runElectronInspection = async (
   await assertStableMainFrame(context, state, main.file_path);
   await report(context.progress, 3, "Electron inspection complete");
   return {
-    schema_version: 1,
     browser: context.discovery.version,
     target: {
       target_id: context.target.id,
       type: context.target.type,
-      title: context.target.title.slice(0, 16_384),
+      title: context.target.title,
       file_path: main.file_path,
       attached: context.target.attached,
     },
@@ -149,12 +148,7 @@ const authorizeInitialFrames = async (
     context.sessionId,
     context.signal,
   );
-  const frames = await captureFrames(
-    result,
-    state.roots,
-    context.input.limits.max_frames,
-    state.completeness,
-  );
+  const frames = await captureFrames(result, state.completeness);
   if (frames[0] === undefined)
     throw new BrowserObservationError("inspect_web_page", "target_not_allowed");
   return frames;
@@ -171,7 +165,7 @@ const enableElectronCapture = async (
   );
   await context.connection.send(
     "Debugger.enable",
-    { maxScriptsCacheSize: 4 * 1_024 * 1_024 },
+    {},
     context.sessionId,
     context.signal,
   );
@@ -186,18 +180,13 @@ const captureElectronContent = async (
 > => {
   await report(context.progress, 2, "Capturing Electron structure");
   const frameIds = new Set(frames.map((frame) => frame.frame_id));
-  const resources = await captureResources(
-    context,
-    state.roots,
-    state.completeness,
-  );
-  const dom = await captureDom(context, state.roots, state.completeness);
+  const resources = await captureResources(context, state.completeness);
+  const dom = await captureDom(context, state.completeness);
   const scripts = await captureElectronScripts({
     connection: context.connection,
     sessionId: context.sessionId,
     ...(context.signal === undefined ? {} : { signal: context.signal }),
     request: context.input,
-    roots: state.roots,
     scripts: state.scripts,
     executionContextFrames: state.executionContextFrames,
     frameIds,
@@ -208,7 +197,6 @@ const captureElectronContent = async (
     ...(context.signal === undefined ? {} : { signal: context.signal }),
     target: context.target,
     request: context.input,
-    roots: state.roots,
     frameIds,
     completeness: state.completeness,
     limitations: state.limitations,
@@ -227,7 +215,7 @@ const assertStableMainFrame = async (
     context.sessionId,
     context.signal,
   );
-  const afterPath = await mainFilePath(result, state.roots);
+  const afterPath = await mainFilePath(result);
   if (afterPath === undefined)
     throw new BrowserObservationError("inspect_web_page", "target_not_allowed");
   if (state.navigationDuringCapture || afterPath !== expectedPath)
@@ -238,57 +226,41 @@ const navigatedFrameId = (event: CdpEvent): string | undefined => {
   const params = recordValue(event.params);
   if (params === undefined) return undefined;
   if (event.method === "Page.frameNavigated")
-    return stringValue(recordValue(params.frame)?.id);
+    return cdpStringValue(recordValue(params.frame)?.id);
   if (event.method === "Page.navigatedWithinDocument")
-    return stringValue(params.frameId);
+    return cdpStringValue(params.frameId);
   return undefined;
 };
 
 const captureFrames = async (
   result: unknown,
-  roots: readonly string[],
-  maximum: number,
   completeness: CdpCaptureCompleteness,
 ): Promise<ElectronPageInspection["frames"]> => {
   const frameTree = recordValue(requiredRecord(result).frameTree);
   if (frameTree === undefined)
     throw new BrowserObservationError("inspect_web_page", "protocol_error");
-  const pending: Array<{
-    readonly tree: UnknownRecord;
-    readonly parent: string | null;
-  }> = [{ tree: frameTree, parent: null }];
   const frames: ElectronPageInspection["frames"] = [];
-  while (pending.length > 0) {
-    const current = pending.shift();
-    if (current === undefined) break;
-    const frame = recordValue(current.tree.frame);
-    const frameId = stringValue(frame?.id);
-    const path = await authorizedElectronFile(
-      stringValue(frame?.url) ?? "",
-      roots,
-    );
+  for (const tree of walkFrameTrees(frameTree, () =>
+    completeness.exclude("frames", "invalid_protocol_value"),
+  )) {
+    const frame = recordValue(tree.frame);
+    const frameId = cdpStringValue(frame?.id);
+    const path = await authorizedElectronFile(cdpStringValue(frame?.url) ?? "");
     if (frameId === undefined || path === undefined) {
       completeness.exclude("frames", "out_of_target_scope");
       continue;
     }
-    if (frames.length >= maximum) {
-      completeness.truncate("frames");
-      continue;
-    }
     frames.push({
-      frame_id: frameId.slice(0, 256),
-      parent_frame_id: current.parent,
+      frame_id: frameId,
+      parent_frame_id: cdpStringValue(frame?.parentId) ?? null,
       file_path: path,
     });
-    for (const child of recordsValue(current.tree.childFrames))
-      pending.push({ tree: child, parent: frameId.slice(0, 256) });
   }
   return frames;
 };
 
 const captureResources = async (
   context: ElectronContext,
-  roots: readonly string[],
   completeness: CdpCaptureCompleteness,
 ): Promise<ElectronPageInspection["resources"]> => {
   const result = await context.connection.send(
@@ -308,8 +280,7 @@ const captureResources = async (
     if (tree === undefined) break;
     for (const resource of recordsValue(tree.resources)) {
       const path = await authorizedElectronFile(
-        stringValue(resource.url) ?? "",
-        roots,
+        cdpStringValue(resource.url) ?? "",
       );
       if (path === undefined) {
         completeness.exclude("resources", "out_of_target_scope");
@@ -317,20 +288,16 @@ const captureResources = async (
       }
       const item = {
         file_path: path,
-        type: (stringValue(resource.type) ?? "Other").slice(0, 100),
-        mime_type: (stringValue(resource.mimeType) ?? "").slice(0, 256),
+        type: cdpStringValue(resource.type) ?? "Other",
+        mime_type: cdpStringValue(resource.mimeType) ?? "",
         content_size:
           numberValue(resource.contentSize) === undefined
             ? null
             : Math.max(0, numberValue(resource.contentSize) ?? 0),
       };
-      const resourceKey = `electron_resource_${digest(item)}`;
+      const resourceKey = `electron_resource_${digestCanonicalValue(item, "CDP capture")}`;
       if (seen.has(resourceKey)) continue;
       seen.add(resourceKey);
-      if (resources.length >= context.input.limits.max_resources) {
-        completeness.truncate("resources");
-        continue;
-      }
       resources.push({
         resource_key: resourceKey,
         ...item,
@@ -339,13 +306,12 @@ const captureResources = async (
     pending.push(...recordsValue(tree.childFrames));
   }
   return resources.sort((left, right) =>
-    left.resource_key.localeCompare(right.resource_key),
+    compareUnicodeCodePoints(left.resource_key, right.resource_key),
   );
 };
 
 const captureDom = async (
   context: ElectronContext,
-  roots: readonly string[],
   completeness: CdpCaptureCompleteness,
 ): Promise<ElectronPageInspection["dom"]> => {
   const result = requiredRecord(
@@ -363,7 +329,7 @@ const captureDom = async (
   let total = 0;
   for (const document of recordsValue(result.documents)) {
     const documentUrl = stringAt(strings, document.documentURL);
-    if ((await authorizedElectronFile(documentUrl, roots)) === undefined) {
+    if ((await authorizedElectronFile(documentUrl)) === undefined) {
       completeness.exclude("dom", "out_of_target_scope");
       continue;
     }
@@ -376,35 +342,29 @@ const captureDom = async (
     const baseIndex = nodes.length;
     total += nodeTypes.length;
     for (let index = 0; index < nodeTypes.length; index += 1) {
-      if (nodes.length >= context.input.limits.max_dom_nodes) continue;
       const attributeIndexes = arrayValue(attributes[index]);
       const parent = integer(parents[index], -1);
       nodes.push({
         index: nodes.length,
         parent_index: parent < 0 ? -1 : baseIndex + parent,
         node_type: integer(nodeTypes[index], 0),
-        node_name: stringAt(strings, nodeNames[index]).slice(0, 1_024),
+        node_name: stringAt(strings, nodeNames[index]),
         node_value_length: Buffer.byteLength(
           stringAt(strings, nodeValues[index]),
         ),
         attribute_names: attributeIndexes
           .filter((_value, attributeIndex) => attributeIndex % 2 === 0)
-          .map((value) => stringAt(strings, value).slice(0, 1_024))
-          .slice(0, 256),
+          .map((value) => stringAt(strings, value)),
       });
     }
   }
-  if (total > nodes.length) completeness.truncate("dom");
   return { total_nodes: total, nodes };
 };
 
-const mainFilePath = async (
-  result: unknown,
-  roots: readonly string[],
-): Promise<string | undefined> => {
+const mainFilePath = async (result: unknown): Promise<string | undefined> => {
   const frameTree = recordValue(requiredRecord(result).frameTree);
   const frame = recordValue(frameTree?.frame);
-  return await authorizedElectronFile(stringValue(frame?.url) ?? "", roots);
+  return await authorizedElectronFile(cdpStringValue(frame?.url) ?? "");
 };
 
 const arrayValue = (value: unknown): readonly unknown[] =>
@@ -416,12 +376,6 @@ const stringAt = (strings: readonly string[], value: unknown): string =>
 const integer = (value: unknown, fallback: number): number => {
   const number = numberValue(value);
   return number === undefined ? fallback : Math.trunc(number);
-};
-
-const digest = (value: unknown): string => {
-  const encoded = canonicalize(value);
-  if (encoded === undefined) throw new TypeError("Expected canonical JSON");
-  return createHash("sha256").update(encoded).digest("hex");
 };
 
 const report = async (

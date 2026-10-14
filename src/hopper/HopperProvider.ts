@@ -1,9 +1,12 @@
+import { snapshotEnvironment } from "../process/snapshotEnvironment.js";
 import { fileURLToPath } from "node:url";
-import { accessSync, constants } from "node:fs";
+import { accessSync, constants, statSync } from "node:fs";
 
 import { createAnalysisExecution } from "../application/AnalysisProvider.js";
 import type {
   AnalysisClient,
+  AnalysisOperation,
+  AnalysisClientContext,
   AnalysisProfileResolutionOptions,
   AnalysisProviderCandidate,
   CapabilityDescriptor,
@@ -12,87 +15,51 @@ import type {
   ProviderTargetSupport,
 } from "../application/AnalysisProvider.js";
 import type { AnalysisProfileCommitment } from "../domain/analysisProfile.js";
-import type { AppConfig } from "../config.js";
-import type { BinaryTarget } from "../domain/binaryTarget.js";
-import type { Logger } from "../logger.js";
-import { AnalysisCapabilityUnavailableError } from "../domain/errors.js";
-import { err } from "../domain/result.js";
+import type { AppConfig } from "../config/types.js";
 import {
-  ENHANCED_TOOL_CONTRACTS,
-  OFFICIAL_TOOL_CONTRACTS,
-} from "../contracts/toolContracts.js";
+  isElfMetadataArchitecture,
+  type BinaryTarget,
+} from "../domain/binaryTargetTypes.js";
+import type { JsonValue } from "../domain/jsonValue.js";
+import type { Logger } from "pino";
+import { AnalysisCapabilityUnavailableError } from "../domain/analysisErrorCore.js";
+import { err, ok } from "../domain/result.js";
 import { HopperApplicationLauncher } from "./BridgeLauncher.js";
 import {
   hopperLoaderArgsForTarget,
   resolveHopperAnalysisProfile,
 } from "./HopperAnalysisProfile.js";
+import { mapHopperFileOffset } from "./HopperFileOffset.js";
+import { HopperRegexSearch } from "./HopperRegexSearch.js";
 import { HopperClient } from "./HopperClient.js";
+import { hopperMachOImageSchema } from "./HopperMachOImage.js";
 
-/** Public identity committed by every Hopper-backed observation. */
-export const HOPPER_PROVIDER_IDENTITY: ProviderIdentity = Object.freeze({
-  id: "hopper",
-  name: "Hopper Disassembler",
-  version: null,
-});
-const IDENTITY = HOPPER_PROVIDER_IDENTITY;
-const MUTATING_OPERATIONS = new Set([
-  "set_address_name",
-  "set_addresses_names",
-  "set_bookmark",
-  "set_comment",
-  "set_inline_comment",
-  "unset_bookmark",
-]);
-
-/** Tool contracts implemented directly by the Hopper adapter. */
-export const HOPPER_PROVIDER_TOOL_CONTRACTS = Object.freeze([
-  ...OFFICIAL_TOOL_CONTRACTS,
-  ...ENHANCED_TOOL_CONTRACTS.filter(
-    (contract) => contract.name === "analyze_function",
-  ),
-]);
-
-const CAPABILITIES: readonly CapabilityDescriptor[] = Object.freeze(
-  HOPPER_PROVIDER_TOOL_CONTRACTS.map((contract) =>
-    Object.freeze({
-      provider: IDENTITY,
-      operation: contract.name,
-      inputContractVersion: 1,
-      outputContractVersion: 1,
-      available: true,
-      reason: null,
-      pagination: "offset" in contract.inputSchema.shape ? "offset" : "none",
-      exhaustive: false,
-      effects: Object.freeze({
-        mutatesArtifact: MUTATING_OPERATIONS.has(contract.name),
-        launchesProcess: true,
-        mayShowUi: true,
-        mayAccessNetwork: false,
-        mayWriteFilesystem: MUTATING_OPERATIONS.has(contract.name),
-        changesPermissions: false,
-        requiresRoot: false,
-      }),
-      limits: Object.freeze({
-        maxResults: null,
-        maxPayloadBytes: null,
-        timeoutMs: null,
-      }),
-      limitations: Object.freeze([
-        "Results depend on Hopper's completed static analysis.",
-      ]),
-    }),
-  ),
-);
+import {
+  CAPABILITIES,
+  HOPPER_PROVIDER_IDENTITY,
+} from "./HopperProviderCapabilities.js";
 
 /** Concrete analysis provider backed by REA's private Hopper bridge. */
 export class HopperProvider implements AnalysisProviderCandidate {
+  private readonly environment: Readonly<NodeJS.ProcessEnv>;
+
+  /**
+   * Host platform, injected so availability and launch-mode decisions can be
+   * exercised for any host rather than only the machine running the suite.
+   * Mirrors `GhidraProvider`, which already threads its installation host's
+   * platform the same way.
+   */
   constructor(
     private readonly config: AppConfig,
     private readonly logger: Logger,
-  ) {}
+    environment: Readonly<NodeJS.ProcessEnv>,
+    private readonly platform: NodeJS.Platform = process.platform,
+  ) {
+    this.environment = snapshotEnvironment(environment, platform);
+  }
 
   identity(): ProviderIdentity {
-    return IDENTITY;
+    return HOPPER_PROVIDER_IDENTITY;
   }
 
   capabilities(): readonly CapabilityDescriptor[] {
@@ -102,24 +69,29 @@ export class HopperProvider implements AnalysisProviderCandidate {
   inspectAvailability(): ProviderAvailability {
     const diagnostics = {
       launcher_path: this.config.hopperLauncherPath,
-      platform: process.platform,
+      platform: this.platform,
     };
-    if (process.platform !== "darwin" && process.platform !== "linux")
+    if (this.platform !== "darwin" && this.platform !== "linux")
       return {
         status: "unavailable",
         code: "unsupported_host",
-        reason: `Hopper integration is not supported on ${process.platform}.`,
+        reason: `Hopper integration is not supported on ${this.platform}.`,
         diagnostics,
       };
     try {
       accessSync(this.config.hopperLauncherPath, constants.X_OK);
+      // A searchable directory, such as an .app bundle, also passes X_OK.
+      if (!statSync(this.config.hopperLauncherPath).isFile())
+        throw new TypeError("Hopper launcher is not a regular file");
       return {
         status: "available",
         code: null,
         reason: null,
         diagnostics,
       };
-    } catch {
+    } catch (cause: unknown) {
+      // best-effort cleanup: optional launcher probing; failure means unavailable.
+      void cause;
       return {
         status: "unavailable",
         code: "executable_missing",
@@ -149,18 +121,29 @@ export class HopperProvider implements AnalysisProviderCandidate {
         reason: null,
         diagnostics,
       };
-    if (!["mach-o", "elf", "pe"].includes(target.format))
-      return {
-        status: "unsupported",
-        code: "target_format_unsupported",
-        reason: `Hopper cannot open ${target.format} through this adapter.`,
-        diagnostics,
-      };
-    if (target.architecture === undefined)
+    if (isElfMetadataArchitecture(target.architecture))
       return {
         status: "unsupported",
         code: "architecture_unsupported",
-        reason: "Hopper requires a supported concrete target architecture.",
+        reason: `REA's Hopper adapter does not admit ${
+          target.architecture === "mips" ? "MIPS" : "RISC-V"
+        } targets.`,
+        diagnostics,
+      };
+    if (target.format === "raw-binary")
+      return {
+        status: "unsupported",
+        code: "target_format_unsupported",
+        reason:
+          "Headerless raw-binary analysis requires the Ghidra adapter with a caller-supplied architecture and entry point.",
+        diagnostics,
+      };
+    if (target.format === "dos-mz" || target.format === "dos-com")
+      return {
+        status: "unsupported",
+        code: "target_format_unsupported",
+        reason:
+          "DOS MZ/COM analysis requires the Ghidra 16-bit real-mode adapter.",
         diagnostics,
       };
     return {
@@ -178,7 +161,7 @@ export class HopperProvider implements AnalysisProviderCandidate {
     return resolveHopperAnalysisProfile(target, {
       launcherPath: this.config.hopperLauncherPath,
       loaderArgsOverride: this.config.hopperLoaderArgs,
-      provider: IDENTITY,
+      provider: HOPPER_PROVIDER_IDENTITY,
       ...(options?.signal === undefined ? {} : { signal: options.signal }),
     });
   }
@@ -186,6 +169,7 @@ export class HopperProvider implements AnalysisProviderCandidate {
   createClient(
     target: BinaryTarget,
     profile?: AnalysisProfileCommitment,
+    context?: AnalysisClientContext,
   ): AnalysisClient {
     if (target.kind !== "executable" && target.kind !== "database")
       return {
@@ -193,26 +177,64 @@ export class HopperProvider implements AnalysisProviderCandidate {
           Promise.resolve(
             err(
               new AnalysisCapabilityUnavailableError(
-                IDENTITY.id,
+                HOPPER_PROVIDER_IDENTITY.id,
                 operation,
                 `Hopper cannot open ${target.kind} targets directly. Inventory or extract the artifact first.`,
               ),
             ),
           ),
-        close: () => Promise.resolve(),
+        close: () => Promise.resolve(ok(null)),
       };
-    const derivedLoaderArgs = hopperLoaderArgsForTarget(target);
+    const preparation = profile?.parameters.prepared_image;
+    const parsedImage =
+      preparation === undefined
+        ? undefined
+        : hopperMachOImageSchema.safeParse(preparation);
+    if (parsedImage?.success === false)
+      return {
+        execute: (operation) =>
+          Promise.resolve(
+            err(
+              new AnalysisCapabilityUnavailableError(
+                HOPPER_PROVIDER_IDENTITY.id,
+                operation,
+                "Hopper prepared-image profile is malformed; resolve the analysis profile again.",
+              ),
+            ),
+          ),
+        close: () => Promise.resolve(ok(null)),
+      };
+    const preparedImage = parsedImage?.data;
+    const container =
+      preparedImage === undefined
+        ? profile?.parameters.macho_container
+        : "thin";
+    const derivedLoaderArgs = hopperLoaderArgsForTarget(
+      target,
+      container === "thin" || container === "fat32" || container === "fat64"
+        ? container
+        : undefined,
+    );
     if (!derivedLoaderArgs.ok)
       return {
         execute: () => Promise.resolve(err(derivedLoaderArgs.error)),
-        close: () => Promise.resolve(),
+        close: () => Promise.resolve(ok(null)),
       };
-    const executionProvider = profile?.provider ?? IDENTITY;
+    const executionProvider = profile?.provider ?? HOPPER_PROVIDER_IDENTITY;
     const client = new HopperClient({
       launcher: new HopperApplicationLauncher({
+        environment: this.environment,
         launcherPath: this.config.hopperLauncherPath,
         targetPath: target.path,
         targetKind: target.kind,
+        ...(preparedImage === undefined
+          ? {}
+          : {
+              preparedImage: {
+                image: preparedImage,
+                sourceSha256: target.sha256,
+              },
+            }),
         loaderArgs:
           this.config.hopperLoaderArgs.length > 0
             ? this.config.hopperLoaderArgs
@@ -220,7 +242,7 @@ export class HopperProvider implements AnalysisProviderCandidate {
         bridgeScriptPath: fileURLToPath(
           new URL("../../bridge/hopper_bridge.py", import.meta.url),
         ),
-        ...(process.platform === "linux"
+        ...(this.platform === "linux"
           ? {
               launchMode: "verified_linux_demo" as const,
               demoHelperPath: fileURLToPath(
@@ -229,24 +251,110 @@ export class HopperProvider implements AnalysisProviderCandidate {
             }
           : { launchMode: "native" as const }),
       }),
+      ...(context === undefined ? {} : { runId: context.runId }),
+      startupTimeoutMs: this.config.hopperStartupTimeoutMs,
       logger: this.logger.child({ layer: "bridge" }),
+      onDiagnostic: (diagnostic) =>
+        this.logger.info(diagnostic, "Hopper bridge reported a diagnostic"),
     });
+    const regexSearch = new HopperRegexSearch(client);
+    const projectExecution = (
+      operation: AnalysisOperation,
+      normalized: JsonValue,
+      rawResult: JsonValue | null = null,
+    ) =>
+      createAnalysisExecution(normalized, executionProvider, {
+        // Only the file-offset mapping differs from Hopper's reply.
+        rawResult,
+        ...(profile === undefined ? {} : { analysisProfile: profile }),
+        ...(operation === "procedure_callers" ||
+        operation === "procedure_callees"
+          ? { relationshipCoverage: { status: "complete" as const } }
+          : {}),
+        limitations: [
+          ...(preparedImage === undefined
+            ? []
+            : [
+                "REA loaded a verified thin Mach-O slice from the original FAT64 source. Identity and file offsets refer to the original file. The owned temporary image and its Hopper document close together, including on MCP shutdown.",
+              ]),
+          ...(CAPABILITIES.find(
+            (descriptor) => descriptor.operation === operation,
+          )?.limitations ?? []),
+          ...(operation === "read_bytes"
+            ? [
+                "Hopper byte reads stop at the containing segment's exclusive end; a readable prefix is returned with complete=false when the requested range crosses it.",
+              ]
+            : []),
+          ...(operation === "procedure_references"
+            ? [
+                "Native CallReference classifications and unresolved targets are preserved. Detailed reference flags and coverage beyond reported CallReference objects remain unknown.",
+              ]
+            : []),
+        ],
+      });
     return {
       execute: async (operation, parameters, options) => {
-        const result = await client.callTool(operation, parameters, options);
-        return result.ok
-          ? {
-              ok: true,
-              value: createAnalysisExecution(result.value, executionProvider, {
-                ...(profile === undefined ? {} : { analysisProfile: profile }),
-                limitations: [
-                  "Results depend on Hopper's completed static analysis.",
-                ],
-              }),
-            }
-          : result;
+        const result =
+          (operation === "search_strings" ||
+            operation === "search_procedures") &&
+          parameters.mode === "regex"
+            ? await regexSearch.execute(operation, parameters, options)
+            : await client.callTool(operation, parameters, options);
+        if (!result.ok) return result;
+        const mapped =
+          operation === "address_to_file_offset"
+            ? await mapHopperFileOffset(target, result.value, options?.signal)
+            : result;
+        return mapped.ok
+          ? ok(
+              projectExecution(
+                operation,
+                mapped.value,
+                mapped === result ? null : result.value,
+              ),
+            )
+          : mapped;
       },
-      close: () => client.close(),
+      executeIfReady: async (operation, parameters, options) => {
+        if (operation !== "list_documents" && operation !== "list_procedures")
+          return undefined;
+        const result = await client.callToolIfReady(
+          operation,
+          parameters,
+          options?.signal === undefined ? {} : { signal: options.signal },
+        );
+        if (result === undefined || !result.ok) return result;
+        return ok(projectExecution(operation, result.value));
+      },
+      runtimeLineageSnapshots: () => {
+        const observation = client.runtimeLineage();
+        return observation === null
+          ? []
+          : [{ provider: executionProvider, observation }];
+      },
+      requestActivitySnapshots: () => {
+        const activity = client.requestActivity();
+        return [
+          {
+            provider: executionProvider,
+            active:
+              activity === null
+                ? null
+                : {
+                    requestId: activity.requestId,
+                    operation: activity.operation,
+                    elapsedMs: activity.elapsedMs,
+                    callerState: activity.callerState,
+                  },
+            queuedRequests: activity?.queuedRequests ?? 0,
+          },
+        ];
+      },
+      operationHealthSnapshot: () => client.operationHealth(),
+      close: async (options) => {
+        await regexSearch.close();
+        return client.close(options);
+      },
     };
   }
 }

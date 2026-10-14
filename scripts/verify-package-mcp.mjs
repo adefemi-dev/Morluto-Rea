@@ -1,51 +1,44 @@
-import { readFile } from "node:fs/promises";
+import {
+  requireMcpLifecycleResult,
+  requireMcpToolError,
+} from "./lib/mcp-verifier-results.mjs";
+import assert from "node:assert/strict";
 import { join } from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { readFile, rm } from "node:fs/promises";
 
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
-import { TOOL_CONTRACTS } from "../dist/contracts/toolContracts.js";
+import { MCP_STARTUP_POLICY } from "../dist/mcpStartupPolicy.js";
+import { parseEvidence } from "../dist/domain/evidence.js";
 import * as prompts from "./verify-package-prompts.mjs";
-import { json } from "./lib/verify-package-core.mjs";
+import { json, verifyCompleteToolCatalog } from "./lib/verify-package-core.mjs";
+
+const execute = promisify(execFile);
 
 const verifyMcpToolsAndPrompts = async (client, mcpOptions) => {
-  if (
-    (await client.listTools(undefined, mcpOptions)).tools.length !==
-    TOOL_CONTRACTS.length
-  )
-    throw new Error("packaged MCP tool inventory diverged from contracts");
+  await verifyCompleteToolCatalog(client, mcpOptions);
   await prompts.verifyPromptCatalog(client, mcpOptions, prompts.names);
-  await prompts.verifyPromptCompletion(client, mcpOptions, false);
-};
-
-const verifyMcpReplay = async (client, mcpOptions, investigationReplay) => {
-  const replay = await client.callTool(
-    {
-      name: "find_changed_behavior",
-      arguments: { investigation_run: investigationReplay.arguments },
-    },
-    mcpOptions,
-  );
-  const replayEvidence = json(prompts.mcpText(replay));
-  const replayWorkspace = json(
-    await readFile(investigationReplay.workspacePath, "utf8"),
-  );
-  if (
-    replay.isError === true ||
-    replayEvidence.evidence_id !== investigationReplay.evidenceId ||
-    replayWorkspace.revision !== investigationReplay.revision
-  )
-    throw new Error(
-      "packaged MCP did not replay with workspace-only authority",
-    );
+  await prompts.verifyPromptCompletion(client, mcpOptions, []);
 };
 
 const verifyMcpTargetFree = async (client, mcpOptions) => {
   const result = await client.callTool(
-    { name: "current_document", arguments: {} },
+    { name: "binary_session", arguments: {} },
     mcpOptions,
   );
-  if (result.isError !== true)
-    throw new Error("packaged target-free MCP omitted no-target error");
+  const status = requireMcpLifecycleResult(result, "binary_session");
+  const currentDocument = status.tool_availability.find(
+    ({ name }) => name === "current_document",
+  );
+  if (
+    currentDocument?.available !== false ||
+    currentDocument.reason !== "target_required"
+  )
+    throw new Error(
+      "packaged target-free MCP omitted target-bound availability metadata",
+    );
 };
 
 const verifyMcpUnknownProvider = async (client, mcpOptions) => {
@@ -61,7 +54,7 @@ const verifyMcpUnknownProvider = async (client, mcpOptions) => {
   );
   if (
     unknownProvider.isError !== true ||
-    unknownProvider.structuredContent?.error?.details?.selection_reason !==
+    requireMcpToolError(unknownProvider)?.details?.selection_reason !==
       "unknown_provider"
   )
     throw new Error("packaged MCP accepted an unknown analysis provider");
@@ -77,15 +70,13 @@ const verifyMcpOpenAndBind = async (client, mcpOptions) => {
   );
   if (opened.isError === true)
     throw new Error("packaged MCP could not open a binary");
-  const providerStatusEnvelope = json(
-    prompts.mcpText(
-      await client.callTool(
-        { name: "binary_session", arguments: {} },
-        mcpOptions,
-      ),
+  const providerStatus = requireMcpLifecycleResult(
+    await client.callTool(
+      { name: "binary_session", arguments: {} },
+      mcpOptions,
     ),
+    "binary_session",
   );
-  const providerStatus = providerStatusEnvelope.result;
   if (
     providerStatus.analysis_provider_binding?.provider?.id !== "hopper" ||
     providerStatus.analysis_provider_binding?.selection_source !== "request"
@@ -93,14 +84,13 @@ const verifyMcpOpenAndBind = async (client, mcpOptions) => {
     throw new Error("packaged MCP omitted its explicit Hopper binding");
 };
 
-const verifyMcpLinuxCurrentDocument = async (client, mcpOptions, current) => {
-  if (
-    current.isError !== true ||
-    !prompts
-      .mcpText(current)
-      .includes("not supported for unattended Linux analysis")
-  )
-    throw new Error("packaged Linux MCP did not reject an unpinned Hopper");
+const verifyMcpLinuxToolAvailability = async (client, mcpOptions) => {
+  const current = await client.callTool(
+    { name: "current_document", arguments: {} },
+    mcpOptions,
+  );
+  if (current.isError !== true)
+    throw new Error("packaged Linux MCP executed an unavailable Hopper tool");
 };
 
 const verifyMcpNonLinuxCurrentDocument = async (
@@ -108,7 +98,7 @@ const verifyMcpNonLinuxCurrentDocument = async (
   mcpOptions,
   current,
 ) => {
-  if (json(prompts.mcpText(current)).result !== "fixture")
+  if (json(prompts.mcpText(current)).normalized_result !== "fixture")
     throw new Error("packaged MCP bridge call failed");
   const batch = await client.callTool(
     {
@@ -117,7 +107,7 @@ const verifyMcpNonLinuxCurrentDocument = async (
     },
     mcpOptions,
   );
-  const batchResult = json(prompts.mcpText(batch)).result;
+  const batchResult = json(prompts.mcpText(batch)).normalized_result;
   if (
     batch.isError === true ||
     batchResult?.total !== 1 ||
@@ -131,19 +121,17 @@ const verifyMcpNonLinuxCurrentDocument = async (
 
 const verifyMcpBinaryLifecycle = async (client, mcpOptions) => {
   await verifyMcpOpenAndBind(client, mcpOptions);
-  await prompts.verifyPromptCompletion(
-    client,
-    mcpOptions,
-    process.platform !== "linux",
-  );
-  const current = await client.callTool(
-    { name: "current_document", arguments: {} },
-    mcpOptions,
-  );
+  // Completion never starts a provider; only an ordinary operation readies it.
+  await prompts.verifyPromptCompletion(client, mcpOptions, []);
   if (process.platform === "linux") {
-    await verifyMcpLinuxCurrentDocument(client, mcpOptions, current);
+    await verifyMcpLinuxToolAvailability(client, mcpOptions);
   } else {
+    const current = await client.callTool(
+      { name: "current_document", arguments: {} },
+      mcpOptions,
+    );
     await verifyMcpNonLinuxCurrentDocument(client, mcpOptions, current);
+    await prompts.verifyPromptCompletion(client, mcpOptions, ["fixture"]);
   }
   const closed = await client.callTool(
     { name: "close_binary", arguments: {} },
@@ -151,7 +139,7 @@ const verifyMcpBinaryLifecycle = async (client, mcpOptions) => {
   );
   if (closed.isError === true)
     throw new Error("packaged MCP could not close its binary");
-  await prompts.verifyPromptCompletion(client, mcpOptions, false);
+  await prompts.verifyPromptCompletion(client, mcpOptions, []);
 };
 
 const verifyMcpEvidenceBundle = async (client, mcpOptions, evidenceRoot) => {
@@ -170,19 +158,120 @@ const verifyMcpEvidenceBundle = async (client, mcpOptions, evidenceRoot) => {
     throw new Error("packaged MCP evidence import failed");
 };
 
-/** Connect to the packaged MCP server and exercise the target-free catalog. */
+const verifyMcpInlineArtifactEvidence = async (
+  client,
+  mcpOptions,
+  artifactArchive,
+) => {
+  const opened = await client.callTool(
+    { name: "open_binary", arguments: { path: artifactArchive } },
+    mcpOptions,
+  );
+  assert.notEqual(opened.isError, true, JSON.stringify(opened));
+  let outputRoot;
+  try {
+    const inspected = await client.callTool(
+      { name: "inspect_artifact", arguments: {} },
+      mcpOptions,
+    );
+    assert.notEqual(inspected.isError, true, JSON.stringify(inspected));
+    const source = parseEvidence(inspected.structuredContent);
+    assert.deepEqual(
+      source.normalized_result,
+      inspected.structuredContent?.normalized_result,
+    );
+    assert.deepEqual(
+      json(prompts.mcpText(inspected)),
+      inspected.structuredContent,
+    );
+    const compared = await client.callTool(
+      {
+        name: "compare_artifacts",
+        arguments: {
+          left: inspected.structuredContent,
+          right: inspected.structuredContent,
+        },
+      },
+      mcpOptions,
+    );
+    assert.notEqual(compared.isError, true, JSON.stringify(compared));
+    const comparison = parseEvidence(compared.structuredContent);
+    assert.deepEqual(
+      comparison.normalized_result,
+      compared.structuredContent?.normalized_result,
+    );
+    assert.ok(comparison.evidence_links.includes(source.evidence_id));
+    const bundle = await client.callTool(
+      { name: "get_evidence_bundle", arguments: {} },
+      mcpOptions,
+    );
+    assert.notEqual(bundle.isError, true, JSON.stringify(bundle));
+    for (const evidence of [source, comparison]) {
+      assert.deepEqual(
+        bundle.structuredContent?.result?.records.find(
+          (record) => record.evidence_id === evidence.evidence_id,
+        ),
+        evidence,
+      );
+    }
+    const extracted = await client.callTool(
+      { name: "extract_artifact", arguments: {} },
+      mcpOptions,
+    );
+    assert.notEqual(extracted.isError, true, JSON.stringify(extracted));
+    const extraction = parseEvidence(extracted.structuredContent);
+    assert.deepEqual(
+      extraction.normalized_result,
+      extracted.structuredContent?.normalized_result,
+    );
+    const materialized = extracted.structuredContent?.normalized_result;
+    assert.equal(typeof materialized?.output_root, "string");
+    outputRoot = materialized.output_root;
+    assert.equal(materialized.containment_verified, true);
+    assert.equal(
+      await readFile(join(outputRoot, "app/main.js"), "utf8"),
+      "main();",
+    );
+  } finally {
+    try {
+      const closed = await client.callTool(
+        { name: "close_binary", arguments: {} },
+        mcpOptions,
+      );
+      assert.notEqual(closed.isError, true, JSON.stringify(closed));
+    } finally {
+      if (outputRoot !== undefined)
+        await rm(outputRoot, { recursive: true, force: true });
+    }
+  }
+};
+
+/** Connect to the packaged MCP server and verify catalog and Evidence composition. */
 export async function verifyPackageMcp({
   cli,
   environment,
   evidenceRoot,
-  investigationReplay,
+  artifactArchive,
 }) {
+  const diagnosed = json(
+    (
+      await execute(cli, ["mcp", "doctor", "--json"], {
+        env: environment,
+        timeout: MCP_STARTUP_POLICY.doctorDeadlineMs,
+      })
+    ).stdout,
+  );
+  if (
+    diagnosed.healthy !== true ||
+    diagnosed.inventory?.tools?.observed !==
+      diagnosed.inventory?.tools?.expected
+  )
+    throw new Error("packaged production MCP doctor failed");
   const transport = new StdioClientTransport({
     command: cli,
     args: ["mcp"],
     env: {
       ...environment,
-      REA_INVESTIGATION_INPUT_ROOTS_JSON: JSON.stringify([]),
     },
     stderr: "pipe",
   });
@@ -195,10 +284,10 @@ export async function verifyPackageMcp({
     await client.connect(transport);
     const mcpOptions = { timeout: 15_000 };
     await verifyMcpToolsAndPrompts(client, mcpOptions);
-    await verifyMcpReplay(client, mcpOptions, investigationReplay);
     await verifyMcpTargetFree(client, mcpOptions);
     await verifyMcpUnknownProvider(client, mcpOptions);
     await verifyMcpBinaryLifecycle(client, mcpOptions);
+    await verifyMcpInlineArtifactEvidence(client, mcpOptions, artifactArchive);
     await verifyMcpEvidenceBundle(client, mcpOptions, evidenceRoot);
   } catch (cause) {
     throw new Error(`packaged MCP smoke failed: ${mcpStderr}`, { cause });

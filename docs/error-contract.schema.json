@@ -9,12 +9,13 @@
           "type": "string",
           "enum": [
             "invalid_input",
-            "permission_required",
             "unsupported_provider",
+            "unsupported_target",
             "integrity_mismatch",
             "truncated",
             "cancelled",
             "timeout",
+            "resource_constraint",
             "unavailable",
             "execution_failure"
           ]
@@ -23,18 +24,86 @@
         "retryable": { "type": "boolean" },
         "remediation": {
           "type": "object",
-          "properties": {
-            "action": { "type": "string", "minLength": 1 },
-            "restart_required": { "type": "boolean" },
-            "elicitation_supported": { "type": "boolean" }
-          },
-          "required": ["action", "restart_required"],
+          "properties": { "action": { "type": "string", "minLength": 1 } },
+          "required": ["action"],
           "additionalProperties": false
         },
         "details": {
           "type": "object",
           "propertyNames": { "type": "string" },
-          "additionalProperties": { "$ref": "#/$defs/__schema0" }
+          "additionalProperties": {}
+        }
+      },
+      "required": ["code", "category", "message", "retryable", "remediation"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "code": { "type": "string", "const": "access_denied" },
+        "category": {
+          "type": "string",
+          "enum": [
+            "invalid_input",
+            "unsupported_provider",
+            "unsupported_target",
+            "integrity_mismatch",
+            "truncated",
+            "cancelled",
+            "timeout",
+            "resource_constraint",
+            "unavailable",
+            "execution_failure"
+          ]
+        },
+        "message": { "type": "string", "minLength": 1 },
+        "retryable": { "type": "boolean" },
+        "remediation": {
+          "type": "object",
+          "properties": { "action": { "type": "string", "minLength": 1 } },
+          "required": ["action"],
+          "additionalProperties": false
+        },
+        "details": {
+          "type": "object",
+          "propertyNames": { "type": "string" },
+          "additionalProperties": {}
+        }
+      },
+      "required": ["code", "category", "message", "retryable", "remediation"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "code": { "type": "string", "const": "artifact_changed" },
+        "category": {
+          "type": "string",
+          "enum": [
+            "invalid_input",
+            "unsupported_provider",
+            "unsupported_target",
+            "integrity_mismatch",
+            "truncated",
+            "cancelled",
+            "timeout",
+            "resource_constraint",
+            "unavailable",
+            "execution_failure"
+          ]
+        },
+        "message": { "type": "string", "minLength": 1 },
+        "retryable": { "type": "boolean" },
+        "remediation": {
+          "type": "object",
+          "properties": { "action": { "type": "string", "minLength": 1 } },
+          "required": ["action"],
+          "additionalProperties": false
+        },
+        "details": {
+          "type": "object",
+          "propertyNames": { "type": "string" },
+          "additionalProperties": {}
         }
       },
       "required": ["code", "category", "message", "retryable", "remediation"],
@@ -48,12 +117,13 @@
           "type": "string",
           "enum": [
             "invalid_input",
-            "permission_required",
             "unsupported_provider",
+            "unsupported_target",
             "integrity_mismatch",
             "truncated",
             "cancelled",
             "timeout",
+            "resource_constraint",
             "unavailable",
             "execution_failure"
           ]
@@ -62,18 +132,14 @@
         "retryable": { "type": "boolean" },
         "remediation": {
           "type": "object",
-          "properties": {
-            "action": { "type": "string", "minLength": 1 },
-            "restart_required": { "type": "boolean" },
-            "elicitation_supported": { "type": "boolean" }
-          },
-          "required": ["action", "restart_required"],
+          "properties": { "action": { "type": "string", "minLength": 1 } },
+          "required": ["action"],
           "additionalProperties": false
         },
         "details": {
           "type": "object",
           "propertyNames": { "type": "string" },
-          "additionalProperties": { "$ref": "#/$defs/__schema0" }
+          "additionalProperties": {}
         }
       },
       "required": ["code", "category", "message", "retryable", "remediation"],
@@ -87,12 +153,13 @@
           "type": "string",
           "enum": [
             "invalid_input",
-            "permission_required",
             "unsupported_provider",
+            "unsupported_target",
             "integrity_mismatch",
             "truncated",
             "cancelled",
             "timeout",
+            "resource_constraint",
             "unavailable",
             "execution_failure"
           ]
@@ -101,18 +168,50 @@
         "retryable": { "type": "boolean" },
         "remediation": {
           "type": "object",
-          "properties": {
-            "action": { "type": "string", "minLength": 1 },
-            "restart_required": { "type": "boolean" },
-            "elicitation_supported": { "type": "boolean" }
-          },
-          "required": ["action", "restart_required"],
+          "properties": { "action": { "type": "string", "minLength": 1 } },
+          "required": ["action"],
           "additionalProperties": false
         },
         "details": {
           "type": "object",
           "propertyNames": { "type": "string" },
-          "additionalProperties": { "$ref": "#/$defs/__schema0" }
+          "additionalProperties": {}
+        }
+      },
+      "required": ["code", "category", "message", "retryable", "remediation"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "code": { "type": "string", "const": "unsupported_target" },
+        "category": {
+          "type": "string",
+          "enum": [
+            "invalid_input",
+            "unsupported_provider",
+            "unsupported_target",
+            "integrity_mismatch",
+            "truncated",
+            "cancelled",
+            "timeout",
+            "resource_constraint",
+            "unavailable",
+            "execution_failure"
+          ]
+        },
+        "message": { "type": "string", "minLength": 1 },
+        "retryable": { "type": "boolean" },
+        "remediation": {
+          "type": "object",
+          "properties": { "action": { "type": "string", "minLength": 1 } },
+          "required": ["action"],
+          "additionalProperties": false
+        },
+        "details": {
+          "type": "object",
+          "propertyNames": { "type": "string" },
+          "additionalProperties": {}
         }
       },
       "required": ["code", "category", "message", "retryable", "remediation"],
@@ -126,12 +225,13 @@
           "type": "string",
           "enum": [
             "invalid_input",
-            "permission_required",
             "unsupported_provider",
+            "unsupported_target",
             "integrity_mismatch",
             "truncated",
             "cancelled",
             "timeout",
+            "resource_constraint",
             "unavailable",
             "execution_failure"
           ]
@@ -140,18 +240,14 @@
         "retryable": { "type": "boolean" },
         "remediation": {
           "type": "object",
-          "properties": {
-            "action": { "type": "string", "minLength": 1 },
-            "restart_required": { "type": "boolean" },
-            "elicitation_supported": { "type": "boolean" }
-          },
-          "required": ["action", "restart_required"],
+          "properties": { "action": { "type": "string", "minLength": 1 } },
+          "required": ["action"],
           "additionalProperties": false
         },
         "details": {
           "type": "object",
           "propertyNames": { "type": "string" },
-          "additionalProperties": { "$ref": "#/$defs/__schema0" }
+          "additionalProperties": {}
         }
       },
       "required": ["code", "category", "message", "retryable", "remediation"],
@@ -165,12 +261,13 @@
           "type": "string",
           "enum": [
             "invalid_input",
-            "permission_required",
             "unsupported_provider",
+            "unsupported_target",
             "integrity_mismatch",
             "truncated",
             "cancelled",
             "timeout",
+            "resource_constraint",
             "unavailable",
             "execution_failure"
           ]
@@ -179,18 +276,50 @@
         "retryable": { "type": "boolean" },
         "remediation": {
           "type": "object",
-          "properties": {
-            "action": { "type": "string", "minLength": 1 },
-            "restart_required": { "type": "boolean" },
-            "elicitation_supported": { "type": "boolean" }
-          },
-          "required": ["action", "restart_required"],
+          "properties": { "action": { "type": "string", "minLength": 1 } },
+          "required": ["action"],
           "additionalProperties": false
         },
         "details": {
           "type": "object",
           "propertyNames": { "type": "string" },
-          "additionalProperties": { "$ref": "#/$defs/__schema0" }
+          "additionalProperties": {}
+        }
+      },
+      "required": ["code", "category", "message", "retryable", "remediation"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "code": { "type": "string", "const": "resource_constraint" },
+        "category": {
+          "type": "string",
+          "enum": [
+            "invalid_input",
+            "unsupported_provider",
+            "unsupported_target",
+            "integrity_mismatch",
+            "truncated",
+            "cancelled",
+            "timeout",
+            "resource_constraint",
+            "unavailable",
+            "execution_failure"
+          ]
+        },
+        "message": { "type": "string", "minLength": 1 },
+        "retryable": { "type": "boolean" },
+        "remediation": {
+          "type": "object",
+          "properties": { "action": { "type": "string", "minLength": 1 } },
+          "required": ["action"],
+          "additionalProperties": false
+        },
+        "details": {
+          "type": "object",
+          "propertyNames": { "type": "string" },
+          "additionalProperties": {}
         }
       },
       "required": ["code", "category", "message", "retryable", "remediation"],
@@ -204,12 +333,13 @@
           "type": "string",
           "enum": [
             "invalid_input",
-            "permission_required",
             "unsupported_provider",
+            "unsupported_target",
             "integrity_mismatch",
             "truncated",
             "cancelled",
             "timeout",
+            "resource_constraint",
             "unavailable",
             "execution_failure"
           ]
@@ -218,18 +348,14 @@
         "retryable": { "type": "boolean" },
         "remediation": {
           "type": "object",
-          "properties": {
-            "action": { "type": "string", "minLength": 1 },
-            "restart_required": { "type": "boolean" },
-            "elicitation_supported": { "type": "boolean" }
-          },
-          "required": ["action", "restart_required"],
+          "properties": { "action": { "type": "string", "minLength": 1 } },
+          "required": ["action"],
           "additionalProperties": false
         },
         "details": {
           "type": "object",
           "propertyNames": { "type": "string" },
-          "additionalProperties": { "$ref": "#/$defs/__schema0" }
+          "additionalProperties": {}
         }
       },
       "required": ["code", "category", "message", "retryable", "remediation"],
@@ -243,12 +369,13 @@
           "type": "string",
           "enum": [
             "invalid_input",
-            "permission_required",
             "unsupported_provider",
+            "unsupported_target",
             "integrity_mismatch",
             "truncated",
             "cancelled",
             "timeout",
+            "resource_constraint",
             "unavailable",
             "execution_failure"
           ]
@@ -257,12 +384,8 @@
         "retryable": { "type": "boolean" },
         "remediation": {
           "type": "object",
-          "properties": {
-            "action": { "type": "string", "minLength": 1 },
-            "restart_required": { "type": "boolean" },
-            "elicitation_supported": { "type": "boolean" }
-          },
-          "required": ["action", "restart_required"],
+          "properties": { "action": { "type": "string", "minLength": 1 } },
+          "required": ["action"],
           "additionalProperties": false
         },
         "details": {
@@ -304,12 +427,13 @@
           "type": "string",
           "enum": [
             "invalid_input",
-            "permission_required",
             "unsupported_provider",
+            "unsupported_target",
             "integrity_mismatch",
             "truncated",
             "cancelled",
             "timeout",
+            "resource_constraint",
             "unavailable",
             "execution_failure"
           ]
@@ -318,18 +442,14 @@
         "retryable": { "type": "boolean" },
         "remediation": {
           "type": "object",
-          "properties": {
-            "action": { "type": "string", "minLength": 1 },
-            "restart_required": { "type": "boolean" },
-            "elicitation_supported": { "type": "boolean" }
-          },
-          "required": ["action", "restart_required"],
+          "properties": { "action": { "type": "string", "minLength": 1 } },
+          "required": ["action"],
           "additionalProperties": false
         },
         "details": {
           "type": "object",
           "propertyNames": { "type": "string" },
-          "additionalProperties": { "$ref": "#/$defs/__schema0" }
+          "additionalProperties": {}
         }
       },
       "required": ["code", "category", "message", "retryable", "remediation"],
@@ -343,12 +463,13 @@
           "type": "string",
           "enum": [
             "invalid_input",
-            "permission_required",
             "unsupported_provider",
+            "unsupported_target",
             "integrity_mismatch",
             "truncated",
             "cancelled",
             "timeout",
+            "resource_constraint",
             "unavailable",
             "execution_failure"
           ]
@@ -357,18 +478,14 @@
         "retryable": { "type": "boolean" },
         "remediation": {
           "type": "object",
-          "properties": {
-            "action": { "type": "string", "minLength": 1 },
-            "restart_required": { "type": "boolean" },
-            "elicitation_supported": { "type": "boolean" }
-          },
-          "required": ["action", "restart_required"],
+          "properties": { "action": { "type": "string", "minLength": 1 } },
+          "required": ["action"],
           "additionalProperties": false
         },
         "details": {
           "type": "object",
           "propertyNames": { "type": "string" },
-          "additionalProperties": { "$ref": "#/$defs/__schema0" }
+          "additionalProperties": {}
         }
       },
       "required": ["code", "category", "message", "retryable", "remediation"],
@@ -382,12 +499,13 @@
           "type": "string",
           "enum": [
             "invalid_input",
-            "permission_required",
             "unsupported_provider",
+            "unsupported_target",
             "integrity_mismatch",
             "truncated",
             "cancelled",
             "timeout",
+            "resource_constraint",
             "unavailable",
             "execution_failure"
           ]
@@ -396,149 +514,14 @@
         "retryable": { "type": "boolean" },
         "remediation": {
           "type": "object",
-          "properties": {
-            "action": { "type": "string", "minLength": 1 },
-            "restart_required": { "type": "boolean" },
-            "elicitation_supported": { "type": "boolean" }
-          },
-          "required": ["action", "restart_required"],
+          "properties": { "action": { "type": "string", "minLength": 1 } },
+          "required": ["action"],
           "additionalProperties": false
         },
         "details": {
           "type": "object",
           "propertyNames": { "type": "string" },
-          "additionalProperties": { "$ref": "#/$defs/__schema0" }
-        }
-      },
-      "required": ["code", "category", "message", "retryable", "remediation"],
-      "additionalProperties": false
-    },
-    {
-      "type": "object",
-      "properties": {
-        "code": { "type": "string", "const": "permission_required" },
-        "category": {
-          "type": "string",
-          "enum": [
-            "invalid_input",
-            "permission_required",
-            "unsupported_provider",
-            "integrity_mismatch",
-            "truncated",
-            "cancelled",
-            "timeout",
-            "unavailable",
-            "execution_failure"
-          ]
-        },
-        "message": { "type": "string", "minLength": 1 },
-        "retryable": { "type": "boolean" },
-        "remediation": {
-          "type": "object",
-          "properties": {
-            "action": { "type": "string", "minLength": 1 },
-            "restart_required": { "type": "boolean" },
-            "elicitation_supported": { "type": "boolean" }
-          },
-          "required": ["action", "restart_required"],
-          "additionalProperties": false
-        },
-        "details": {
-          "type": "object",
-          "properties": {
-            "capability": { "type": "string" },
-            "requested": {
-              "type": "object",
-              "properties": {
-                "capability": { "type": "string" },
-                "roots": { "type": "array", "items": { "type": "string" } },
-                "executables": {
-                  "type": "array",
-                  "items": { "type": "string" }
-                },
-                "environment_names": {
-                  "type": "array",
-                  "items": { "type": "string" }
-                },
-                "origins": { "type": "array", "items": { "type": "string" } },
-                "network": {
-                  "type": "string",
-                  "enum": ["none", "loopback", "external"]
-                },
-                "mount": { "type": "boolean" }
-              },
-              "required": [
-                "capability",
-                "roots",
-                "executables",
-                "environment_names",
-                "network",
-                "mount"
-              ],
-              "additionalProperties": false
-            },
-            "missing": {
-              "type": "object",
-              "properties": {
-                "roots": { "type": "array", "items": { "type": "string" } },
-                "executables": {
-                  "type": "array",
-                  "items": { "type": "string" }
-                },
-                "environment_names": {
-                  "type": "array",
-                  "items": { "type": "string" }
-                },
-                "origins": { "type": "array", "items": { "type": "string" } },
-                "network": {
-                  "type": "string",
-                  "enum": ["none", "loopback", "external"]
-                },
-                "mount": { "type": "boolean", "const": true }
-              },
-              "additionalProperties": false
-            },
-            "ceiling": {
-              "anyOf": [
-                {
-                  "type": "object",
-                  "properties": {
-                    "capability": { "type": "string" },
-                    "roots": { "type": "array", "items": { "type": "string" } },
-                    "executables": {
-                      "type": "array",
-                      "items": { "type": "string" }
-                    },
-                    "environment_names": {
-                      "type": "array",
-                      "items": { "type": "string" }
-                    },
-                    "origins": {
-                      "type": "array",
-                      "items": { "type": "string" }
-                    },
-                    "network": {
-                      "type": "string",
-                      "enum": ["none", "loopback", "external"]
-                    },
-                    "mount": { "type": "boolean" }
-                  },
-                  "required": [
-                    "capability",
-                    "roots",
-                    "executables",
-                    "environment_names",
-                    "network",
-                    "mount"
-                  ],
-                  "additionalProperties": false
-                },
-                { "type": "null" }
-              ]
-            }
-          },
-          "required": ["capability", "requested", "missing", "ceiling"],
-          "additionalProperties": false
+          "additionalProperties": {}
         }
       },
       "required": ["code", "category", "message", "retryable", "remediation"],
@@ -552,12 +535,13 @@
           "type": "string",
           "enum": [
             "invalid_input",
-            "permission_required",
             "unsupported_provider",
+            "unsupported_target",
             "integrity_mismatch",
             "truncated",
             "cancelled",
             "timeout",
+            "resource_constraint",
             "unavailable",
             "execution_failure"
           ]
@@ -566,18 +550,14 @@
         "retryable": { "type": "boolean" },
         "remediation": {
           "type": "object",
-          "properties": {
-            "action": { "type": "string", "minLength": 1 },
-            "restart_required": { "type": "boolean" },
-            "elicitation_supported": { "type": "boolean" }
-          },
-          "required": ["action", "restart_required"],
+          "properties": { "action": { "type": "string", "minLength": 1 } },
+          "required": ["action"],
           "additionalProperties": false
         },
         "details": {
           "type": "object",
           "propertyNames": { "type": "string" },
-          "additionalProperties": { "$ref": "#/$defs/__schema0" }
+          "additionalProperties": {}
         }
       },
       "required": ["code", "category", "message", "retryable", "remediation"],
@@ -591,12 +571,13 @@
           "type": "string",
           "enum": [
             "invalid_input",
-            "permission_required",
             "unsupported_provider",
+            "unsupported_target",
             "integrity_mismatch",
             "truncated",
             "cancelled",
             "timeout",
+            "resource_constraint",
             "unavailable",
             "execution_failure"
           ]
@@ -605,18 +586,14 @@
         "retryable": { "type": "boolean" },
         "remediation": {
           "type": "object",
-          "properties": {
-            "action": { "type": "string", "minLength": 1 },
-            "restart_required": { "type": "boolean" },
-            "elicitation_supported": { "type": "boolean" }
-          },
-          "required": ["action", "restart_required"],
+          "properties": { "action": { "type": "string", "minLength": 1 } },
+          "required": ["action"],
           "additionalProperties": false
         },
         "details": {
           "type": "object",
           "propertyNames": { "type": "string" },
-          "additionalProperties": { "$ref": "#/$defs/__schema0" }
+          "additionalProperties": {}
         }
       },
       "required": ["code", "category", "message", "retryable", "remediation"],
@@ -630,12 +607,13 @@
           "type": "string",
           "enum": [
             "invalid_input",
-            "permission_required",
             "unsupported_provider",
+            "unsupported_target",
             "integrity_mismatch",
             "truncated",
             "cancelled",
             "timeout",
+            "resource_constraint",
             "unavailable",
             "execution_failure"
           ]
@@ -644,57 +622,14 @@
         "retryable": { "type": "boolean" },
         "remediation": {
           "type": "object",
-          "properties": {
-            "action": { "type": "string", "minLength": 1 },
-            "restart_required": { "type": "boolean" },
-            "elicitation_supported": { "type": "boolean" }
-          },
-          "required": ["action", "restart_required"],
+          "properties": { "action": { "type": "string", "minLength": 1 } },
+          "required": ["action"],
           "additionalProperties": false
         },
         "details": {
           "type": "object",
           "propertyNames": { "type": "string" },
-          "additionalProperties": { "$ref": "#/$defs/__schema0" }
-        }
-      },
-      "required": ["code", "category", "message", "retryable", "remediation"],
-      "additionalProperties": false
-    },
-    {
-      "type": "object",
-      "properties": {
-        "code": { "type": "string", "const": "outside_approved_root" },
-        "category": {
-          "type": "string",
-          "enum": [
-            "invalid_input",
-            "permission_required",
-            "unsupported_provider",
-            "integrity_mismatch",
-            "truncated",
-            "cancelled",
-            "timeout",
-            "unavailable",
-            "execution_failure"
-          ]
-        },
-        "message": { "type": "string", "minLength": 1 },
-        "retryable": { "type": "boolean" },
-        "remediation": {
-          "type": "object",
-          "properties": {
-            "action": { "type": "string", "minLength": 1 },
-            "restart_required": { "type": "boolean" },
-            "elicitation_supported": { "type": "boolean" }
-          },
-          "required": ["action", "restart_required"],
-          "additionalProperties": false
-        },
-        "details": {
-          "type": "object",
-          "propertyNames": { "type": "string" },
-          "additionalProperties": { "$ref": "#/$defs/__schema0" }
+          "additionalProperties": {}
         }
       },
       "required": ["code", "category", "message", "retryable", "remediation"],
@@ -708,12 +643,13 @@
           "type": "string",
           "enum": [
             "invalid_input",
-            "permission_required",
             "unsupported_provider",
+            "unsupported_target",
             "integrity_mismatch",
             "truncated",
             "cancelled",
             "timeout",
+            "resource_constraint",
             "unavailable",
             "execution_failure"
           ]
@@ -722,18 +658,14 @@
         "retryable": { "type": "boolean" },
         "remediation": {
           "type": "object",
-          "properties": {
-            "action": { "type": "string", "minLength": 1 },
-            "restart_required": { "type": "boolean" },
-            "elicitation_supported": { "type": "boolean" }
-          },
-          "required": ["action", "restart_required"],
+          "properties": { "action": { "type": "string", "minLength": 1 } },
+          "required": ["action"],
           "additionalProperties": false
         },
         "details": {
           "type": "object",
           "propertyNames": { "type": "string" },
-          "additionalProperties": { "$ref": "#/$defs/__schema0" }
+          "additionalProperties": {}
         }
       },
       "required": ["code", "category", "message", "retryable", "remediation"],
@@ -747,12 +679,13 @@
           "type": "string",
           "enum": [
             "invalid_input",
-            "permission_required",
             "unsupported_provider",
+            "unsupported_target",
             "integrity_mismatch",
             "truncated",
             "cancelled",
             "timeout",
+            "resource_constraint",
             "unavailable",
             "execution_failure"
           ]
@@ -761,18 +694,14 @@
         "retryable": { "type": "boolean" },
         "remediation": {
           "type": "object",
-          "properties": {
-            "action": { "type": "string", "minLength": 1 },
-            "restart_required": { "type": "boolean" },
-            "elicitation_supported": { "type": "boolean" }
-          },
-          "required": ["action", "restart_required"],
+          "properties": { "action": { "type": "string", "minLength": 1 } },
+          "required": ["action"],
           "additionalProperties": false
         },
         "details": {
           "type": "object",
           "propertyNames": { "type": "string" },
-          "additionalProperties": { "$ref": "#/$defs/__schema0" }
+          "additionalProperties": {}
         }
       },
       "required": ["code", "category", "message", "retryable", "remediation"],
@@ -786,12 +715,13 @@
           "type": "string",
           "enum": [
             "invalid_input",
-            "permission_required",
             "unsupported_provider",
+            "unsupported_target",
             "integrity_mismatch",
             "truncated",
             "cancelled",
             "timeout",
+            "resource_constraint",
             "unavailable",
             "execution_failure"
           ]
@@ -800,77 +730,18 @@
         "retryable": { "type": "boolean" },
         "remediation": {
           "type": "object",
-          "properties": {
-            "action": { "type": "string", "minLength": 1 },
-            "restart_required": { "type": "boolean" },
-            "elicitation_supported": { "type": "boolean" }
-          },
-          "required": ["action", "restart_required"],
+          "properties": { "action": { "type": "string", "minLength": 1 } },
+          "required": ["action"],
           "additionalProperties": false
         },
         "details": {
           "type": "object",
           "propertyNames": { "type": "string" },
-          "additionalProperties": { "$ref": "#/$defs/__schema0" }
-        }
-      },
-      "required": ["code", "category", "message", "retryable", "remediation"],
-      "additionalProperties": false
-    },
-    {
-      "type": "object",
-      "properties": {
-        "code": { "type": "string", "const": "plan_stale" },
-        "category": {
-          "type": "string",
-          "enum": [
-            "invalid_input",
-            "permission_required",
-            "unsupported_provider",
-            "integrity_mismatch",
-            "truncated",
-            "cancelled",
-            "timeout",
-            "unavailable",
-            "execution_failure"
-          ]
-        },
-        "message": { "type": "string", "minLength": 1 },
-        "retryable": { "type": "boolean" },
-        "remediation": {
-          "type": "object",
-          "properties": {
-            "action": { "type": "string", "minLength": 1 },
-            "restart_required": { "type": "boolean" },
-            "elicitation_supported": { "type": "boolean" }
-          },
-          "required": ["action", "restart_required"],
-          "additionalProperties": false
-        },
-        "details": {
-          "type": "object",
-          "propertyNames": { "type": "string" },
-          "additionalProperties": { "$ref": "#/$defs/__schema0" }
+          "additionalProperties": {}
         }
       },
       "required": ["code", "category", "message", "retryable", "remediation"],
       "additionalProperties": false
     }
-  ],
-  "$defs": {
-    "__schema0": {
-      "anyOf": [
-        { "type": "string" },
-        { "type": "number" },
-        { "type": "boolean" },
-        { "type": "null" },
-        { "type": "array", "items": { "$ref": "#/$defs/__schema0" } },
-        {
-          "type": "object",
-          "propertyNames": { "type": "string" },
-          "additionalProperties": { "$ref": "#/$defs/__schema0" }
-        }
-      ]
-    }
-  }
+  ]
 }

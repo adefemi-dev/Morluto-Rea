@@ -1,18 +1,14 @@
-import { compareFunctions } from "../domain/functionComparison.js";
 import { createEvidence } from "../domain/evidence.js";
 import { jsonValueSchema } from "../domain/jsonValue.js";
-import {
-  compareProcessCaptures,
-  processCaptureSchema,
-} from "../domain/processCapture.js";
+import { compareProcessCaptures } from "../domain/process/processComparison.js";
+import { parseProcessCapture } from "../domain/process/processCaptureParsing.js";
 import { FUNCTION_COMPARISON_EXAMPLE } from "./functionComparisonExample.js";
-import { EMPTY_PROCESS_CAPTURE_EXAMPLE } from "./processCaptureExample.js";
+import { EMPTY_PROCESS_CAPTURE_EXAMPLE } from "../domain/process/processCaptureExample.js";
 
+import { compareFunctions } from "../domain/functionComparison.js";
 const comparison = compareFunctions(
   FUNCTION_COMPARISON_EXAMPLE.left,
   FUNCTION_COMPARISON_EXAMPLE.right,
-  0,
-  100,
 );
 
 export const FUNCTION_COMPARISON_EVIDENCE = createEvidence(
@@ -23,13 +19,11 @@ export const FUNCTION_COMPARISON_EVIDENCE = createEvidence(
     version: "1",
   },
   {
-    predicateType: "rea.function-comparison/v1",
+    predicateType: "rea.function-comparison",
     operation: "compare_functions",
     parameters: {
-      left_evidence_ids: [FUNCTION_COMPARISON_EXAMPLE.left.evidence_id],
-      right_evidence_ids: [FUNCTION_COMPARISON_EXAMPLE.right.evidence_id],
-      offset: 0,
-      limit: 100,
+      left_evidence_id: FUNCTION_COMPARISON_EXAMPLE.left.evidence_id,
+      right_evidence_id: FUNCTION_COMPARISON_EXAMPLE.right.evidence_id,
     },
     result: jsonValueSchema.parse(comparison),
     confidence: "derived",
@@ -46,10 +40,10 @@ const PROCESS_PROVIDER = {
   name: "REA deterministic process harness",
   version: "3",
 } as const;
-const capture = processCaptureSchema.parse(EMPTY_PROCESS_CAPTURE_EXAMPLE);
+const capture = parseProcessCapture(EMPTY_PROCESS_CAPTURE_EXAMPLE);
 const captureEvidence = (scenario: string) =>
   createEvidence(undefined, PROCESS_PROVIDER, {
-    predicateType: "rea.process-capture/v4",
+    predicateType: "rea.process-capture",
     operation: "capture_process_scenario",
     parameters: { scenario },
     result: jsonValueSchema.parse(capture),
@@ -68,7 +62,7 @@ export const PROCESS_COMPARISON_EVIDENCE = createEvidence(
   undefined,
   PROCESS_PROVIDER,
   {
-    predicateType: "rea.process-comparison/v3",
+    predicateType: "rea.process-comparison",
     operation: "compare_process_captures",
     parameters: {
       left_evidence_id: PROCESS_CAPTURE_REFERENCE.evidence_id,
@@ -88,6 +82,12 @@ export const PROCESS_COMPARISON_EVIDENCE = createEvidence(
 
 /** Canonical inputs for comparison-composed investigation contracts. */
 export const INVESTIGATION_EXAMPLES = {
+  compare_process_captures: {
+    input: {
+      left: PROCESS_CAPTURE_REFERENCE,
+      right: PROCESS_CAPTURE_RECONSTRUCTION,
+    },
+  },
   find_changed_behavior: { comparisons: [FUNCTION_COMPARISON_EVIDENCE] },
   build_call_path: {
     functions: [FUNCTION_COMPARISON_EXAMPLE.left],
@@ -117,7 +117,6 @@ export const INVESTIGATION_EXAMPLES = {
   },
   verify_reconstruction: {
     specification: {
-      schema_version: 1,
       name: "Terminal compatibility",
       claims: [
         {

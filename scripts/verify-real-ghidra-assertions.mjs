@@ -1,7 +1,9 @@
+import { hasTypedSwitchEvidence } from "./verify-real-ghidra-switch-assertions.mjs";
+
 import { access } from "node:fs/promises";
 
-import { parseBinaryTarget } from "../dist/domain/binaryTarget.js";
-import { SUPPORTED_GHIDRA_VERSION } from "../dist/ghidra/GhidraInstallation.js";
+import { parseBinaryTarget } from "../dist/application/BinaryTargetResolver.js";
+import { SUPPORTED_GHIDRA_VERSION } from "../dist/ghidra/GhidraInstallationPolicy.js";
 import { GHIDRA_SESSION_CAPABILITIES } from "../dist/ghidra/GhidraSessionValues.js";
 
 export function assertLocalProcedureInfo(info, expectedAddress) {
@@ -31,16 +33,16 @@ export function assertProviderText(assembly, pseudocode, expectedAddress) {
 }
 
 export function assertReferenceMetadata(observed) {
+  const references = observed?.references;
   if (
-    observed.instructions_scanned < 1 ||
-    observed.instruction_scan_truncated ||
-    observed.references.items.length === 0 ||
-    !observed.references.items.every(
+    !Array.isArray(references) ||
+    references.length === 0 ||
+    !references.every(
       ({ kind }) =>
         kind.available && kind.provenance === "ghidra-reference-manager",
     ) ||
-    !observed.references.items.some(({ kind }) => kind.call) ||
-    !observed.references.items.some(({ kind }) => kind.data)
+    !references.some(({ kind }) => kind.call) ||
+    !references.some(({ kind }) => kind.data)
   )
     throw new Error(
       `Ghidra typed reference metadata drifted: ${JSON.stringify(observed)}`,
@@ -55,14 +57,114 @@ export function assertDossier(
     expectedString = null,
     requireAssembly = false,
     requireMultiBlock = false,
+    requireJumpTable = false,
   },
 ) {
   assertDossierProcedure(dossier, address);
+  assertNativeApiBoundary(dossier.native_api, requireJumpTable);
+  assertNativeValueFlow(dossier.native_value_flow);
   assertDossierReferences(dossier);
   assertDossierCallees(dossier, expectedCallees);
   assertDossierStrings(dossier, expectedString);
   assertDossierAssembly(dossier, requireAssembly);
   assertDossierMultiBlock(dossier, requireMultiBlock);
+}
+
+function assertNativeValueFlow(observed) {
+  if (
+    observed?.available !== true ||
+    observed.provenance !== "ghidra-high-pcode" ||
+    observed.operations.length === 0 ||
+    !observed.limitations.some((value) =>
+      /cross function boundaries/u.test(value),
+    )
+  )
+    throw new Error(
+      `Ghidra p-code value-flow boundary drifted: ${JSON.stringify(observed)}`,
+    );
+  const ids = new Set(observed.operations.map(({ id }) => id));
+  if (
+    observed.def_use.some(
+      ({ definition, use }) => !ids.has(definition) || !ids.has(use),
+    ) ||
+    observed.effects.some(({ operation }) => !ids.has(operation)) ||
+    observed.truncated !==
+      (observed.omitted_operations_lower_bound > 0 ||
+        observed.known_omitted_inputs > 0 ||
+        observed.known_omitted_edges > 0)
+  )
+    throw new Error(
+      "Ghidra p-code value-flow links or truncation facts drifted",
+    );
+}
+
+export function assertDenseSwitchDossier(dossier, address) {
+  assertDossier(dossier, {
+    address,
+    requireAssembly: true,
+    requireMultiBlock: true,
+  });
+  const denseTable = dossier.native_api.jump_tables.find(
+    ({ mappings }) => mappings.length > 32,
+  );
+  if (
+    denseTable === undefined ||
+    denseTable.default_targets.length !== 1 ||
+    denseTable.default_targets[0].confidence !== "high" ||
+    !hasTypedSwitchEvidence(
+      denseTable.default_targets[0].evidence,
+      "Typed default label",
+      denseTable.default_targets[0].target_address,
+      denseTable.dispatch_address,
+    ) ||
+    denseTable.mappings.some(
+      ({ target_address: target, evidence }) =>
+        !/^0x[0-9a-f]+$/u.test(target) ||
+        !evidence.some(({ kind }) => kind === "jump-table"),
+    )
+  )
+    throw new Error(
+      `Ghidra dense jump-table completeness drifted: ${JSON.stringify(dossier.native_api.jump_tables)}`,
+    );
+}
+
+function assertNativeApiBoundary(observed, requireJumpTable) {
+  if (
+    observed?.available !== true ||
+    observed.provenance !== "ghidra-high-function" ||
+    !["low", "medium", "high"].includes(observed.return_type?.confidence) ||
+    !observed.return_type?.evidence?.some(
+      ({ source }) => source === "ghidra-high-function",
+    ) ||
+    observed.pseudocode?.classification !== "decompiler-generated-non-source" ||
+    observed.pseudocode.compilable !== false ||
+    !observed.decompiler_artifacts?.includes("pointer-arithmetic")
+  )
+    throw new Error(
+      `Ghidra native API boundary drifted: ${JSON.stringify(observed)}`,
+    );
+  if (!requireJumpTable) return;
+  if (
+    observed.jump_tables.length === 0 ||
+    !observed.jump_tables.some(
+      ({ data_sources: sources, mappings }) =>
+        sources.length > 0 &&
+        sources.every(
+          ({ address, evidence }) =>
+            /^0x[0-9a-f]+$/u.test(address) &&
+            evidence.some(({ kind }) => kind === "jump-table"),
+        ) &&
+        mappings.length > 0 &&
+        mappings.every(
+          ({ target_address: target, evidence }) =>
+            /^0x[0-9a-f]+$/u.test(target) &&
+            evidence.some(({ kind }) => kind === "jump-table"),
+        ),
+    )
+  )
+    throw new Error(
+      `Ghidra jump-table evidence drifted: ${JSON.stringify(observed.jump_tables)}`,
+    );
 }
 
 function assertDossierProcedure(dossier, address) {
@@ -71,10 +173,8 @@ function assertDossierProcedure(dossier, address) {
     dossier.procedure.classification === null ||
     dossier.procedure.classification.provenance !== "ghidra-function-manager" ||
     dossier.procedure.classification.external ||
-    dossier.pseudocode.text.trim().length === 0 ||
-    dossier.pseudocode.returned_chars !== [...dossier.pseudocode.text].length ||
-    dossier.instruction_scan.scanned < 1 ||
-    dossier.instruction_scan.truncated ||
+    typeof dossier.pseudocode !== "string" ||
+    dossier.pseudocode.trim().length === 0 ||
     !dossier.limitations.some((value) => /indirect|computed/u.test(value)) ||
     !dossier.limitations.some((value) => /Ghidra|Hopper|provider/u.test(value))
   )
@@ -85,10 +185,7 @@ function assertDossierProcedure(dossier, address) {
 
 function assertDossierReferences(dossier) {
   if (
-    ![
-      ...dossier.incoming_references.items,
-      ...dossier.outgoing_references.items,
-    ].every(
+    ![...dossier.incoming_references, ...dossier.outgoing_references].every(
       ({ kind }) =>
         kind.available && kind.provenance === "ghidra-reference-manager",
     )
@@ -98,16 +195,14 @@ function assertDossierReferences(dossier) {
 
 function assertDossierCallees(dossier, expectedCallees) {
   for (const expected of expectedCallees)
-    if (!dossier.callees.items.some(({ address: value }) => value === expected))
+    if (!dossier.callees.some(({ address: value }) => value === expected))
       throw new Error(`Ghidra dossier missed callee ${expected}`);
 }
 
 function assertDossierStrings(dossier, expectedString) {
   if (
     expectedString !== null &&
-    !dossier.referenced_strings.items.some(
-      ({ value }) => value === expectedString,
-    )
+    !dossier.referenced_strings.some(({ value }) => value === expectedString)
   )
     throw new Error(
       `Ghidra dossier missed referenced string ${expectedString}`,
@@ -115,20 +210,15 @@ function assertDossierStrings(dossier, expectedString) {
 }
 
 function assertDossierAssembly(dossier, requireAssembly) {
-  if (
-    requireAssembly &&
-    (dossier.assembly.items.length === 0 || dossier.assembly.truncated)
-  )
+  if (requireAssembly && dossier.assembly.length === 0)
     throw new Error("Ghidra dossier assembly was unavailable or truncated");
 }
 
 function assertDossierMultiBlock(dossier, requireMultiBlock) {
   if (
     requireMultiBlock &&
-    (dossier.basic_blocks.items.length < 2 ||
-      !dossier.basic_blocks.items.some(
-        ({ successors }) => successors.length > 0,
-      ))
+    (dossier.basic_blocks.length < 2 ||
+      !dossier.basic_blocks.some(({ successors }) => successors.length > 0))
   )
     throw new Error(
       "Ghidra dossier CFG missed the multi-block branch structure",
@@ -138,12 +228,20 @@ function assertDossierMultiBlock(dossier, requireMultiBlock) {
 export function dossierSummary(dossier) {
   return {
     address: dossier.procedure.address,
-    pseudocode_chars: dossier.pseudocode.total_chars,
-    instructions: dossier.instruction_scan.scanned,
-    callees: dossier.callees.returned,
-    outgoing_references: dossier.outgoing_references.returned,
-    referenced_strings: dossier.referenced_strings.returned,
-    basic_blocks: dossier.basic_blocks.returned,
+    pseudocode_chars: [...dossier.pseudocode].length,
+    instructions: dossier.assembly.length,
+    callees: dossier.callees.length,
+    outgoing_references: dossier.outgoing_references.length,
+    referenced_strings: dossier.referenced_strings.length,
+    basic_blocks: dossier.basic_blocks.length,
+    native_parameters:
+      dossier.native_api.available === true
+        ? dossier.native_api.parameters.length
+        : null,
+    jump_tables:
+      dossier.native_api.available === true
+        ? dossier.native_api.jump_tables.length
+        : null,
   };
 }
 
@@ -157,10 +255,13 @@ export async function assertSession(
     session.provider.version !== SUPPORTED_GHIDRA_VERSION ||
     session.profile_digest !== expectedDigest ||
     session.target.sha256 !== expectedTargetSha256 ||
-    session.read_only !== true ||
+    session.read_only !== false ||
     session.analysis_complete !== true ||
     session.analysis_timed_out !== false ||
-    session.capabilities.join(",") !== GHIDRA_SESSION_CAPABILITIES.join(",") ||
+    session.capabilities.length !== GHIDRA_SESSION_CAPABILITIES.length ||
+    GHIDRA_SESSION_CAPABILITIES.some(
+      (name) => !session.capabilities.includes(name),
+    ) ||
     !/^0x[0-9a-f]+$/u.test(session.target.image_base) ||
     session.target.default_address_space.length === 0
   )
@@ -178,7 +279,12 @@ export function assertRuntimeCoordinates(coordinates) {
 }
 
 export async function assertCleanup(coordinates) {
-  for (const name of ["runtime_root", "endpoint_path", "project_root"]) {
+  for (const name of [
+    "runtime_root",
+    "endpoint_path",
+    "project_root",
+    "socket_root",
+  ]) {
     const path = coordinates[name];
     if (typeof path === "string" && (await exists(path)))
       throw new Error(`Ghidra cleanup left ${name}: ${path}`);
@@ -189,16 +295,19 @@ export async function assertCleanup(coordinates) {
 }
 
 export function assertDebugFixture(observed) {
+  const expectedDocument = `target-${observed.target.sha256.slice(0, 12)}.bin`;
   if (
     !Array.isArray(observed.documents) ||
     observed.documents.length !== 1 ||
-    !observed.documents[0].includes("debug")
+    observed.documents[0] !== expectedDocument
   )
-    throw new Error("Ghidra did not expose exactly one debug Program identity");
+    throw new Error(
+      `Ghidra did not expose the digest-bound debug Program identity ${expectedDocument}: ${JSON.stringify(observed.documents)}`,
+    );
   const entry = findValue(observed.procedures, "rea_ghidra_inventory_entry");
   const leaf = findValue(observed.procedures, "rea_ghidra_inventory_leaf");
   const external = observed.procedures.find(
-    (item) => item.procedure.external && symbolTail(item.value) === "puts",
+    (item) => item.procedure.external && matchesSymbol(item.value, "puts"),
   );
   if (entry === undefined || leaf === undefined || external === undefined)
     throw new Error(
@@ -265,7 +374,6 @@ function assertStrings(strings) {
     const item = strings.find((candidate) => candidate.value === expected);
     if (
       item === undefined ||
-      item.value_truncated ||
       typeof item.string.encoding !== "string" ||
       item.string.byte_length < expected.length
     )
@@ -290,13 +398,18 @@ function assertSegments(segments, imageBase) {
 }
 
 export function findValue(items, expected) {
-  return items.find((item) => symbolTail(item.value) === expected);
+  return items.find((item) => matchesSymbol(item.value, expected));
 }
 
 export function requireProcedure(items, expected) {
   const observed = findValue(items, expected);
   if (observed === undefined)
-    throw new Error(`Ghidra procedure probe is unavailable: ${expected}`);
+    throw new Error(
+      `Ghidra procedure probe is unavailable: ${expected}; observed: ${items
+        .slice(0, 40)
+        .map(({ value }) => value)
+        .join(", ")}`,
+    );
   return observed;
 }
 

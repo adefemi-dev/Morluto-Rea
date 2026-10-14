@@ -1,116 +1,159 @@
-import { createHash } from "node:crypto";
-
-import canonicalize from "canonicalize";
-
 import {
   artifactInventoryResultSchema,
+  type ArtifactInventoryCoverage,
   type ArtifactInventoryResult,
   type ArtifactNode,
   type ArtifactOccurrence,
   type IntegrityContradiction,
 } from "./artifactGraph.js";
+import { compareUnicodeCodePoints } from "./unicodeCodePointOrder.js";
+import { canonicalJson } from "./comparisonSemantics.js";
+import {
+  artifactContradictionId,
+  artifactEdgeId,
+  artifactGraphDigest,
+  artifactIdForContent,
+  artifactManifestId,
+  occurrenceIdForLocation,
+} from "./artifactIdentity.js";
 import { parseEvidence, type Evidence } from "./evidence.js";
+import { artifactInspectionResultSchema } from "./artifactInspection.js";
+import { ZIP_NON_ENTRY_TAIL_LIMITATION } from "./zipPackageFormat.js";
 
 /** Complete or partially assembled inventory used by comparison workflows. */
 export interface InventorySet {
   readonly manifest: ArtifactInventoryResult["manifest"];
   readonly nodes: readonly ArtifactNode[];
   readonly occurrences: readonly ArtifactOccurrence[];
-  readonly edges: readonly ArtifactInventoryResult["edges"]["items"][number][];
+  readonly edges: readonly ArtifactInventoryResult["edges"][number][];
   readonly integrityContradictions: readonly IntegrityContradiction[];
   readonly limitations: readonly string[];
+  /** True when merged node, occurrence, and edge counts match the manifest. */
   readonly complete: boolean;
+  readonly coverage_status: ArtifactInventoryCoverage;
 }
 
-interface ParsedInventorySet {
+/** Whether all graph members are present and the producer reports full coverage. */
+export const hasCompleteInventoryCoverage = (
+  inventory: InventorySet,
+): boolean => inventory.complete && inventory.coverage_status === "complete";
+
+export interface ParsedInventorySet {
   readonly evidence: readonly Evidence[];
   readonly inventory: InventorySet;
 }
 
-/** Parse, merge, and verify a bounded set of inventory Evidence pages. */
+/** Parse, merge, and verify inventory Evidence pages. */
 export const parseArtifactInventoryEvidence = (
   input: unknown,
-): ParsedInventorySet =>
-  assembleInventorySet(
-    (Array.isArray(input) ? input : [input]).map((value) => {
-      const evidence = parseEvidence(value);
-      if (evidence.operation !== "inventory_artifact")
-        throw new TypeError(
-          "Artifact comparison requires inventory_artifact Evidence",
-        );
-      const inventory = artifactInventoryResultSchema.parse(
-        evidence.normalized_result,
+): ParsedInventorySet => {
+  const pages = (Array.isArray(input) ? input : [input]).map((value) => {
+    const evidence = parseEvidence(value);
+    const inventoryEvidence =
+      evidence.operation === "inventory_artifact"
+        ? evidence
+        : evidence.operation === "inspect_artifact"
+          ? artifactInspectionResultSchema.parse(evidence.normalized_result)
+              .substeps[0]?.evidence
+          : undefined;
+    if (inventoryEvidence === undefined)
+      throw new TypeError(
+        "Artifact comparison requires inspect_artifact Evidence",
       );
-      if (
-        evidence.subject === null ||
-        evidence.subject.digest.sha256 !== inventory.manifest.root_sha256 ||
-        evidence.subject.format !== inventory.manifest.root_format
-      )
-        throw new TypeError(
-          "Artifact inventory Evidence subject does not match its root digest",
-        );
-      validateInventoryPage(inventory);
-      return { evidence, inventory };
-    }),
-  );
+    const inventory = artifactInventoryResultSchema.parse(
+      inventoryEvidence.normalized_result,
+    );
+    validateArtifactInventorySubject(
+      inventoryEvidence.subject,
+      inventory.manifest,
+    );
+    validateInventoryPage(inventory);
+    return { evidence, inventory };
+  });
+  return {
+    evidence: pages.map(({ evidence }) => evidence),
+    inventory: assembleInventoryResults(
+      pages.map(({ inventory }) => inventory),
+    ),
+  };
+};
+
+/** Validate one already authenticated parent payload with the same graph proofs. */
+export const parseArtifactInventoryResult = (
+  input: unknown,
+  subject: Evidence["subject"],
+): InventorySet => {
+  const inventory = artifactInventoryResultSchema.parse(input);
+  validateArtifactInventorySubject(subject, inventory.manifest);
+  validateInventoryPage(inventory);
+  return assembleInventoryResults([inventory]);
+};
+
+/** Both inventory carriers require the same authenticated root identity. */
+export const validateArtifactInventorySubject = (
+  subject: Evidence["subject"],
+  manifest: ArtifactInventoryResult["manifest"],
+): void => {
+  if (
+    subject === null ||
+    subject.digest.sha256 !== manifest.root_sha256 ||
+    subject.format !== manifest.root_format
+  )
+    throw new TypeError(
+      "Artifact inventory Evidence subject does not match its root digest",
+    );
+};
 
 const validateInventoryPage = (inventory: ArtifactInventoryResult): void => {
   assertUnique(
-    inventory.nodes.items.map(({ artifact_id: id }) => id),
+    inventory.nodes.map(({ artifact_id: id }) => id),
     "node ID",
   );
   assertUnique(
-    inventory.occurrences.items.map(({ occurrence_id: id }) => id),
+    inventory.occurrences.map(({ occurrence_id: id }) => id),
     "occurrence ID",
   );
   assertUnique(
-    inventory.occurrences.items.map(({ logical_path: path }) => path),
+    inventory.occurrences.map(({ logical_path: path }) => path),
     "logical path",
   );
   assertUnique(
-    inventory.edges.items.map(({ edge_id: id }) => id),
+    inventory.edges.map(({ edge_id: id }) => id),
     "edge ID",
   );
-  for (const node of inventory.nodes.items)
-    if (
-      node.artifact_id !==
-      `art_${digestCanonical({ schema_version: 1, sha256: node.sha256 })}`
-    )
+  for (const node of inventory.nodes)
+    if (node.artifact_id !== artifactIdForContent(node.sha256))
       throw new TypeError("Artifact node ID is not content-addressed");
 };
 
-const assembleInventorySet = (
-  pages: readonly {
-    readonly evidence: Evidence;
-    readonly inventory: ArtifactInventoryResult;
-  }[],
-): ParsedInventorySet => {
-  if (pages.length === 0 || pages.length > 100)
-    throw new TypeError("Artifact comparison requires 1 to 100 Evidence pages");
+const assembleInventoryResults = (
+  pages: readonly ArtifactInventoryResult[],
+): InventorySet => {
   const first = pages[0];
   if (first === undefined)
-    throw new TypeError("Artifact comparison requires Evidence pages");
-  const manifestJson = canonicalJson(first.inventory.manifest);
+    throw new TypeError("Artifact inventory requires Evidence pages");
+  const coverageStatuses = new Set(pages.map(resolveInventoryCoverageStatus));
+  if (coverageStatuses.size !== 1)
+    throw new TypeError("Artifact inventory pages disagree on coverage status");
+  const coverageStatus = [...coverageStatuses][0]!;
+  const manifestJson = canonicalJson(first.manifest, "Artifact inventory");
   const nodes = new Map<string, ArtifactNode>();
   const occurrences = new Map<string, ArtifactOccurrence>();
   const paths = new Map<string, ArtifactOccurrence>();
-  const edges = new Map<
-    string,
-    ArtifactInventoryResult["edges"]["items"][number]
-  >();
+  const edges = new Map<string, ArtifactInventoryResult["edges"][number]>();
   for (const page of pages) {
-    if (canonicalJson(page.inventory.manifest) !== manifestJson)
+    if (canonicalJson(page.manifest, "Artifact inventory") !== manifestJson)
       throw new TypeError("Artifact inventory pages do not share one manifest");
     if (
-      canonicalJson(page.inventory.integrity_contradictions) !==
-      canonicalJson(first.inventory.integrity_contradictions)
+      canonicalJson(page.integrity_contradictions, "Artifact inventory") !==
+      canonicalJson(first.integrity_contradictions, "Artifact inventory")
     )
       throw new TypeError(
         "Artifact inventory pages do not share integrity contradictions",
       );
-    for (const node of page.inventory.nodes.items)
+    for (const node of page.nodes)
       mergeExact(nodes, node.artifact_id, node, "node");
-    for (const occurrence of page.inventory.occurrences.items) {
+    for (const occurrence of page.occurrences) {
       mergeExact(
         occurrences,
         occurrence.occurrence_id,
@@ -119,38 +162,40 @@ const assembleInventorySet = (
       );
       mergeExact(paths, occurrence.logical_path, occurrence, "logical path");
     }
-    for (const edge of page.inventory.edges.items)
+    for (const edge of page.edges)
       mergeExact(edges, edge.edge_id, edge, "edge");
   }
-  const inventory = orderedInventory(first.inventory, pages, {
-    nodes,
-    occurrences,
-    edges,
-  });
+  const inventory = orderedInventory(
+    first,
+    pages,
+    { nodes, occurrences, edges },
+    coverageStatus,
+  );
   if (inventory.complete) validateCompleteInventory(inventory);
-  return { evidence: pages.map(({ evidence }) => evidence), inventory };
+  return inventory;
 };
 
 const orderedInventory = (
   first: ArtifactInventoryResult,
-  pages: readonly { readonly inventory: ArtifactInventoryResult }[],
+  pages: readonly ArtifactInventoryResult[],
   values: {
     readonly nodes: ReadonlyMap<string, ArtifactNode>;
     readonly occurrences: ReadonlyMap<string, ArtifactOccurrence>;
     readonly edges: ReadonlyMap<
       string,
-      ArtifactInventoryResult["edges"]["items"][number]
+      ArtifactInventoryResult["edges"][number]
     >;
   },
+  coverageStatus: ArtifactInventoryCoverage,
 ): InventorySet => {
   const nodes = [...values.nodes.values()].sort((left, right) =>
-    left.artifact_id.localeCompare(right.artifact_id),
+    compareUnicodeCodePoints(left.artifact_id, right.artifact_id),
   );
   const occurrences = [...values.occurrences.values()].sort((left, right) =>
-    left.logical_path.localeCompare(right.logical_path, "en"),
+    compareUnicodeCodePoints(left.logical_path, right.logical_path),
   );
   const edges = [...values.edges.values()].sort((left, right) =>
-    left.edge_id.localeCompare(right.edge_id),
+    compareUnicodeCodePoints(left.edge_id, right.edge_id),
   );
   return {
     manifest: first.manifest,
@@ -159,14 +204,33 @@ const orderedInventory = (
     edges,
     integrityContradictions: first.integrity_contradictions,
     limitations: [
-      ...new Set(pages.flatMap(({ inventory }) => inventory.limitations)),
-    ].sort((left, right) => left.localeCompare(right)),
+      ...new Set(pages.flatMap((inventory) => inventory.limitations)),
+    ].sort(compareUnicodeCodePoints),
     complete:
       nodes.length === first.manifest.node_count &&
       occurrences.length === first.manifest.occurrence_count &&
       edges.length === first.manifest.edge_count,
+    coverage_status: coverageStatus,
   };
 };
+
+const resolveInventoryCoverageStatus = (
+  inventory: ArtifactInventoryResult,
+): ArtifactInventoryCoverage => {
+  if (inventory.coverage_status !== undefined) return inventory.coverage_status;
+  // Older retained Evidence has no typed status. Keep only its known
+  // informational notices complete; unknown limitation text fails closed.
+  return inventory.limitations.every(isKnownNonCoverageNotice)
+    ? "complete"
+    : "partial";
+};
+
+const isKnownNonCoverageNotice = (limitation: string): boolean =>
+  limitation === "Artifact has no child container entries." ||
+  limitation === ZIP_NON_ENTRY_TAIL_LIMITATION ||
+  /^\d+ integrity contradiction\(s\) were recorded; mismatched content is observed-untrusted\.$/u.test(
+    limitation,
+  );
 
 const validateCompleteInventory = (inventory: InventorySet): void => {
   const nodeIds = new Set(inventory.nodes.map(({ artifact_id: id }) => id));
@@ -180,10 +244,26 @@ const validateCompleteInventory = (inventory: InventorySet): void => {
     throw new TypeError(
       "Artifact root node does not match its manifest digest",
     );
+  const rootOccurrence = inventory.occurrences.find(
+    ({ logical_path }) => logical_path === ".",
+  );
+  if (
+    rootOccurrence?.artifact_id !== inventory.manifest.root_artifact_id ||
+    rootOccurrence.artifact_format !== inventory.manifest.root_format
+  )
+    throw new TypeError(
+      "Artifact root occurrence does not match its manifest representation",
+    );
   for (const occurrence of inventory.occurrences)
     validateOccurrence(occurrence, inventory, nodeIds, occurrenceIds);
+  const occurrencesById = new Map(
+    inventory.occurrences.map((occurrence) => [
+      occurrence.occurrence_id,
+      occurrence,
+    ]),
+  );
   for (const edge of inventory.edges)
-    validateEdge(edge, nodeIds, occurrenceIds);
+    validateEdge(edge, nodeIds, occurrencesById);
   for (const contradiction of inventory.integrityContradictions) {
     if (
       !nodeIds.has(contradiction.parent_artifact_id) ||
@@ -192,30 +272,29 @@ const validateCompleteInventory = (inventory: InventorySet): void => {
       throw new TypeError(
         "Integrity contradiction references a missing graph member",
       );
-    const expectedId = `ic_${digestCanonical({
-      root_artifact_id: inventory.manifest.root_artifact_id,
-      logical_path: contradiction.logical_path,
-      declared_sha256: contradiction.declared_sha256,
-      observed_sha256: contradiction.observed_sha256,
-    })}`;
+    const expectedId = artifactContradictionId({
+      rootArtifactId: inventory.manifest.root_artifact_id,
+      logicalPath: contradiction.logical_path,
+      declaredSha256: contradiction.declared_sha256,
+      observedSha256: contradiction.observed_sha256,
+    });
     if (contradiction.contradiction_id !== expectedId)
       throw new TypeError(
         "Integrity contradiction ID does not match its identity",
       );
   }
-  const graphSha256 = digestCanonical({
+  const graphSha256 = artifactGraphDigest({
     nodes: inventory.nodes,
     occurrences: inventory.occurrences,
     edges: inventory.edges,
-    integrity_contradictions: inventory.integrityContradictions,
+    contradictions: inventory.integrityContradictions,
   });
   if (graphSha256 !== inventory.manifest.graph_sha256)
     throw new TypeError("Artifact graph commitment does not match its members");
-  const manifestId = `agm_${digestCanonical({
-    schema_version: 1,
-    root_artifact_id: inventory.manifest.root_artifact_id,
-    graph_sha256: graphSha256,
-  })}`;
+  const manifestId = artifactManifestId(
+    inventory.manifest.root_artifact_id,
+    graphSha256,
+  );
   if (manifestId !== inventory.manifest.manifest_id)
     throw new TypeError("Artifact manifest ID does not match its commitment");
 };
@@ -233,37 +312,29 @@ const validateOccurrence = (
     !occurrenceIds.has(occurrence.parent_occurrence_id)
   )
     throw new TypeError("Artifact occurrence references a missing parent");
-  const expectedId =
-    occurrence.logical_path === "."
-      ? `occ_${digestCanonical({ root: inventory.manifest.root_artifact_id })}`
-      : `occ_${digestCanonical({
-          root_artifact_id: inventory.manifest.root_artifact_id,
-          logical_path: occurrence.logical_path,
-          entry_kind: occurrence.entry_kind,
-        })}`;
+  const expectedId = occurrenceIdForLocation({
+    rootArtifactId: inventory.manifest.root_artifact_id,
+    logicalPath: occurrence.logical_path,
+    entryKind: occurrence.entry_kind,
+  });
   if (occurrence.occurrence_id !== expectedId)
     throw new TypeError("Artifact occurrence ID does not match its identity");
 };
 
 const validateEdge = (
-  edge: ArtifactInventoryResult["edges"]["items"][number],
+  edge: ArtifactInventoryResult["edges"][number],
   nodeIds: ReadonlySet<string>,
-  occurrenceIds: ReadonlySet<string>,
+  occurrences: ReadonlyMap<string, ArtifactOccurrence>,
 ): void => {
+  const occurrence = occurrences.get(edge.occurrence_id);
   if (
     !nodeIds.has(edge.parent_artifact_id) ||
-    !nodeIds.has(edge.child_artifact_id) ||
-    !occurrenceIds.has(edge.occurrence_id)
+    occurrence?.artifact_id === null ||
+    occurrence === undefined ||
+    !nodeIds.has(occurrence.artifact_id)
   )
     throw new TypeError("Artifact edge references a missing graph member");
-  const semantic = {
-    parent_artifact_id: edge.parent_artifact_id,
-    child_artifact_id: edge.child_artifact_id,
-    relation: edge.relation,
-    occurrence_id: edge.occurrence_id,
-    logical_path: edge.logical_path,
-  };
-  if (edge.edge_id !== `edge_${digestCanonical(semantic)}`)
+  if (edge.edge_id !== artifactEdgeId(edge, occurrence))
     throw new TypeError("Artifact edge ID does not match its identity");
 };
 
@@ -276,7 +347,8 @@ const mergeExact = <Value>(
   const previous = output.get(key);
   if (
     previous !== undefined &&
-    canonicalJson(previous) !== canonicalJson(value)
+    canonicalJson(previous, "Artifact inventory") !==
+      canonicalJson(value, "Artifact inventory")
   )
     throw new TypeError(`Artifact inventory has conflicting ${label} pages`);
   output.set(key, value);
@@ -285,14 +357,4 @@ const mergeExact = <Value>(
 const assertUnique = (values: readonly string[], label: string): void => {
   if (new Set(values).size !== values.length)
     throw new TypeError(`Artifact inventory contains a duplicate ${label}`);
-};
-
-const digestCanonical = (value: unknown): string =>
-  createHash("sha256").update(canonicalJson(value)).digest("hex");
-
-const canonicalJson = (value: unknown): string => {
-  const encoded = canonicalize(value);
-  if (encoded === undefined)
-    throw new TypeError("Artifact inventory could not canonicalize graph data");
-  return encoded;
 };

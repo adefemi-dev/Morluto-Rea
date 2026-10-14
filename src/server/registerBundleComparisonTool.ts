@@ -1,74 +1,101 @@
-import type { McpServer } from "@modelcontextprotocol/server";
+import type { EvidenceMcpServer } from "./EvidenceMcpServer.js";
 
-import type { BinarySessionPort } from "../application/BinarySession.js";
+import type { BinarySessionPort } from "../application/binary/BinarySessionPort.js";
 import { readEvidenceBundle } from "../application/EvidenceBundleFiles.js";
-import type { ToolContract } from "../contracts/toolContracts.js";
-import {
-  bundleComparisonInputSchema,
-  compareBundles,
-} from "../domain/bundleComparison.js";
+import { toolContract } from "../contracts/toolContracts.js";
+import { compareBundles } from "../domain/bundleComparison.js";
 import { createEvidence } from "../domain/evidence.js";
 import { jsonValueSchema } from "../domain/jsonValue.js";
-import { ok } from "../domain/result.js";
-import type { EvidenceFilePolicy } from "../domain/evidenceBundle.js";
-import { BUNDLE_COMPARISON_PROVIDER } from "./sessionToolPolicies.js";
-import { toCallToolResult } from "./toolResult.js";
-import { toolRegistrationOptions } from "./toolRegistrationOptions.js";
 import { runDerivedOperation } from "./runDerivedOperation.js";
-import { safeParseToolInput } from "./toolInputValidation.js";
+import { recordSessionEvidenceSources } from "./sessionEvidence.js";
+import { BUNDLE_COMPARISON_PROVIDER } from "../application/InvestigationProviders.js";
+import { toolRegistrationOptions } from "./toolRegistrationOptions.js";
+import { withAdmittedAnalysis } from "./analysisAdmission.js";
+import { runAdmittedToolOperation } from "./admittedToolOperation.js";
+import type { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 
 /** Register canonical Evidence bundle comparison. */
 export const registerBundleComparisonTool = (
-  server: McpServer,
+  server: EvidenceMcpServer,
   session: BinarySessionPort,
-  contract: ToolContract<"compare_bundles">,
-  evidenceFilePolicy: EvidenceFilePolicy,
+  contract: ReturnType<typeof toolContract<"compare_bundles">>,
+  resources: ArtifactResourceScope,
 ): void => {
+  const admission = withAdmittedAnalysis({ kind: "session", session });
   server.registerTool(
     contract.name,
     toolRegistrationOptions(contract),
-    async (input, context) => {
-      const parsedInput = safeParseToolInput(
-        bundleComparisonInputSchema,
-        input,
+    async (input, context) =>
+      runAdmittedToolOperation(
+        server,
+        admission,
         contract.name,
-      );
-      if (!parsedInput.ok) return toCallToolResult(parsedInput, contract);
-      const parsed = parsedInput.value;
-      const [left, right] = await Promise.all([
-        readEvidenceBundle(parsed.left_bundle_path, evidenceFilePolicy),
-        readEvidenceBundle(parsed.right_bundle_path, evidenceFilePolicy),
-      ]);
-      if (!left.ok) return toCallToolResult(left, contract);
-      if (!right.ok) return toCallToolResult(right, contract);
-      const computed = await runDerivedOperation(context, contract.name, () =>
-        compareBundles(
-          left.value,
-          right.value,
-          parsed.record_pairs,
-          parsed.offset,
-          parsed.limit,
-        ),
-      );
-      if (!computed.ok) return toCallToolResult(computed, contract);
-      const comparison = computed.value;
-      const evidence = createEvidence(undefined, BUNDLE_COMPARISON_PROVIDER, {
-        predicateType: "rea.bundle-comparison/v1",
-        operation: contract.name,
-        parameters: {
-          left_bundle_sha256: comparison.left_bundle_sha256,
-          right_bundle_sha256: comparison.right_bundle_sha256,
-          record_pairs: parsed.record_pairs,
-          offset: parsed.offset,
-          limit: parsed.limit,
+        context.mcpReq.signal,
+        async () => {
+          const [left, right] = await Promise.all([
+            readEvidenceBundle(
+              input.left_bundle_path,
+              context.mcpReq.signal,
+              resources,
+            ),
+            readEvidenceBundle(
+              input.right_bundle_path,
+              context.mcpReq.signal,
+              resources,
+            ),
+          ]);
+          if (!left.ok) return server.delivery.toCallToolResult(left, contract);
+          if (!right.ok)
+            return server.delivery.toCallToolResult(right, contract);
+          const computed = await runDerivedOperation(
+            context,
+            contract.name,
+            () => compareBundles(left.value, right.value, input.record_pairs),
+          );
+          if (!computed.ok)
+            return server.delivery.toCallToolResult(computed, contract);
+          const comparison = computed.value;
+          const sourceRecords = [
+            ...new Map(
+              [...left.value.records, ...right.value.records].map((record) => [
+                record.evidence_id,
+                record,
+              ]),
+            ).values(),
+          ];
+          const recordedSources = recordSessionEvidenceSources(
+            (evidence) => session.recordEvidence(evidence),
+            sourceRecords,
+          );
+          if (!recordedSources.ok)
+            return server.delivery.toCallToolResult(recordedSources, contract);
+          const evidence = createEvidence(
+            undefined,
+            BUNDLE_COMPARISON_PROVIDER,
+            {
+              predicateType: "rea.bundle-comparison",
+              operation: contract.name,
+              parameters: {
+                left_bundle_sha256: comparison.left_bundle_sha256,
+                right_bundle_sha256: comparison.right_bundle_sha256,
+                record_pairs: input.record_pairs,
+              },
+              result: jsonValueSchema.parse(comparison),
+              confidence: "derived",
+              authority: "analyst-inference",
+              limitations: comparison.limitations,
+              evidenceLinks: sourceRecords.map(
+                ({ evidence_id }) => evidence_id,
+              ),
+            },
+          );
+          const recorded = session.recordEvidence(evidence);
+          return server.delivery.toEvidenceToolResult(
+            evidence,
+            contract,
+            recorded,
+          );
         },
-        result: jsonValueSchema.parse(comparison),
-        confidence: "derived",
-        authority: "analyst-inference",
-        limitations: comparison.limitations,
-      });
-      const recorded = session.recordEvidence(evidence);
-      return toCallToolResult(recorded.ok ? ok(evidence) : recorded, contract);
-    },
+      ),
   );
 };

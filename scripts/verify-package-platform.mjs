@@ -8,14 +8,7 @@ export async function verifyPackagePlatform({ cli, environment }) {
       ["analyze", process.execPath, "--json"],
       environment,
     );
-    const unsupported = json(unsupportedExecution.stdout);
-    if (
-      unsupportedExecution.status !== 1 ||
-      unsupported.details?.failure_code !== "unsupported_hopper_build"
-    )
-      throw new Error(
-        `packaged Linux Hopper verification did not fail closed: ${JSON.stringify(unsupported)}`,
-      );
+    assertLinuxPackageProviderFailure(unsupportedExecution);
   } else {
     const overview = json(
       await run(cli, ["analyze", process.execPath, "--json"], environment),
@@ -28,23 +21,11 @@ export async function verifyPackagePlatform({ cli, environment }) {
         `packaged Hopper-backed analyze CLI failed: ${JSON.stringify(overview)}`,
       );
     const inspected = json(
-      await run(
-        cli,
-        [
-          "inspect",
-          process.execPath,
-          "--detail",
-          "detailed",
-          "--limit",
-          "1",
-          "--json",
-        ],
-        environment,
-      ),
+      await run(cli, ["inspect", process.execPath, "--json"], environment),
     );
     if (
       inspected.operation !== "binary_overview" ||
-      inspected.normalized_result?.detail !== "detailed"
+      inspected.normalized_result?.procedure_count < 1
     )
       throw new Error("packaged inspect CLI failed");
     const functionResult = json(
@@ -85,3 +66,30 @@ export async function verifyPackagePlatform({ cli, environment }) {
       throw new Error(`packaged trace CLI failed: ${JSON.stringify(trace)}`);
   }
 }
+
+/** Require the declared unsupported build or an exact missing-Xvfb diagnostic, never arbitrary provider failure. */
+export const assertLinuxPackageProviderFailure = (execution) => {
+  const failure = json(execution.stdout);
+  const details = failure?.details;
+  const diagnostic = details?.diagnostics;
+  const unsupportedBuild =
+    details?.failure_code === "unsupported_hopper_build" &&
+    details.exit_code === 72;
+  const missingDisplayDependency =
+    details?.failure_code === "runtime_dependency_unavailable" &&
+    details.exit_code === 79 &&
+    diagnostic?.component === "hopper_private_display" &&
+    diagnostic.operation === "probe" &&
+    diagnostic.reason === "missing_xvfb" &&
+    diagnostic.status === "error" &&
+    diagnostic.failure_code === "runtime_dependency_unavailable" &&
+    diagnostic.strategy === "unavailable";
+  if (
+    execution.status !== 1 ||
+    failure?.code !== "provider_unavailable" ||
+    (!unsupportedBuild && !missingDisplayDependency)
+  )
+    throw new Error(
+      `packaged Linux Hopper verification did not fail closed: ${JSON.stringify(failure)}`,
+    );
+};

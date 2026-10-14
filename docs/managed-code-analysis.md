@@ -1,128 +1,301 @@
-# Managed-code analysis plan
+# Managed-code analysis
 
-This document turns
-[ADR-0003](adr/0003-managed-code-evidence-and-provider-boundary.md) into an
-implementation and verification plan. REA currently ships read-only PE/CLI
-triage and exact identity through `inspect_managed_artifact` and
-`rea inspect-managed-artifact`, plus bounded metadata, signature, method-body
-CIL, exception-region, call-edge, and field-access inspection through
-`inspect_managed_members` and `rea inspect-managed-members`, and
-declared ModuleRef/ImplMap/PInvoke and native implementation boundary inventory
-through `inspect_managed_native_boundaries` and
-`rea inspect-managed-native-boundaries`, plus obfuscation-resistant member
-comparison through `compare_managed_members` and `rea compare-managed-members`,
-managed/native export or function Evidence matching through
-`verify_managed_native_boundaries` and `rea verify-managed-native-boundaries`,
-decompiler reconstruction import through `import_managed_reconstruction` and
-`rea import-managed-reconstruction`, and default-disabled runtime-correlation
-admission planning through `plan_managed_runtime_correlation` and
-`rea plan-managed-runtime-correlation`, plus static managed graph projection
-through `project_managed_application_graph` and
-`rea project-managed-application-graph`. Native-body bridge mapping and runtime
-execution remain planned behavior. The current product inventory remains the
-one in [`product-catalog.json`](product-catalog.json).
+REA inspects .NET PE/CLI artifacts without loading or executing their code.
+It can identify an assembly, inspect metadata and CIL, compare members across
+builds, and connect declared native calls to supplied native-analysis evidence.
+CIL is Common Intermediate Language, the instruction format used by managed
+assemblies.
+
+The seven shipped tools are:
+
+| Task                                                                        | MCP tool                            |
+| --------------------------------------------------------------------------- | ----------------------------------- |
+| Identify an artifact and its managed deployment form                        | `inspect_managed_artifact`          |
+| Inspect types, signatures, method bodies, calls, and field access           | `inspect_managed_members`           |
+| List declared native calls and native implementation indicators             | `inspect_managed_native_boundaries` |
+| Compare members across builds and map build-local tokens                    | `compare_managed_members`           |
+| Check native call declarations against supplied export or function evidence | `verify_managed_native_boundaries`  |
+| Import decompiled code against verified static member identities            | `import_managed_reconstruction`     |
+| Add managed findings to an application graph                                | `project_managed_application_graph` |
+
+Each has a matching CLI command: replace underscores with hyphens and prefix
+the name with `rea`, for example `rea inspect-managed-artifact`.
+Native-body bridge mapping and managed runtime execution are outside the
+current tool set.
+
+The canonical tool inventory is the
+[build-generated catalog](mcp-contracts.md#generated-catalog).
+
+## Inspect an assembly
+
+```bash
+rea inspect-managed-artifact /absolute/path/Assembly.dll --json
+rea inspect-managed-members /absolute/path/Assembly.dll --json
+```
+
+Use the artifact result to identify the assembly and its metadata coverage.
+Member results retain build-local tokens, signatures, CIL bodies, and decoded
+relationships. Use an exact reported `full_name` with `--type` when a focused
+inspection is needed; see [selected member inspection](#selected-member-inspection).
+Compare separate builds with [member comparison](#member-comparison), preserving
+their paths, digests, and selection scope.
+
+### Metadata overview and retained rows
+
+The existing CLI and omitted/complete MCP detail return complete metadata
+inventories. For identity and classification questions, select
+`inspect_managed_artifact` with
+`{"path":"/absolute/path/Assembly.dll","detail":"summary"}` on the first call.
+This keeps the complete source in the session and returns a distinct linked
+`inspect_analysis_view` overview with complete PE/CLI, classification and its
+evidence, metadata status, module/MVID, assembly, frameworks, returned-row counts,
+coverage/issues and limitations. No assembly is loaded or executed.
+
+Use `normalized_result.parent_evidence_id` to page original rows:
+
+```json
+{
+  "source": {
+    "kind": "retained-evidence",
+    "evidence_id": "<parent_evidence_id>"
+  },
+  "view": {
+    "kind": "managed",
+    "collection": "attributes",
+    "offset": 0,
+    "limit": 16
+  }
+}
+```
+
+Collections are `references`, `resources` and `attributes`; rows retain their
+original values, nulls, order, metadata tokens and offsets. Pages retain source
+metadata status and coverage. Exhaustion covers the returned parent collection,
+not all possible metadata, and empty rows under partial/unavailable metadata do
+not establish absence. Tokens are build-local and require the recorded artifact
+SHA-256 and known module MVID for cross-observation matching.
+
+Retained views do not repeat the parser or require the source file to remain
+available. Portable views use the authenticated original Evidence inline,
+including the existing `inspect-analysis-view` CLI. Session record lifetime and
+export/import semantics remain unchanged. A server without Evidence retention
+rejects selected summary before analysis; complete delivery remains available.
+
+## Shipped scope
+
+The canonical parser admits PE/CLI bytes and their metadata/CIL without loading
+an assembly. It reports observed implementation markers and unavailable facts;
+it does not unpack .NET single-file hosts, decode IL2CPP metadata, or infer a
+NativeAOT identity from an ordinary native PE. Inputs without admitted CLI
+metadata do not become managed assemblies through naming or routing guesses.
+Inspect separately obtained components explicitly and preserve their identities.
+
+A valid implementation marker establishes a candidate native boundary, not
+recovered native semantics or runtime behavior.
+
+An assembly targeting [.NET Standard](https://learn.microsoft.com/en-us/dotnet/standard/net-standard)
+declares API compatibility across multiple .NET implementations. REA preserves
+that target in `target_frameworks` and leaves `runtime_family` as `unknown`
+unless independent markers identify a runtime family, such as a ReadyToRun
+signature.
+
+### Resource admission
+
+The static provider admits regular input files up to 128 MiB before retaining
+their bytes. Reads remain bounded if a file grows after admission. Metadata,
+CIL decoding, and projected inspection records have a separate conservative
+64 MiB representation budget; shared heap strings are cached, but repeated
+output occurrences still consume that budget. These are inspection resource
+policies, not PE format limits or a hard bound on total V8 heap use.
+
+Path-based member comparison uses the same per-input snapshot policy and
+inspects its two selected paths sequentially, retaining each inspection rather
+than both full byte snapshots. The limit therefore remains a per-file resource
+admission rule, not an aggregate comparison limit. Comparison Evidence keeps
+the caller-selected paths as its parameters and artifact locations.
+
+Input overflow returns a resource constraint. Decode or projection overflow
+reports `resource-limit` with unavailable or partial coverage; omitted facts do
+not become empty observations. Ambiguous PE section mappings are rejected
+rather than interpreted according to section order.
+
+### Selected member inspection
+
+When whole-assembly member decoding reaches the representation budget, select
+known declaring types before their signatures and CIL bodies are decoded:
+
+```bash
+rea inspect-managed-members /absolute/path/Assembly.dll --type Example.Parser
+```
+
+MCP uses `inspect_managed_members` with
+`{"path":"/absolute/path/Assembly.dll","type_names":["Example.Parser"]}`.
+Repeat `--type` or supply multiple unique `type_names` for several types.
+Names match the reported `full_name` exactly. Top-level names are namespace
+qualified; nested types currently report bare names, which can select several
+types with that name.
+
+The result preserves the requested names in `selection.type_names` and reports
+unmatched names separately. If metadata names are unreadable, limitations retain
+that uncertainty. With no selection, `selection` is null and whole-assembly
+inspection keeps its existing resource policy. Selection restricts types,
+fields, methods, call edges and field accesses; member references remain an
+assembly-wide inventory, so output size is not guaranteed to be small.
+
+Coverage describes the selected members. Comparisons leave members outside the
+opposite observation's selection unknown, and application graphs report their
+selected scope as partial. Neither makes an absence claim about the whole
+assembly. Older member Evidence without `selection` remains readable.
 
 ## Analysis objective
 
-REA's managed-code track is intended to answer five different questions without
-collapsing them:
+Start by identifying the artifact with `inspect_managed_artifact`, then inspect
+its types and CIL with `inspect_managed_members`. Use [member comparison](#member-comparison)
+for another build, and [managed/native boundary rules](#managed-native-boundaries)
+when matching declared native calls to supplied native Evidence. Static inspection
+does not load or execute the assembly. Reconstructed structure and unresolved
+native/runtime questions retain their own authority and coverage.
 
-1. What exact artifact and managed deployment form is this?
-2. What do its admitted metadata and CIL bytes state?
-3. What source-like or behavioral structure can be reconstructed or inferred?
-4. Which findings survive an exact-build check or a cross-build structural
-   comparison?
-5. Which remaining questions require native analysis or a separately
-   authorized runtime experiment?
+## Member comparison
 
-The ordinary workflow ends at question four. Static analysis never loads or
-executes the target.
+Names and semantic labels do not establish durable member identity. Comparison
+preserves observed differences, structural inferences, and unknowns separately.
 
-## Classification workflow
+Cross-version matching first prefers exact CIL/signature identity. When that
+does not match, it pairs an exact declared type, method name, and raw signature
+before trying structural body shape. The exact-signature key uses names only
+as part of that full tuple; names alone never select a pair. Duplicate tuples
+remain ambiguous rather than being paired by token order. Fields follow the
+same exact tiers. The raw signature is exact whether or not REA decoded it, so
+undecoded signatures pair by that tuple too, but they never enter structural
+rounds. An unmatched member is therefore reported as `unknown`, not added or
+removed, when its own signature was not decoded or when the other side has an
+unpaired member, one-sided or ambiguous, with the same declared type and name
+whose signature was not decoded.
 
-Classification proceeds from the outermost authenticated bytes inward:
+For a matched method, an unavailable or partial body makes body-shape facets
+unknown while preserving observed signature differences. Structural identity
+compares normalized signatures, the limited decoded-CIL tuple fingerprint,
+constants, and bounded shape context. It reports all candidates at the winning
+score and remains ambiguous when the evidence does not distinguish them. The
+digest does not itself remap metadata tokens.
 
-```text
-source path
-  -> canonical path, size, SHA-256
-  -> container inventory
-  -> PE/native header and architecture
-  -> CLI header and metadata root
-  -> deployment/runtime markers
-  -> per-component and per-method implementation availability
-  -> managed-only, native-only, composed, degraded, or unsupported route
-```
+Tokens are always remapped through observed structure. A caller cannot carry
+`0x06001234` into a new MVID and assume it names the same method.
 
-The result is a vector rather than one label. For example, a single-file modern
-.NET deployment can contain a native host, ordinary CIL assemblies, and
-ReadyToRun components. Each component receives its own digest, classification,
-coverage, and route while retaining the outer bundle commitment.
+## NativeAOT metadata recovery
 
-| Case                  | Required positive observations                                               | Claims that remain unavailable or inferred                                                |
-| --------------------- | ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| .NET Framework        | Valid CLI metadata plus bounded Framework-specific target/reference evidence | Exact installed CLR and runtime behavior                                                  |
-| Modern .NET           | Valid CLI metadata plus bounded target/reference/runtime-config evidence     | Exact runtime selected on another host                                                    |
-| Unity Mono            | Valid managed assembly plus authenticated Unity context when supplied        | Engine behavior or native integration not represented by metadata                         |
-| ReadyToRun            | Valid managed metadata plus authenticated ReadyToRun header/sections         | Native implementation semantics until a selected deep provider analyzes them              |
-| C++/CLI               | Valid CLI metadata plus mixed-mode PE/header evidence                        | Mapping managed declarations to native implementations without explicit bridge evidence   |
-| Single-file           | Valid authenticated bundle inventory and component extents                   | Components that are compressed or encoded by an unsupported bundle version                |
-| Unity IL2CPP          | Authenticated native image/metadata pairing and supported metadata version   | Canonical CIL and source-equivalent C#                                                    |
-| NativeAOT             | Native image plus bounded NativeAOT evidence                                 | Ordinary CLI metadata/CIL unless independently present                                    |
-| Obfuscated assembly   | Same positive byte observations as its underlying deployment form            | Meaning inferred only from names                                                          |
-| Malformed/unsupported | Exact admitted regions and failure locations                                 | Completeness, successfully skipped rows, or semantics beyond the admitted parser boundary |
+NativeAOT removes the ordinary CIL method bodies, so a CIL decompiler cannot
+reconstruct those bodies as C# source. The executable remains a native target
+for Hopper or Ghidra, where decompilation produces pseudocode and analyst
+inference. This is a different route from ordinary managed member inspection.
+
+NativeAOT is not limited to Windows `.exe` files. The native image can be PE,
+ELF, or Mach-O, and NativeAOT can also publish shared libraries (PE DLL, ELF
+`.so`, or Mach-O `.dylib`) with explicitly exported entry points. Identify the
+image from its bytes and loader metadata, not its filename extension. When the
+image is inside an application bundle, inventory or extract the bundle first
+and carry the component identity into native analysis. Matching PDB, ELF debug,
+or dSYM sidecars can add symbol evidence when the selected provider supports
+them; verify their identity and keep them separate from observations made from
+the executable itself. [Microsoft's NativeAOT overview](https://learn.microsoft.com/en-us/dotnet/core/deploying/native-aot/)
+lists supported OS/architecture targets and deployment limitations, while its
+[native library guide](https://learn.microsoft.com/en-us/dotnet/core/deploying/native-aot/libraries)
+describes exported shared-library entry points.
+
+REA offers a built-in read-only snapshot parser for x64 PE/RTR 9.1 metadata and
+an optional Linux headless Ghidra adapter for annotations and broader recovery.
+The adapter requires a locally built `REA_GHIDRA_NATIVEAOT_JAR`; REA does not
+install it or its toolchain. The [NativeAOT guide](ghidra-nativeaot.md) defines
+these routes, their layout/host restrictions, derived-memory provenance, and
+verification coverage.
+
+REA's experimental Windows Ghidra boundary admits native x86 and x86-64 PE
+applications and DLLs for static analysis. This does not establish Windows
+NativeAOT metadata-recovery coverage.
+
+For NativeAOT analysis, preserve the selected native artifact's path and digest
+and report recovered type data with its returned provenance. Linking those types
+to native function addresses requires verified
+provider evidence; names or vtable similarity alone do not prove that a native
+function implements a specific managed method.
+
+<div id="managed-native-boundaries"></div>
+
+## Managed/native boundary rules
+
+`verify_managed_native_boundaries` compares declared P/Invoke module and entry
+point identities with supplied native export or function evidence. Name/module
+matches establish declaration links; they do not establish that a call executed.
+
+Metadata tokens are not native addresses. Native body mapping for C++/CLI,
+ReadyToRun, NativeAOT, and IL2CPP requires separately verified format and provider
+support. The managed static tools do not recover those mappings. The optional
+[Ghidra NativeAOT extension](ghidra-nativeaot.md) has its own supported boundary.
+
+Declared import inventory supports a bounded positive claim. Its absence does
+not exclude dynamic resolution, generated code, protected code, native helpers,
+or server-side behavior.
 
 ## Evidence record shape
 
-Every planned operation returns a provider result and Evidence with four
-commitment groups:
+Member comparison, application graph projection, and managed/native verification
+authenticate supplied inspection Evidence and check that any subject SHA-256
+matches the normalized artifact SHA-256. A valid Evidence ID alone does not
+establish that those two identities agree. Evidence without a subject remains
+usable, with no subject digest available to cross-check.
 
-### Artifact commitment
+Artifact inspection returns the selected path, byte length and SHA-256, observed
+PE/CLI classification, assembly and module identities, and metadata coverage.
+Member inspection binds build-local tokens, signatures, row offsets, method
+bodies, and decoded relationships to that artifact and MVID. Missing or malformed
+facts remain explicit in coverage and per-member status.
 
-- canonical local path, byte length, and SHA-256;
-- outer-container identity and digest when inspecting a component;
-- component name/path, byte extent, and SHA-256;
-- observed PE machine, CLI flags, and conflicts;
-- classification vector, supporting observations, and unresolved dimensions.
+Metadata table streams may carry the CLR-compatible `ExtraData` extension
+(`HeapSizes` flag `0x40`), which Microsoft readers honor although it is not
+specified by ECMA-335. REA skips its fixed four-byte word after the row counts
+before decoding table rows; the word's value is not a length. An incomplete
+word is reported as a metadata coverage failure at its file offset, without
+reading beyond the declared table stream.
 
-### Module commitment
+For unoptimized `#-` metadata, nonempty `FieldPtr` and `MethodPtr` tables
+translate TypeDef list positions to physical member definitions. REA resolves
+these indirections for member ownership and local attribute-constructor types;
+field and method tokens still identify the original definition rows.
+`field_list` and `method_list` retain the metadata's list coordinates, which
+refer to the pointer table when present rather than necessarily contiguous
+definition rows. Malformed or ambiguous pointers leave the owner unknown with
+partial coverage while preserving readable member and attribute facts.
+The retained inverse indexes are admitted against the existing representation
+budget before allocation.
 
-- assembly simple name, version, culture, public-key/token state, flags, and
-  hash algorithm;
-- module name, generation, and MVID;
-- target framework and runtime/version strings with their exact metadata
-  locations;
-- parser/provider version, profile schema, limits, and profile digest.
+`exported_types` reports ExportedType rows as declared. Facade assemblies such
+as .NET `System.Runtime.dll` provide their types this way: `forwarder: true`
+marks a type forwarder, and `implementation_token` names the AssemblyRef, File,
+or enclosing ExportedType row that implements it. REA does not load the
+implementing assembly to resolve the forwarded definition, and
+`compare_managed_members` does not compare exported types. Member Evidence
+recorded before this field existed reads back with `exported_types: null`,
+which means the table was not examined.
 
-CLI `#GUID` heap values are committed as their exact 16-byte GUID text. REA
-does not impose RFC 4122 UUID version or variant bits on MVID, EncId, or
-EncBaseId because ECMA-335 metadata does not require those bit patterns.
+CLI `#GUID` heap values retain their exact 16-byte GUID text. REA does not impose
+RFC 4122 UUID version or variant bits on MVID, EncId, or EncBaseId because
+ECMA-335 metadata does not require those bit patterns. Tokens and RVAs are
+build-local coordinates, not durable cross-build identities or native addresses.
 
-### Entity commitment
-
-- table kind and build-local token;
-- declaring scope and normalized CLI signature;
-- row/heap/body locations expressed as typed file offsets, RVAs, or CIL
-  offsets;
-- exact raw bytes or bounded value digest;
-- raw CIL digest plus separately reported method-header, locals-token, and
-  exception-region observations where available;
-- a deterministic v1 decoded-instruction-tuple digest for completely decoded
-  CIL, with the limitations below.
-
-### Shipped decoded-CIL fingerprint v1
+## Decoded-CIL fingerprint
 
 `inspect_managed_members` exposes two method CIL hashes with different byte
 boundaries:
 
-| Field                  | Shipped v1 input                                                                                          | Excluded from the digest                                                                                                                                      |
+| Field                  | Input                                                                                                     | Excluded from the digest                                                                                                                                      |
 | ---------------------- | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `il_sha256`            | The exact `il_size` raw CIL bytes after the tiny or fat method header                                     | Method header, locals signature blob, alignment, and extra sections including exception clauses                                                               |
 | `normalized_il_sha256` | UTF-8 `JSON.stringify` output for the instruction-order array of `[opcode, operand_kind, operand]` tuples | Instruction offsets except projected scalar branch targets, switch targets, resolved metadata/string identities, method header, locals, and exception regions |
 
 The normalized field is available only when the entire CIL stream decodes with
-status `present`. A partial, malformed, absent, or over-limit body reports
-`null`. The containing member result's `schema_version: 1` scopes the tuple
-format; v1 does not expose a separate algorithm-version field.
+status `present`. A malformed or absent body reports `null`. The tuple format
+is defined here.
 
 Tuple operands use these exact projections:
 
@@ -134,133 +307,33 @@ Tuple operands use these exact projections:
 - signed integer and variable operands: decimal strings; floating-point
   operands: JavaScript's `String` representation of the decoded IEEE value.
 
-Opcode names retain short/long forms and prefix opcodes. This makes v1 a
+Opcode names retain short/long forms and prefix opcodes. This makes the value a
 reproducible decoded-tuple fingerprint, not a canonical semantic CIL identity:
 it does not resolve tokens across MVIDs, does not commit full control flow or
 exception semantics, and does not replace the raw CIL digest. Cross-build
 comparison uses the value only as one unique-only structural tier and reports
-ambiguity when that evidence is insufficient. A future normalized-CIL v2 must
-have an explicit algorithm version, canonical token/literal identities,
-complete branch and switch targets, and explicit locals/exception semantics.
+ambiguity when that evidence is insufficient.
 
 For example, a decoded `nop; ret` body serializes exactly as
-`[["nop","none",null],["ret","none",null]]` and has v1 digest
+`[["nop","none",null],["ret","none",null]]` and has digest
 `5e5fad7741cb44bca3a4f045546b7449990da343f612f5f34c0ca30e9eee0636`.
 This vector specifies the tuple order, `null` handling, absence of whitespace,
 UTF-8 encoding, and lowercase hexadecimal output.
 
-### Epistemic commitment
-
-- authority: static bytes, reconstruction, structural inference, independent
-  validation, native provider, or separately authorized runtime;
-- state: observed, inferred, unknown, or unavailable;
-- confidence independent of authority;
-- coverage and admitted/dropped counts;
-- exact supporting Evidence IDs and actionable limitations.
-
-A semantic label such as `score_submission_gate` can annotate an entity, but it
-is never the entity's identity. The same applies to an obfuscated name, token,
-RVA, or decompiler-generated local name.
-
-## Planned static capabilities
-
-The caller-visible grouping and exact tool names are decided with the contracts
-that implement them. The underlying capability slices are:
-
-1. **Triage and inventory**: container/component classification, assembly and
-   module identity, references, files, exported types, resources, attributes,
-   and runtime markers.
-2. **Member inventory**: bounded types, methods, fields, properties, events,
-   interfaces, nesting, generics, and normalized signatures.
-3. **Method inspection**: headers, max stack, locals, CIL instructions,
-   constants, metadata operands, exception regions, and implementation flags.
-4. **Relationships**: declared overrides, interface implementations, member
-   references, direct CIL callers/callees, field access, construction, and
-   interop declarations. Dynamic dispatch remains qualified.
-5. **Structural search and comparison**: signature/API/constant/flow anchors,
-   exact and normalized hashes, competing candidates, and explicit
-   exact/structural/missing/ambiguous states.
-6. **Managed/native composition**: P/Invoke, unmanaged exports, COM/mixed-mode
-   declarations, ReadyToRun/native bodies, single-file hosts, and authenticated
-   IL2CPP pairs linked to selected Hopper/Ghidra evidence. The shipped
-   verification workflow checks P/Invoke declarations against supplied native
-   export or function Evidence; native-body, thunk, and token-to-address bridge
-   mapping remain unavailable without explicit provider-supported evidence.
-7. **Application graph projection**: managed assembly/module/type/method/field,
-   P/Invoke, and native-implementation declarations enter the same
-   Evidence-backed application graph vocabulary as JavaScript/Electron
-   findings while preserving managed static-analysis authority.
-
-Every list has a deterministic order and hard limits. Search exposes scanned,
-matched, returned, and dropped counts. An unresolved indirect call or a failed
-signature decode is not silently omitted from a completeness claim.
-
-## Obfuscation-resistant method slices
-
-Names are one weak feature among many. A behavior slice records the smallest
-bounded set of observations needed to investigate a proposition:
-
-- normalized declaring/member signatures and inheritance/interface shape;
-- framework and application API references;
-- exact strings, numeric constants, enum-like values, and serialization keys;
-- branch, switch, exception, loop, call, and field-flow shape;
-- construction and generic-instantiation sites;
-- raw CIL and decoded-tuple-v1 commitments, plus separate header, locals, and
-  exception observations;
-- callers, callees, shared fields, and competing candidates; and
-- limitations from reflection, dynamic dispatch, generated code, protection,
-  native transitions, or incomplete coverage.
-
-The workflow produces separate observation, inference, validation, and unknown
-tables. It may say that a method is a strong candidate for a role; it cannot
-turn that role into the method's durable identity.
-
-Cross-version matching is two-stage:
-
-1. Exact identity requires compatible artifact/module commitments and exact
-   raw CIL identity; v1 does not expose a standalone complete-method-body
-   digest.
-2. Structural identity compares schema-versioned signatures, the limited v1
-   decoded-CIL tuple fingerprint, constants, and bounded shape context. It
-   reports all candidates at the winning score and remains ambiguous when the
-   evidence does not distinguish them. The v1 digest does not itself remap
-   metadata tokens.
-
-Tokens are always remapped through observed structure. A caller cannot carry
-`0x06001234` into a new MVID and assume it names the same method.
-
-## Managed/native boundary rules
-
-| Boundary                | Managed observation                                                     | Native observation                                                               | Permitted link                                                       |
-| ----------------------- | ----------------------------------------------------------------------- | -------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
-| P/Invoke                | Module, entry point, charset/calling-convention flags, declaring method | Import/export/symbol/function evidence from the selected deep provider           | Exact declared-name/module link or qualified resolution inference    |
-| COM                     | Interop attributes, GUIDs, imported interfaces, method signatures       | Native registration/vtable evidence when independently available                 | Identifier/signature inference with explicit environment limitations |
-| C++/CLI                 | Managed declaration and implementation flags                            | Native body/function evidence                                                    | Only a provider-supported bridge observation; never token-as-address |
-| ReadyToRun              | Component/header and per-method CIL/native availability                 | Native section/function evidence                                                 | Authenticated image mapping with format/profile version              |
-| Unmanaged export        | Export metadata/attribute when present                                  | PE export and native thunk/function                                              | Exact export identity plus provider-qualified address                |
-| Single-file host        | Bundle entry/component identity                                         | Host and native component evidence                                               | Outer bundle plus component digest/extent commitment                 |
-| Unity IL2CPP            | Supported metadata entity with authenticated pairing                    | Generated native function/type evidence                                          | Versioned IL2CPP mapping only; no invented CIL                       |
-| Runtime-resolved native | API/constant/data-flow candidate                                        | Loaded-module/symbol observation only under separate runtime execution authority | Static candidate remains inference until separately observed         |
-
-Declared import inventory supports a bounded positive claim. Its absence does
-not exclude dynamic resolution, generated code, protected code, native helpers,
-or server-side behavior.
-
 ## Tool and packaging boundary
 
 The production parser is REA-owned TypeScript and ships with the existing Node
-application. It is verified against the ECMA-335 format and independent pinned
-oracles but has no runtime dependency on them.
+application. Deterministic conformance uses source-owned byte-built PE/CLI
+fixtures and expected semantic facts. An optional real ILSpy lane runs only when
+its executable is explicitly supplied; the default lane does not establish
+independent pinned-oracle parity. Production inspection needs none of those tools.
 
-- `System.Reflection.Metadata` is the primary independent metadata/CIL oracle.
-- `ICSharpCode.Decompiler` and `ilspycmd` are reconstruction and differential
-  oracles. An admitted BYO reconstruction operation records its exact version
+- `ICSharpCode.Decompiler`/`ilspycmd` can supply reconstruction inference.
+  A BYO reconstruction import records the supplied version
   and remains non-canonical. When `REA_ILSPY_CMD_PATH` points to an absolute
   runnable `ilspycmd`, `verify:managed` runs a source-owned real ILSpy oracle
   and imports its C# output as reconstruction inference against exact static
   member Evidence.
-- dnlib and Mono.Cecil may increase differential coverage. Their mutation APIs
-  are not exposed or included in the production parsing boundary.
 - The package contains no .NET runtime, SDK, ILSpy installation, proprietary
   assembly, or compiled conformance fixture.
 - Setup never installs or upgrades those tools. Doctor may inspect an explicit
@@ -278,24 +351,15 @@ they do not claim that the REA application itself supports Windows. Native
 ReadyToRun, C++/CLI, NativeAOT, or IL2CPP coverage is additionally constrained
 by the selected Hopper/Ghidra host and format matrix.
 
-## Source-built conformance corpus
+## Conformance verification
 
-Fixture sources are intentionally small and behavior-focused. Build outputs
-are generated outside tracked fixture directories and must not remain after
-verification or packaging.
+The current lane uses source-owned byte-built fixtures and malformed-input
+regressions, with optional operator-supplied applications and ILSpy verification.
 
-| Corpus slice           | Required properties                                                                        |
-| ---------------------- | ------------------------------------------------------------------------------------------ |
-| Identity               | Assembly/module/version/culture/public key, references, attributes, resources, MVID        |
-| Signatures             | Nested/generic types, arrays, pointers, by-ref, function pointers where supported, varargs |
-| CIL                    | Short/long branches, switch, prefixes, constants, locals, calls, fields, boxing, tokens    |
-| Exceptions             | Catch, finally, fault/filter where the compiler/toolchain supports them                    |
-| Generated structure    | Async and iterator state machines, lambdas, closures, properties, events                   |
-| Interop                | P/Invoke flags, module/name mapping, managed/unmanaged implementation metadata             |
-| Architecture           | AnyCPU, preferred-32-bit where applicable, x86, x64                                        |
-| Obfuscation resistance | Unicode/meaningless/duplicate-looking names and structure-preserving renames               |
-| Cross-build comparison | At least two builds with changed MVID/token order/layout and known same/changed behaviors  |
-| Malformed/adversarial  | Truncated/overflowing headers, streams, tables, heaps, signatures, bodies, and EH sections |
+Run the deterministic lane with `npm run verify:managed`. See
+[testing](testing.md#real-toolchain-verification-lanes) for prerequisites and
+coverage. Generated outputs belong outside tracked fixture directories and must
+not remain after verification or packaging.
 
 Verification compares semantic facts, not decompiler text. It checks resource
 ceilings, deterministic ordering, complete cleanup, CLI/MCP parity, Evidence
@@ -327,7 +391,6 @@ absolute or relative to the manifest file. A compact manifest contains:
 
 ```json
 {
-  "schema_version": 1,
   "label": "operator-local osu!stable semantic slice",
   "target": {
     "path": "./osu!.exe",
@@ -373,10 +436,10 @@ Before evaluating methods, the verifier fails closed on target SHA-256, MVID,
 assembly name, runtime-family, and managed-architecture mismatches whenever the
 manifest supplies those fields. It then pages each declared MethodDef token
 directly by row, so selected methods do not need to appear in the first member
-page of a large application. `il_length` remains accepted as a legacy alias for
-`il_size`; optional `il_sha256` locks the exact raw CIL bytes in addition to
-REA's member-result-v1 decoded-instruction-tuple digest. That normalized field
-has the v1 limits documented above and is not a complete semantic CIL identity.
+page of a large application. Optional `il_sha256` locks the exact raw CIL bytes
+in addition to REA's decoded-instruction-tuple digest. That normalized field
+has the byte boundaries documented above and is not a complete semantic CIL
+identity.
 
 The optional `application_graph` block reuses those exact-build method
 commitments. For each referenced MethodDef token, the verifier builds a bounded
@@ -398,49 +461,18 @@ The benchmark may prove that REA reproduces selected facts for that exact local
 build. It cannot establish general support on its own; source-built conformance
 remains the admission requirement.
 
-## Runtime admission boundary
+## Runtime behavior boundary
 
-The later runtime track is not an extension flag on a static operation. Its
-design must expose whether it attaches to an existing process, launches a new
-process, loads an assembly, uses reflection, installs a debugger/profiler, or
-instruments code. Each effect needs separate approval and exact-build checks.
+Managed inspection does not execute assemblies or observe CLR internals.
+Questions about actual behavior remain unknown until supported runtime
+evidence is collected. A direct process capture can retain declared inputs,
+outputs, filesystem and protocol activity for a target run; it does not prove
+which managed methods executed or how the CLR resolved them.
 
-At minimum, admission requires target SHA-256, MVID, normalized signature and
-body/CIL commitment, CLR family, OS, architecture, tool version, scenario
-limits, output policy, and cleanup ownership to match. Any mismatch fails before
-the experiment. It must not contact real services/accounts or claim that an
-instrumented path represents an ordinary launch unless that proposition is
-independently tested.
+## Method metadata during build comparison
 
-The shipped `plan_managed_runtime_correlation` path admits only a
-default-disabled, permission-gated experiment plan and records that no target
-code was executed. Until a separate executor is designed and shipped, runtime
-behavior questions remain explicit unknowns with suggested probes; static
-support does not perform them.
-
-## Delivery sequence
-
-The managed-code track advances as reviewable pull requests:
-
-1. accepted evidence/provider boundary (this document and ADR);
-2. read-only artifact triage and exact identity (shipped);
-3. bounded metadata, signatures, method bodies, raw CIL hashes, and the limited
-   decoded-instruction-tuple fingerprint v1 (shipped; normalized-CIL v2
-   semantics remain planned);
-4. obfuscation-resistant slices and cross-version comparison (shipped for
-   static member observations);
-5. decompiler reconstruction import (shipped as analyst inference; REA does
-   not run ILSpy/dnSpy, and metadata/CIL remain canonical);
-6. managed/native composition and truthful deployment degradation (declaration
-   inventory and native export/function Evidence matching shipped; native-body
-   bridge mapping remains planned);
-7. source-built managed conformance and package/CLI verification (source-owned
-   PE/CLI corpus shipped through `npm run verify:managed`; optional BYO
-   `ilspycmd` real-tool oracle shipped through `REA_ILSPY_CMD_PATH`; dnSpy and
-   pinned Windows checks remain planned); and
-8. separately authorized runtime-correlation admission planning (shipped; no
-   runtime execution);
-9. managed static Evidence projection into the application graph (shipped).
-
-Each implementation PR updates generated product facts only for behavior it
-actually ships and states which real-tool checks were performed.
+Managed member comparisons report a `metadata` dimension when an observed
+MethodDef flags or implementation flags value differs, including accessibility
+or synchronization changes. This is separate from the CIL/signature matching
+tiers: identical instructions do not establish unchanged method metadata. The
+reported difference is static metadata evidence, not proof of runtime behavior.

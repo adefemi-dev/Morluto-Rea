@@ -1,4 +1,4 @@
-import type { WebPageInspection } from "./browserObservation.js";
+import type { WebPageInspection } from "./browserObservationSchemas.js";
 import {
   webBundleAnalysisSchema,
   type WebBundleAnalysis,
@@ -17,18 +17,20 @@ export const buildWebBundleAnalysis = (
   const unavailable = inspection.scripts.items
     .filter((script) => !script.source.included)
     .map(({ script_key }) => script_key);
+  const omittedScripts = captureBudgetOmission(inspection, "scripts");
+  const omittedSourceMaps =
+    sourceMaps.status === "not_requested"
+      ? undefined
+      : captureBudgetOmission(inspection, "source_maps");
   const sourceMapIncomplete =
     sourceMaps.status === "partial" || sourceMaps.status === "unavailable";
   const partial =
     accumulator.parseFailures > 0 ||
     unavailable.length > 0 ||
-    sourceMapIncomplete;
-  const truncated =
-    accumulator.astLimitReached ||
-    accumulator.droppedFindings > 0 ||
-    sourceMaps.status === "truncated";
+    sourceMapIncomplete ||
+    omittedScripts !== undefined ||
+    omittedSourceMaps !== undefined;
   return webBundleAnalysisSchema.parse({
-    schema_version: 1,
     capture: buildCaptureObservation(inspection, sourceScripts),
     observations: {
       chunks: {
@@ -46,14 +48,14 @@ export const buildWebBundleAnalysis = (
       unavailable,
       parseFailures: accumulator.parseFailures,
       sourceMaps,
+      omittedScripts,
+      omittedSourceMaps,
     }),
     completeness: buildCompleteness({
-      truncated,
       partial,
       parsedScripts: accumulator.parsedScripts,
       parseFailures: accumulator.parseFailures,
       visitedNodes: accumulator.visitedNodes,
-      droppedFindings: accumulator.droppedFindings,
     }),
     limitations: bundleLimitations(),
   });
@@ -90,15 +92,26 @@ interface UnknownsInput {
   readonly unavailable: string[];
   readonly parseFailures: number;
   readonly sourceMaps: WebBundleAnalysis["observations"]["source_maps"];
+  readonly omittedScripts: number | null | undefined;
+  readonly omittedSourceMaps: number | null | undefined;
 }
 
 const buildUnknowns = (input: UnknownsInput): WebBundleAnalysis["unknowns"] => [
+  ...(input.omittedScripts === undefined
+    ? []
+    : [
+        {
+          dimension: "script_inventory",
+          reason: captureBudgetReason("script records", input.omittedScripts),
+          affected_script_keys: [],
+        },
+      ]),
   ...(input.unavailable.length === 0
     ? []
     : [
         {
           dimension: "script_source" as const,
-          reason: "Source artifact was not captured within approved limits",
+          reason: "Source artifact was not captured",
           affected_script_keys: input.unavailable,
         },
       ]),
@@ -113,6 +126,18 @@ const buildUnknowns = (input: UnknownsInput): WebBundleAnalysis["unknowns"] => [
           ),
         },
       ]),
+  ...(input.omittedSourceMaps === undefined
+    ? []
+    : [
+        {
+          dimension: "source_maps" as const,
+          reason: captureBudgetReason(
+            "source-map declarations",
+            input.omittedSourceMaps,
+          ),
+          affected_script_keys: [],
+        },
+      ]),
   ...(input.sourceMaps.status === "not_requested" ||
   input.sourceMaps.status === "included"
     ? []
@@ -120,42 +145,49 @@ const buildUnknowns = (input: UnknownsInput): WebBundleAnalysis["unknowns"] => [
         {
           dimension: "source_maps" as const,
           reason:
-            input.sourceMaps.status === "truncated"
-              ? "Source-map evidence was truncated by approved limits"
-              : "One or more requested source maps were unavailable or incomplete",
-          affected_script_keys: [
-            ...new Set([
-              ...input.sourceMaps.items
-                .filter(({ status }) => status !== "included")
-                .map(({ script_key }) => script_key),
-              ...input.sourceMaps.dropped_script_keys,
-            ]),
-          ].sort(),
+            input.sourceMaps.limitation ??
+            "One or more requested source maps were unavailable or incomplete",
+          affected_script_keys: input.sourceMaps.items
+            .filter(({ status }) => status !== "included")
+            .map(({ script_key }) => script_key)
+            .sort(),
         },
       ]),
 ];
 
+const captureBudgetOmission = (
+  inspection: WebPageInspection,
+  section: "scripts" | "source_maps",
+): number | null | undefined => {
+  const exclusions = inspection.completeness.excluded.filter(
+    (exclusion) =>
+      exclusion.section === section &&
+      exclusion.reason === "resource_budget_exhausted",
+  );
+  if (exclusions.length === 0) return undefined;
+  if (exclusions.some(({ count }) => count === null)) return null;
+  return exclusions.reduce((sum, { count }) => sum + (count ?? 0), 0);
+};
+
+const captureBudgetReason = (label: string, count: number | null): string =>
+  count === null
+    ? `Capture omitted an unknown number of ${label} because its resource budget was exhausted.`
+    : `Capture omitted ${String(count)} ${label} because its resource budget was exhausted.`;
+
 interface CompletenessInput {
-  readonly truncated: boolean;
   readonly partial: boolean;
   readonly parsedScripts: number;
   readonly parseFailures: number;
   readonly visitedNodes: number;
-  readonly droppedFindings: number;
 }
 
 const buildCompleteness = (
   input: CompletenessInput,
 ): WebBundleAnalysis["completeness"] => ({
-  status: input.truncated
-    ? "truncated"
-    : input.partial
-      ? "partial"
-      : "complete_within_limits",
+  status: input.partial ? "partial" : "complete",
   parsed_scripts: input.parsedScripts,
   parse_failures: input.parseFailures,
   visited_ast_nodes: input.visitedNodes,
-  dropped_findings: input.droppedFindings,
 });
 
 const bundleLimitations = (): WebBundleAnalysis["limitations"] => [

@@ -1,23 +1,24 @@
 #!/usr/bin/env node
 
+import { snapshotEnvironment } from "./process/snapshotEnvironment.js";
 import { pathToFileURL } from "node:url";
 import { realpathSync } from "node:fs";
 
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 
-import { parseConfig } from "./config.js";
-import { createBinarySession } from "./application/runtime.js";
+import { parseConfig } from "./config/parseConfig.js";
+import { createBinarySession } from "./composition/binary.js";
 import { createLogger } from "./logger.js";
-import { projectAnalysisError } from "./domain/errors.js";
-import { loadConfiguredPermissionAuthority } from "./application/PermissionConfiguration.js";
-import { CdpBrowserProvider } from "./browser/CdpBrowserProvider.js";
-import { CdpElectronProvider } from "./browser/CdpElectronProvider.js";
+import { projectAnalysisError } from "./domain/analysisErrorProjection.js";
 import type { RuntimeDependencies } from "./main/types.js";
 import { SERVER_START_FAILED } from "./main/messages.js";
-import { createRuntimeState } from "./main/state.js";
 import { openInitialTarget } from "./main/startup.js";
 import { startMcpTransport } from "./main/transport.js";
-import { registerConfigReload } from "./main/reload.js";
+import {
+  createOptionalObservationFactories,
+  loadOptionalObservationProviders,
+} from "./composition/optionalObservationProviders.js";
+import { createToolResultDelivery } from "./server/toolResult.js";
 import { createShutdown } from "./main/shutdown.js";
 
 const runtimeDependencies = (): RuntimeDependencies => ({
@@ -39,10 +40,6 @@ const runtimeDependencies = (): RuntimeDependencies => ({
       process.stdin.off("close", handler);
     };
   },
-  registerReload: (handler) => {
-    process.on("SIGHUP", handler);
-    return () => process.off("SIGHUP", handler);
-  },
 });
 
 /**
@@ -53,26 +50,15 @@ const runtimeDependencies = (): RuntimeDependencies => ({
 export const run = async (
   dependencies: RuntimeDependencies = runtimeDependencies(),
 ): Promise<number> => {
-  const config = parseConfig(dependencies.env);
+  const environment = snapshotEnvironment(dependencies.env);
+  const config = parseConfig(environment);
   if (!config.ok) {
     dependencies.writeStderr(`${projectAnalysisError(config.error).message}\n`);
     return 1;
   }
   const logger = createLogger("mcp", config.value.logLevel);
   const serverLogger = logger.child({ layer: "server" });
-  const permissionAuthority = await loadConfiguredPermissionAuthority(
-    config.value,
-  );
-  if (!permissionAuthority.ok) {
-    dependencies.writeStderr(
-      `${projectAnalysisError(permissionAuthority.error).message}\n`,
-    );
-    return 1;
-  }
-
-  const session = createBinarySession(config.value, logger);
-  const browserObservation = new CdpBrowserProvider();
-  const electronObservation = new CdpElectronProvider();
+  const session = createBinarySession(config.value, logger, environment);
   const opened = await openInitialTarget(
     session,
     config.value,
@@ -80,28 +66,24 @@ export const run = async (
     dependencies.writeStderr,
   );
   if (!opened.ok) return opened.exitCode;
-  const runtimeState = createRuntimeState(config.value);
   const transport = await startMcpTransport(dependencies, session, {
     logger,
     serverLogger,
-    browserObservation,
-    electronObservation,
-    permissionAuthority: permissionAuthority.value,
-    runtimeState,
+    environment,
+    delivery: createToolResultDelivery(config.value.mcpMaxResponseBytes),
+    loadOptionalProviders:
+      dependencies.loadOptionalProviders ??
+      (() =>
+        loadOptionalObservationProviders(
+          createOptionalObservationFactories(environment),
+        )),
   });
   if (!transport.ok) return 1;
-  const unregisterReload = registerConfigReload({
-    dependencies,
-    permissionAuthority: permissionAuthority.value,
-    runtimeState,
-    liveServers: transport.liveServers,
-    serverLogger,
-  });
   createShutdown({
     handle: transport.handle,
+    closeAndroid: transport.closeAndroid,
+    closeOptionalProviders: transport.closeOptionalProviders,
     session,
-    permissionAuthority: permissionAuthority.value,
-    unregisterReload,
     dependencies,
     serverLogger,
   });
@@ -118,7 +100,10 @@ export const runEntrypoint = async (
 ): Promise<void> => {
   try {
     setExitCode(await start());
-  } catch {
+  } catch (cause: unknown) {
+    // Intentionally redact the startup cause from caller-visible output;
+    // unexpected failures must not leak internal details.
+    void cause;
     writeStderr(`${SERVER_START_FAILED}\n`);
     setExitCode(1);
   }

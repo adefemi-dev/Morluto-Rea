@@ -1,111 +1,90 @@
 # Repository Guidelines
 
-## Product Direction
+## Product and Authority
 
-REA exposes reverse-engineering tools through a CLI and MCP server. Hopper and the bring-your-own Ghidra adapter are operation-capable deep binary-analysis providers. Ghidra is supported on Linux x64 and has an experimental Windows x64 P0 boundary for approved native x86-64 PE applications; it supplies admitted read-only inventory and function-analysis operations but no GUI or mutation authority. Keep provider-specific code out of the domain and application layers.
+REA is a local-only reverse-engineering tool with shared CLI/MCP workflows. Distinguish observations, derivations, inferences, and unknowns; preserve Evidence provenance and session semantics through both adapters. Provider support and setup live in [README.md](README.md#choosing-a-deep-analysis-provider) and its linked guides.
 
-Prioritize:
+Follow the [contribution scope and fail-closed integration rule](CONTRIBUTING.md#contribution-scope). Do not integrate capabilities while material scope, authority, side-effect, or required verification questions remain unresolved. For new providers or capabilities involving target execution, injection, mutation, or protection recovery, seek the required maintainer scope decision before substantial implementation for integration. Welcome early proposals, small exploratory prototypes, and draft PRs that help resolve questions; they do not authorize integration.
 
-- tool results that distinguish observations, inferences, and unknowns;
-- equivalent behavior through the CLI and MCP;
-- additive, idempotent configuration with backups;
-- end-to-end tests for packaged artifacts and real Hopper/Ghidra claims.
+Ghidra uses ephemeral databases without modifying executable bytes or controlling a GUI; Windows Ghidra P0 has no mutation authority. IDA analysis is read-only; never save or close an attached GUI database.
 
-Installers must not install or upgrade Homebrew, Node.js, npm, Java, Ghidra, or other unrelated software. Ghidra is bring-your-own. `rea setup` must print its planned changes and require approval before writing files or installing Hopper.
+Configuration changes must be additive and idempotent, with backups. Installers must not install or upgrade unrelated software, including Homebrew, Node.js, npm, Java, or Ghidra. Ghidra and IDA are bring-your-own. `rea setup` must show its planned changes and require approval before writing files or installing Hopper.
 
-REA is a local-only tool; do not sanitize actionable local diagnostics such as artifact paths, digests, mismatch locations, or analysis metadata, while continuing to redact genuine secrets such as credentials and authorization headers.
+Preserve caller-selected inputs and local evidence, including output, URLs, paths, digests, and metadata. Redact transport authentication credentials and explicitly marked sensitive values; do not infer secrecy from names or text patterns. Do not persist the ambient environment merely because a child inherits it.
 
-## Project Structure & Module Organization
+## Architecture and Cleanup
 
-REA is a layered ESM TypeScript application. Dependencies flow inward: `domain` underlies `contracts` and the shared `process` primitives; providers depend on those layers, followed by `application`, `server`, and the entry adapters.
+Dependencies flow inward: domain semantics and contracts, provider adapters, shared application workflows, then CLI/MCP adapters. Keep engine protocols and provider-specific code out of domain/application layers. See [docs/architecture.mermaid](docs/architecture.mermaid) when changing composition.
 
-See [docs/architecture.mermaid](docs/architecture.mermaid) for a visual architecture diagram.
+Give each interpretation and resource a clear owner. Consumers must use that owner's parsed facts rather than reinterpret raw source. Preserve identity, omission, uncertainty, and source evidence across boundaries. Retain ownership of resources whose cleanup failed. Reuse `src/process/` supervision and identity primitives; a PID and executable path alone do not establish ownership after exit or reuse.
 
-- `scripts/rea.mjs`: executable dispatcher. Routes only bare `mcp` and `--mcp` to the production stdio server; Incur handles registration utilities and one-shot commands.
-- `src/main.ts`: MCP adapter. Parses config, wires the shared session runtime, starts stdio transport, and owns process-lifetime shutdown.
-- `src/cli.ts`: one-shot CLI adapter for setup, diagnostics, analysis, and decompilation.
-- `src/config.ts`: Zod-validated parsing of environment configuration into `AppConfig`.
-- `src/domain/`: pure, side-effect-free modules. `errors.ts` owns the tagged error algebra; `result.ts` owns `Result`/`ok`/`err`; `hopperValues.ts` owns shared function-dossier values plus Hopper boundary parsers; `symbolAnalysis.ts` parses Swift/ObjC names; `javascriptApplicationGraph.ts` validates and canonically commits the provider-neutral JavaScript Application Graph; `javascriptStaticAnalysis.ts` performs bounded AST-only JavaScript structure recovery.
-- `src/contracts/`: caller-visible tool schemas and catalog metadata; `toolContracts.ts` owns the canonical inventory and `enhancedInputs.ts` owns enhanced input parsing.
-- `src/process/`: provider-neutral process ownership and lifecycle primitives. It owns private runtime roots, absolute startup deadlines, correlated request waits, bounded output capture, and TERM-to-KILL cleanup without defining any provider wire protocol.
-- `src/replay/`: Linux x64 controlled-JavaScript-replay adapter. It owns exact runtime closure inspection, Bubblewrap/seccomp/cgroup admission, the disposable worker, strict parent/worker protocol validation, and complete cleanup observation.
-- `src/browser/`: loopback CDP discovery, bounded WebSocket transport, exact-origin target authorization, and passive browser observation normalization.
-- `src/hopper/`: Hopper launch and Unix-socket protocol mechanics. `BridgeLauncher.ts` spawns the Hopper app with the in-process bridge, `HopperClient.ts` correlates request/response over the socket with timeouts and cancellation, `protocol.ts` frames bridge messages.
-- `bridge/hopper_bridge.py`: runs inside Hopper and adapts declared operations to Hopper's public Python API. Hopper's bundled MCP server is not used.
-- `src/ghidra/`: exact Ghidra 12.1.2/JDK 21 inspection, analysis-profile commitment, digest-bound target snapshots, isolated `analyzeHeadless` launch, authenticated Unix-socket or Windows loopback transport, bounded serial request queue, and strict inventory/function boundaries.
-- `src/dotnet/`: execution-free managed PE/CLI inspection. It owns bounded PE, CLI metadata, heap, table, and resource parsing for `rea-dotnet-static`; it must never load, reflect, execute, decompile, or resolve target assemblies.
-- `bridge/ghidra/ReaGhidraBridge.java`: packaged read-only `HeadlessScript` loaded through Ghidra's `scriptPath`; it owns the persistent decompiler and adapts admitted inventory, function, reference, and CFG operations to public Ghidra APIs.
-- `src/application/`: shared CLI/MCP session composition, setup and diagnostics, and enhanced workflows. `AnalysisProviderRegistry` discovers overlapping deep candidates without starting them; `SessionProviderRouter` binds one candidate per target and composes it with disjoint auxiliary providers; `JavaScriptArtifactReconstruction.ts` safely projects local directories/ASARs and inert bundle syntax into the application graph without adding a caller-visible tool yet.
-- `src/server/`: MCP request translation. `createServer.ts` assembles the MCP server, `registerOfficialTools.ts`/`registerEnhancedTools.ts` register each tool set, `toolResult.ts` maps `Result` values to MCP content.
-- `docs/product-catalog.json`: generated package, tool-family, provider, setup-client, schema-version, and CLI facts. Regenerate it from source; do not edit it by hand.
-- `tests/`: Vitest suite. `tests/fixtures/` holds reusable provider-process fixtures, source-owned synthetic JavaScript graph and Electron/Webpack/Rspack artifact trees, and the fake launcher, Hopper bridge, and CDP seams.
-- `scripts/verify-real-hopper.mjs`: real-Hopper end-to-end verifier.
-- `scripts/verify-real-ghidra.mjs`: real Linux Ghidra verifier for x86-64 debug/stripped ELF, AArch64 ELF, PE, and Mach-O function semantics plus complete cleanup.
-- `scripts/verify-real-ghidra-windows.mjs`: real Windows x64 Ghidra P0 verifier for the source-owned native PE fixture, all 18 admitted operations, digest linkage, loopback transport, and cleanup.
-- `scripts/verify-real-browser.mjs`: real Chrome end-to-end verifier for the passive CDP provider.
-- `scripts/print-mcp-config.mjs`: prints an MCP server config with absolute paths filled in (`npm run config:print -- /path/to/binary`).
+Keep proof of ownership separate from validity, editability, and readiness. Malformed owned data may still be safely removable. Unresolved identity or applicability must remain unknown rather than be treated as absent, foreign, or aligned.
 
-## Build, Test, and Development Commands
+Assess brittleness in touched code during implementation, debugging, review, and maintenance. Fix the producing representation or ownership rule before adding downstream repairs. Normalize once at the owning boundary using format-aware parsers. Remove superseded representations, aliases, wrappers, and redundant tests after verifying affected consumers. Introduce abstractions only when they remove observed complexity.
 
-- `npm ci`: install exact lockfile dependencies.
-- `npm run deps:check`: verify that installed direct dependency versions match the root lockfile; on failure, run `npm ci`, then retry.
-- `npm run build`: compile `src/` into `dist/`.
-- `npm test`: build, then run the Vitest suite once.
-- `npm run typecheck`: run strict TypeScript checks without emitting files.
-- `npm run lint`: apply oxlint rules (complexity, max-lines, unused vars, and TypeScript-specific checks).
-- `npm run lint:fix`: auto-fix oxlint violations where possible.
-- `npm run format:check`: verify Prettier formatting.
-- `npm run check`: run typecheck, lint, format:check, generated-document freshness checks, and tests.
-- `npm run knip`: detect unused files, dependencies, and exports.
-- `npm run jscpd`: detect duplicate code blocks.
-- `npm run scan:todos`: scan for TODO, FIXME, and HACK markers.
-- `npm run verify:hopper`: build and run the real-Hopper verifier with two distinct binaries.
-- `npm run verify:ghidra`: build and run the real-Ghidra verifier against `GHIDRA_INSTALL_DIR` and optional `GHIDRA_TARGET_PATH`.
-- `npm run verify:ghidra:windows`: build and run the real Windows Ghidra verifier against `GHIDRA_INSTALL_DIR` and the source-owned x64 PE fixture.
-- `npm run verify:browser`: build and run the real Chrome verifier against `REA_BROWSER_EXECUTABLE` or a platform-default Chrome-family executable.
-- `npm run verify:managed`: build and run the source-owned managed PE/CLI conformance verifier for artifact triage, member inspection, managed/native boundary declarations, token drift comparison, malformed metadata, non-managed degradation, managed application-graph projection, manifest-verifier self-test, and optional BYO ILSpy oracle checks; set `REA_MANAGED_APP_MANIFEST_PATH` to verify an operator-local managed app manifest, including optional graph/trace assertions, and set `REA_ILSPY_CMD_PATH` to an absolute `ilspycmd` path to run the real ILSpy reconstruction oracle.
-- `npm run verify:replay`: build and run the real Linux Bubblewrap/seccomp/cgroup verifier against source-owned replay fixtures; set `REA_REPLAY_INPUT_PATH` to verify an operator-local manifest.
-- `npm run verify:package`: pack and test the CLI, setup transaction, skill, and canonical target-free MCP catalog in an isolated environment.
-- `npm run docs:generate`: generate API documentation from JSDoc comments into `docs/api/` using TypeDoc.
-- `npm run docs:check`: verify generated package metadata, the canonical product catalog, caller-visible documentation facts, TypeDoc output, and the error JSON schema without rewriting them.
-- `npm run config:print -- /path/to/binary`: print an MCP server config with absolute paths.
-- `HOPPER_TARGET_PATH=/path/to/binary npm start`: launch Hopper and run the built stdio MCP server.
+When fixing a bug, inspect the producing boundary and affected consumers for duplicated interpretation or unclear ownership. Complete any directly related refactor in the same change and remove superseded code. Passing regression tests alone does not establish that the brittleness is resolved. If related cleanup remains, explain what remains and why.
 
-Pre-commit hooks via Husky run `oxlint` on staged files before every commit. Use `npm run lint:fix` to auto-correct violations locally.
+When addressing a review thread, inspect the producing boundary and affected consumers for brittleness. Complete directly related refactoring in the same change. Before resolving the thread, explain the root cause, structural fix, validation, and any remaining cleanup.
 
-## Configuration & Environment Variables
+Parse unknown boundary values and model expected failures with the tagged error algebra and `Result`. Preserve partial facts and meaningful failure reasons. Keep identity and lookup values separate from display formatting; preserve source values and explicit unknowns when normalization loses information. Absolute paths, file URLs, and HTTP paths have different semantics.
 
-- `REA_ANALYSIS_PROVIDER` (optional, default `auto`): require one deep-analysis provider ID for startup and one-shot commands, or use deterministic automatic selection. A request-level `provider_id`/`--provider` takes precedence.
-- `GHIDRA_INSTALL_DIR` (optional): absolute root of an extracted official Ghidra 12.1.2 distribution. The adapter supports Linux x64 and the experimental Windows x64 P0 boundary documented in `docs/windows-ghidra-p0.md`.
-- `JAVA_HOME` (optional): absolute 64-bit full JDK 21 root used by Ghidra. When absent, doctor probes `java`/`javac` from `PATH`.
-- `REA_ILSPY_CMD_PATH` (optional): absolute path to a bring-your-own `ilspycmd`; doctor reports its configured version, and `verify:managed` can use it as a real reconstruction oracle without making ILSpy a setup-installed dependency or canonical parser.
-- `HOPPER_TARGET_PATH` (optional): absolute initial binary or `.hop` target. Target-free MCP sessions use `open_binary` instead.
-- `HOPPER_LAUNCHER_PATH` (optional): override the Hopper executable path (defaults to `/Applications/Hopper Disassembler.app/Contents/MacOS/hopper`).
-- `HOPPER_TARGET_KIND` (optional, default `executable`): startup kind for `HOPPER_TARGET_PATH`; dynamic targets are classified from their paths and headers.
-- `HOPPER_LOADER_ARGS_JSON` (optional): JSON array overriding derived Hopper loader arguments for supported executable targets, e.g. `["-l","Mach-O","--aarch64"]`.
-- `REA_BROWSER_OBSERVE_ENABLED` (optional, default `false`): add browser observation authority to the administrator ceiling.
-- `REA_BROWSER_CDP_ENDPOINTS_JSON` (optional): approved literal loopback CDP HTTP endpoints.
-- `REA_BROWSER_ALLOWED_ORIGINS_JSON` (optional): exact HTTP(S) page origins approved for passive observation.
-- `REA_ELECTRON_OBSERVE_ENABLED` (optional, default `false`): add passive Electron file-page observation authority to the administrator ceiling.
-- `REA_ELECTRON_CDP_ENDPOINTS_JSON` (optional): approved literal loopback Electron CDP HTTP endpoints.
-- `REA_ELECTRON_FILE_ROOTS_JSON` (optional): canonical filesystem roots approved for passive Electron page observation.
-- `REA_INVESTIGATION_INPUT_ROOTS_JSON` (optional): canonical filesystem roots approved for static JavaScript/Electron application analysis and other investigation inputs.
-- `REA_JAVASCRIPT_REPLAY_ENABLED` (optional, default `false`): add controlled extracted-module execution authority to the administrator ceiling.
-- `REA_JAVASCRIPT_REPLAY_ROOTS_JSON` (optional): exact canonical source roots approved for controlled replay.
-- `REA_JAVASCRIPT_REPLAY_NODE_PATH`, `REA_JAVASCRIPT_REPLAY_BWRAP_PATH`, `REA_JAVASCRIPT_REPLAY_SYSTEMD_RUN_PATH`, `REA_JAVASCRIPT_REPLAY_SYSTEMCTL_PATH`, and `REA_JAVASCRIPT_REPLAY_SHELL_PATH` (optional): absolute paths committed by each replay plan; defaults target the current Node runtime and standard Linux system executables.
+Validate advertised JSON Schemas after SDK conversion against their declared dialect and actual clients. Bind handlers to named contracts with exact types; catalog ordering must never select an operation or schema.
 
-## Coding Style & Naming Conventions
+## Performance
 
-Use ESM TypeScript, two-space indentation, and Prettier defaults. Keep compiler strictness intact (`strict`, `exactOptionalPropertyTypes`, `noUncheckedIndexedAccess`, `verbatimModuleSyntax`). Use `camelCase` for values/functions, `PascalCase` for classes/types, and `UPPER_SNAKE_CASE` for constants. Parse unknown values at every MCP, environment, and subprocess boundary. Avoid `any`, unchecked casts, non-null assertions, import-time I/O, and floating promises. Exported APIs require concise JSDoc. Model expected failures with the tagged error algebra and `Result`, not broad exception wrappers.
+Design analysis workflows and agent interfaces for efficiency from the first
+implementation. Correctness, useful answers, Evidence provenance, caller choices,
+compatibility and safe resource bounds remain required.
 
-## Testing Guidelines
+Optimize in this order:
 
-Name tests `*.test.ts`. Use Vitest and production seams (`tests/fixtures/`) rather than module mocks. Domain tests assert pure behavior; adapter tests use fake launcher/socket seams; MCP tests connect with the client SDK version pinned in `package.json`. Preserve the canonical tool inventory defined by `TOOL_CONTRACTS` and verified through `CATALOG_IDENTITY` and generated product metadata. Cover malformed input, cancellation, timeouts, process exit, concurrency, limits, and clean shutdown. Real Hopper, Ghidra, browser, JavaScript replay, managed conformance, and any real managed-tool claims cannot be replaced by mocks; use the corresponding `verify:*` command.
+1. Agent tokens and context. Return the smallest sufficient answer with
+   necessary provenance, coverage and limitations. Use task selection,
+   summaries, paging and retained Evidence where supported; honor requested
+   detail and keep complete Evidence accessible. Count the whole task,
+   including schemas, extra calls and retries.
+2. Analysis time. Reuse validated results and shared work. Cache keys must
+   cover result-affecting inputs; define invalidation and lifetime. Validate
+   freshness before reporting cached live state as current.
+3. CPU and memory. Avoid unnecessary work and copies; bound concurrency,
+   retained state and serialization growth.
 
-MCP tools are agent-computer interfaces. Optimize them first for successful agent use: distinct purposes, clear names and parameters, relevant result context, actionable errors, and realistic multi-step workflows. Validate tool-design changes with representative agent tasks and transcripts when possible; schema validity and transport success alone do not prove that a tool is easy for an agent to use.
+For changes affecting these costs, measure representative completed tasks and
+compare equivalent workflows before and after where available. Report token
+usage, elapsed time, CPU time and peak process-family memory. Separate cold
+and warm runs, label estimates, and state unmeasured costs. Fewer bytes alone
+do not establish fewer tokens or faster analysis.
 
-MCP tool catalogs must remain complete and self-describing. Prefer capability- and session-scoped tool advertisement over schema truncation. Never use serialized byte counts as a proxy for model-context cost, token use, tool usability, or agent performance. Measure bytes only when evaluating a named transport, storage, or protocol constraint. Any model-context or token-efficiency claim must identify the client and its actual model-facing projection and tokenizer, since clients may omit, transform, dereference, or otherwise reproject MCP schemas. Do not weaken names, descriptions, schemas, examples, errors, or result context to improve a byte-based metric.
+## Development
 
-## Commit & Pull Request Guidelines
+Use [.nvmrc](.nvmrc) and `package.json#packageManager` for the pinned toolchain. Cursor Cloud may place older Node.js first on `PATH`; environment setup installs the pinned toolchain under `/usr/local/bin`.
 
-Use Conventional Commit subjects because Release Please derives versions and changelogs from them. Examples: `feat: add historical source import`, `fix(process): stop timers after exit`, and `docs: update architecture`. Use `!` or a `BREAKING CHANGE:` footer for breaking changes. Pull request titles must follow the same format because squash merges use the title as the release commit. Pull requests should describe contract or behavior changes, list verification commands, link issues, and include sanitized MCP examples when schemas change. State whether real Hopper/Ghidra verification was performed. Never commit binaries, Hopper or Ghidra project documents, credentials, `dist/`, `node_modules/`, or local planning artifacts (e.g. `.codex/`).
+- `npm ci`: install locked dependencies.
+- `npm run build:cached`: build the runtime and packaged skill.
+- `npm run test:local -- PATH...`: source tests without building.
+- `npm run test:focused -- PATH...`: exact tests with their required artifacts.
+- `npm run check:fast`: cached typecheck/lint and the pre-push check.
+- `npm run docs:check`: validate generated documentation.
+
+Use relevant checks for the change. The complete local gate, `npm run check:pr`, is optional for broad changes or CI diagnosis. See [CONTRIBUTING.md](CONTRIBUTING.md) for development, generated-file ownership, and release conventions.
+
+`docs/public/product-catalog.json`, `docs/verification/managed-conformance-*.json`, and `skills/` are ignored outputs. Edit source contracts and `.agents/skills/reverse-engineer-anything/`, then regenerate as needed. `.cache/mcp-tool-catalog.json` is test metadata; runtime builds and source checking do not consume it. Never commit binaries, provider project documents, credentials, `dist/`, `node_modules/`, or local planning artifacts.
+
+## Tool and Test Changes
+
+For tool design, follow [docs/tool-design.md](docs/tool-design.md): start from the analyst question, reuse existing contracts, preserve caller choices, and return useful evidence inline. Limits must follow real format, protocol, authority, or resource constraints. Account for representation expansion before allocation; derive completeness from examined coverage.
+
+For test changes or provider claims, use [docs/testing.md](docs/testing.md). Prefer real public CLI/MCP workflows, then production-boundary integration, then producer goldens. Keep module tests for distinct semantics stronger workflows cannot reliably reproduce. Preserve malformed-input, cancellation, cleanup, permission, capacity, and target-identity coverage when pruning. Report unverified coverage explicitly; simulated providers do not establish real-provider behavior.
+
+Use Conventional Commit subjects and PR titles. Mark breaking changes with `!` or a `BREAKING CHANGE:` footer. Describe behavior changes, relevant validation, and real-provider verification scope.
+
+<!-- BEGIN:turborepo-agent-rules -->
+
+# This is NOT the Turborepo you know
+
+Turborepo configuration, task behavior, and CLI commands can vary between installed versions and may differ from your training data. Resolve the `turbo` package from this file's directory or relevant workspace; in monorepos, it may not be visible from the repository root. For example, run `node -p "require.resolve('turbo/package.json')"` from a workspace that depends on `turbo`.
+
+Read `docs/README.md` inside that installed package first, then read the relevant pages from its `docs/` directory before changing Turborepo configuration or commands. Heed deprecation notices. These bundled docs match the installed package version and are available without network access.
+
+This block is written and re-added by `turbo` before repository-scoped commands when an AI agent is detected. In the Turborepo source repository, its template is defined in `crates/turborepo-cli/src/cli/agent_guidance.rs`. Removing the managed block while updates are enabled means a later qualifying invocation will add it again. Set `"agentGuidance": false` in the root `turbo.json` or `turbo.jsonc` to opt out; this does not remove an existing block. Keep the block committed with your work to avoid an uncommitted change on the next agent invocation.
+<!-- END:turborepo-agent-rules -->

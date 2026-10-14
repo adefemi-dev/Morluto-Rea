@@ -6,11 +6,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
+import { execFileOutput } from "../process/ExecFileOutput.js";
+import {
+  downloadHopperPackage,
+  HOPPER_DOWNLOAD_BYTES,
+} from "./HopperDownload.js";
+
 const execFileAsync = promisify(execFile);
 const DOWNLOAD_PREFIX = "https://www.hopperapp.com:443/downloader/public/";
-const MAX_PACKAGE_BYTES = 100_000_000;
-const SUPPORTED_HOPPER_SHA256 =
-  "0294ced141cc373468ee22d8343e7dac41980cb05a937994ca81c9f09afe7ded";
+const SUPPORTED_HOPPER_SHA256 = new Set([
+  "0294ced141cc373468ee22d8343e7dac41980cb05a937994ca81c9f09afe7ded",
+  "1339f9e58377442b0c6fcb0dfc3cec20d593cc557408521fad9a00dbc6b8da13",
+]);
 interface LinuxHopperRelease {
   readonly filename: string;
   readonly file_length: string;
@@ -64,13 +71,23 @@ export const linuxHopperInstallDisclosure = (
   };
 };
 
-/** Parsed Linux distribution information used for support and package selection. */
-export interface LinuxDistribution {
+interface LinuxDistributionIdentity {
   readonly id: string;
   readonly versionId?: string;
-  readonly packageFamily: LinuxPackageFamily | undefined;
-  readonly supported: boolean;
 }
+
+/** Parsed Linux distribution information used for support and package selection. */
+export type LinuxDistribution = LinuxDistributionIdentity &
+  (
+    | {
+        readonly packageFamily: LinuxPackageFamily;
+        readonly supported: true;
+      }
+    | {
+        readonly packageFamily: LinuxPackageFamily | undefined;
+        readonly supported: false;
+      }
+  );
 
 /** Download response kept independent of Node's global fetch implementation. */
 export interface LinuxHopperDownload {
@@ -134,15 +151,20 @@ export const parseLinuxDistribution = (text: string): LinuxDistribution => {
   const versionId = fields.get("VERSION_ID");
   const packageFamily = packageFamilyFor(id, fields.get("ID_LIKE"));
   const supported =
-    id === "arch" ||
-    (id === "ubuntu" && versionAtLeast(versionId, 24)) ||
-    (id === "fedora" && versionAtLeast(versionId, 41));
-  return {
+    packageFamily !== undefined &&
+    (id === "arch" ||
+      id === "cachyos" ||
+      (id === "omarchy" && packageFamily === "arch") ||
+      (id === "ubuntu" && versionAtLeast(versionId, 24)) ||
+      (id === "fedora" && versionAtLeast(versionId, 41)) ||
+      (id === "nobara" && versionAtLeast(versionId, 44)));
+  const identity = {
     id,
     ...(versionId === undefined ? {} : { versionId }),
-    packageFamily,
-    supported,
   };
+  return supported
+    ? { ...identity, packageFamily, supported: true }
+    : { ...identity, packageFamily, supported: false };
 };
 
 /** Read and classify the current Linux distribution. */
@@ -151,14 +173,16 @@ export const readLinuxDistribution = async (): Promise<
 > => {
   try {
     return parseLinuxDistribution(await readFile("/etc/os-release", "utf8"));
-  } catch {
+  } catch (cause: unknown) {
+    // best-effort cleanup: optional host probing; unknown distribution means unsupported.
+    void cause;
     return undefined;
   }
 };
 
 /** Download, verify, install, and read back the official Hopper Linux package. */
 export const installLinuxHopper = async (
-  host: LinuxHopperInstallHost = systemLinuxHopperInstallHost(),
+  host: LinuxHopperInstallHost = systemLinuxHopperInstallHost(process.env),
   options: {
     readonly signal?: AbortSignal;
     readonly releases?: Readonly<
@@ -169,10 +193,7 @@ export const installLinuxHopper = async (
   if (options.signal?.aborted === true)
     return { status: "failed", reason: "cancelled" };
   const distribution = await host.distribution();
-  if (
-    distribution?.supported !== true ||
-    distribution.packageFamily === undefined
-  )
+  if (distribution?.supported !== true)
     return { status: "failed", reason: "unsupported_host" };
   let temporary: string | undefined;
   try {
@@ -209,31 +230,28 @@ export const installLinuxHopper = async (
 export const linuxHopperLauncherPath = (home: string): string =>
   join(home, ".local/share/rea/hopper/bin/Hopper");
 
-const systemLinuxHopperInstallHost = (): LinuxHopperInstallHost => ({
+/** Compose package-manager and linker checks from the selected caller environment. */
+export const systemLinuxHopperInstallHost = (
+  environment: Readonly<NodeJS.ProcessEnv>,
+): LinuxHopperInstallHost => ({
   distribution: readLinuxDistribution,
-  async download(url, options) {
-    const response = await fetch(url, {
-      headers: { accept: "application/json", "user-agent": "rea-installer" },
-      ...(options.signal === undefined ? {} : { signal: options.signal }),
-    });
-    return {
-      ok: response.ok,
-      bytes: new Uint8Array(await response.arrayBuffer()),
-    };
-  },
+  download: downloadHopperPackage,
   createTemporaryDirectory: () => mkdtemp(join(tmpdir(), "rea-hopper-")),
   writeArchive: (path, bytes) => writeFile(path, bytes, { mode: 0o600 }),
-  installPackage: installSystemPackage,
+  installPackage: (family, archive) =>
+    installSystemPackage(family, archive, environment),
   async launcherStatus(path) {
     try {
       await access(path);
-      const linked = await execFileAsync("ldd", [path]);
+      const linked = await execFileOutput("ldd", [path], { env: environment });
       if (!linuxSharedLibrariesAvailable(`${linked.stdout}\n${linked.stderr}`))
         return "runtime_dependencies";
       return (await linuxHopperBinarySupported(path))
         ? "ready"
         : "unsupported_hopper_build";
-    } catch {
+    } catch (cause: unknown) {
+      // best-effort cleanup: optional launcher probing; unreadable means missing.
+      void cause;
       return "missing";
     }
   },
@@ -247,11 +265,17 @@ export const linuxHopperBinarySupported = async (
   try {
     const hash = createHash("sha256");
     for await (const chunk of createReadStream(path)) hash.update(chunk);
-    return hash.digest("hex") === SUPPORTED_HOPPER_SHA256;
-  } catch {
+    return linuxHopperLauncherDigestSupported(hash.digest("hex"));
+  } catch (cause: unknown) {
+    // best-effort cleanup: optional build probing; unreadable means unsupported.
+    void cause;
     return false;
   }
 };
+
+/** Match a launcher extracted from one of the pinned official Linux packages. */
+export const linuxHopperLauncherDigestSupported = (digest: string): boolean =>
+  SUPPORTED_HOPPER_SHA256.has(digest);
 
 /** Interpret ldd output conservatively so a present but broken launcher is unhealthy. */
 export const linuxSharedLibrariesAvailable = (output: string): boolean =>
@@ -260,6 +284,7 @@ export const linuxSharedLibrariesAvailable = (output: string): boolean =>
 const installSystemPackage = async (
   family: LinuxPackageFamily,
   archive: string,
+  environment: Readonly<NodeJS.ProcessEnv>,
 ): Promise<boolean> => {
   try {
     for (const command of linuxPackageManagerCommands(
@@ -267,9 +292,13 @@ const installSystemPackage = async (
       archive,
       process.getuid?.() === 0,
     ))
-      await execFileAsync(command.executable, command.args);
+      await execFileAsync(command.executable, command.args, {
+        env: environment,
+      });
     return true;
-  } catch {
+  } catch (cause: unknown) {
+    // Package-manager failure is reported by the false return.
+    void cause;
     return false;
   }
 };
@@ -316,7 +345,7 @@ const packageIntegrityMatches = (
   release: LinuxHopperRelease,
 ): boolean =>
   bytes.byteLength === Number(release.file_length) &&
-  bytes.byteLength <= MAX_PACKAGE_BYTES &&
+  bytes.byteLength <= HOPPER_DOWNLOAD_BYTES &&
   createHash("sha1").update(bytes).digest("hex") === release.file_hash;
 
 const packageFamilyFor = (

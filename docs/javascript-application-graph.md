@@ -1,6 +1,6 @@
 # JavaScript Application Graph
 
-JavaScript Application Graph v1 is REA's provider-neutral domain model for
+JavaScript Application Graph is REA's provider-neutral domain model for
 connecting shipped application bytes, JavaScript structure, Electron process
 boundaries, passive browser observations, and native add-ons. It is a durable,
 canonical data contract; it is not an extractor or a new CLI/MCP tool.
@@ -32,13 +32,12 @@ adds capture-scoped targets, frames, scripts, workers, and inferred
 verification remains a separate later layer. The domain graph itself never
 reaches outward to obtain any of those facts.
 
-## Versioned record
+## Stored record
 
 A stored graph has this top-level shape:
 
 ```text
 schema: "JavaScriptApplicationGraph"
-schema_version: 1
 graph_id: jag_<sha256 of normalized graph semantics>
 root_node_ids: jag_node_<sha256>[]
 nodes: application entities with one or more observations
@@ -47,14 +46,14 @@ coverage: complete, partial, unknown, or unavailable
 limitations: explicit graph-wide constraints
 ```
 
-Parsing rejects unknown fields, unsupported versions, non-canonical ordering,
-duplicate IDs, stale semantic commitments, missing roots, dangling endpoints,
-self-edges, and `changed_from` edges between unlike node kinds. Constructors
-normalize set-like arrays before deriving their IDs.
+Parsing rejects unknown fields, non-canonical ordering, duplicate IDs, stale
+semantic commitments, missing roots, dangling endpoints, self-edges, and
+`changed_from` edges between unlike node kinds. Constructors normalize set-like
+arrays before deriving their IDs.
 
 ## Entities and relationships
 
-The v1 node vocabulary covers:
+The node vocabulary covers:
 
 - package, installer, and artifact;
 - ASAR entry;
@@ -73,6 +72,18 @@ The directed relation vocabulary is `contains`, `loads`, `imports`, `maps_to`,
 `exposes`, `sends`, `invokes`, `handles`, `calls`, `persists_to`, `observed_as`,
 and `changed_from`. Provider names are deliberately absent from both
 vocabularies.
+
+For a `maps_to` edge targeting a source-map node, the edge carries
+`resolved_path` and `declared_url_sha256`. The target node's reference
+observation carries that same digest and the exact `declared_url`; match the
+digest to select the URL belonging to that edge when several references share
+one physical source map. The full URL is kept out of node identity, display
+label, and edge properties, so large inline data URLs are stored once per
+source-map reference.
+
+Consumers previously reading `edge.properties.declared_url` should follow
+`target_node_id` and select the observation by `declared_url_sha256` instead.
+Node labels serve display; the observation preserves the original URL.
 
 For example, a source-owned synthetic fixture proves this path without using a
 third-party application:
@@ -98,7 +109,7 @@ correspondence is a separately identified cross-layer inference.
 Every observation and edge carries all of the following:
 
 - an authority, such as artifact bytes, AST analysis, static relationship
-  inference, passive CDP runtime, cross-layer reconciliation, controlled replay,
+  inference, passive CDP runtime, and cross-layer reconciliation,
   native analysis, historical reference, or user assertion;
 - an epistemic state: `observed`, `inferred`, `unknown`, or `unavailable`;
 - confidence independently bounded as exact, high, medium, low, or unknown;
@@ -107,7 +118,7 @@ Every observation and edge carries all of the following:
   location, or an unavailable reason;
 - extractor name, version, operation, and optional executable digest;
 - coverage status, truncation, omitted count, and named limits;
-- limitations and links to existing Evidence v2 records;
+- limitations and links to existing Evidence records;
 - a content-derived identifier and its declared stability strategy.
 
 Authority and epistemic state are separate fields. An AST observation does not
@@ -158,16 +169,12 @@ stability. Edge IDs use the same derivation with `relationship-exact`
 stability. Node, observation, edge, and graph IDs are recomputed during parsing,
 so callers cannot preserve a stale ID after changing semantic content.
 
-## Bounds
+## Structure
 
-The v1 boundary admits at most 1,000 roots, 100,000 nodes, 200,000 edges, and 64
-observations per node. Each properties object is valid bounded JSON with at most
-64 keys, depth 6, 512 structural nodes, and 4,096 characters per string. Arrays
-of evidence links, limits, and limitations have independent caps.
-
-These are admission limits, not completeness claims. When an extractor reaches
-a limit, it must record partial coverage and the exact named limit. It must not
-return a bounded prefix labeled complete.
+The graph does not impose aggregate caps on roots, nodes, edges, observations,
+or JSON properties. Properties must be valid JSON; field-specific validation
+still applies to paths, identifiers, and evidence values. Extractors report
+actual omissions in coverage instead of silently dropping a prefix.
 
 ## Domain API
 
@@ -184,7 +191,3 @@ The public domain functions are:
 - `serializeJavaScriptApplicationGraph` for canonical JSON;
 - `computeJavaScriptApplicationGraphSha256` for a byte-stable verified graph
   digest.
-
-Schema evolution is explicit. A future incompatible shape receives a new
-`schema_version`; v1 parsing fails with an unsupported-version diagnostic rather
-than guessing how to reinterpret it.

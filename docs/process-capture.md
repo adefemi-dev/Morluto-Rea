@@ -1,79 +1,182 @@
-# Process Capture v4
+# Process capture
 
-Process Capture records one approved command as deterministic Evidence. It is
-intended for authority-versus-reconstruction checks where terminal behavior,
-child lifetime, filesystem state, or dependency timing matters.
+Process Capture runs one caller-selected command and records bounded evidence
+about its terminal behavior, scheduled interactions, process lifetime, and
+selected filesystem state. Use it to compare two direct runs of the same
+scenario, such as an authority build and a reconstruction. It does not replay a
+previous execution or emulate dependencies.
 
-The harness records both raw PTY chunks and terminal states rendered by xterm.
-It also records scripted input, resize and signal delivery, sampled process
-metadata, named filesystem checkpoints, command-shim invocations, loopback
-HTTP/WebSocket exchanges, and process exit ownership. Missing or bounded
-observations remain explicit; a truncated capture is never treated as
-equivalent to another capture.
+The command runs with the current user's permissions and inherits the host
+environment before applying the scenario's explicit overrides. This is not a
+sandbox. Filesystem observation paths select what REA snapshots; they do not
+restrict what the process can read or write. The inherited environment is not
+recorded, so its influence may remain unknown.
 
-Every v4 capture includes a run manifest with canonical SHA-256 commitments for
-the secret-safe full scenario projection, comparison contract, executable,
-normalization rules, command-shim plan, and replay plan. The manifest also
-records the REA/provider versions, platform, architecture, PTY backend, and UTC
-start/completion timestamps. Capture creation, Evidence import, and comparison
-recompute the self-contained commitments and reject invalid lifecycle data.
+## Host support
 
-## Enable the capability
+Capturing a new scenario currently requires Linux or macOS and a working
+native PTY backend. Native Windows capture is unavailable because the PTY
+adapter does not yet verify descendant cleanup. The native Job Object controls
+used by other REA providers do not establish PTY capture support. Reinstalling
+the Windows PTY binary does not enable this workflow.
 
-Process execution is disabled until the operator supplies policy roots and
-approves host networking:
+For Linux commands, use Linux REA inside WSL. Adapt the scenario to that host;
+this does not establish capture of a native Windows process tree. Comparing
+existing capture Evidence through the CLI or MCP remains available on Windows
+and does not launch a PTY or the captured target.
 
-```bash
-export REA_PROCESS_CAPTURE_ENABLED=true
-export REA_PROCESS_EXECUTABLE_ROOTS_JSON='["/usr/bin","/absolute/project/bin"]'
-export REA_PROCESS_WORKING_ROOTS_JSON='["/absolute/project"]'
-export REA_PROCESS_ALLOWED_ENV_JSON='["PATH"]'
-export REA_PROCESS_ALLOW_EXTERNAL_NETWORK=true
-```
+On supported capture hosts, a missing or incompatible native PTY binary has a
+different recovery: reinstall REA for the active platform, architecture, and
+Node.js version with optional dependencies enabled. Capability diagnostics
+distinguish this from the Windows capture-adapter limitation.
 
-By default, enabling process capture also installs an administrator-lifetime
-grant for the configured boundary. Set
-`REA_PROCESS_CAPTURE_AUTO_GRANT=false` to install the same boundary only as an
-administrator ceiling. Captures then fail with a structured permission-required
-result until a narrower grant is established; this is the prerequisite mode for
-connection-scoped MCP elicitation. It does not itself authorize a capture.
-Each MCP connection owns its elicited once and session grants. A grant accepted
-on one connection is not visible to another connection, and disconnect cleanup
-removes only the grants owned by the connection that closed. Reloaded
-administrator ceilings and persisted grants still apply immediately to every
-live connection.
+macOS also requires Apple's Swift compiler through `xcrun` for process
+ownership inspection. REA compiles its packaged, narrow process-inspection
+helper into a private temporary directory before a capture or owned provider
+process starts; the same prerequisite applies to owned provider-process
+supervision on macOS. REA removes that directory when it exits. REA does not
+install Xcode, Command Line Tools, or other software. Capability checks prepare
+this helper before reporting macOS capture as available.
 
-REA offers the once-or-session grant form only after the connection negotiates
-an MCP revision with multi-round tool results and advertises form elicitation.
-Older connections keep returning the structured
-permission-required result and never wait for an unsupported elicitation
-response. The MCP SDK runtime currently pinned by REA negotiates the older
-protocol path, so the interactive flow remains fail-closed until its runtime
-protocol support is available.
+## Capture a command
 
-Every scenario must also contain `"approved": true`. Executables, working
-directories, filesystem roots, and requested environment variables are checked
-against operator policy before launch. Process Capture is an observation tool,
-not a security sandbox: the target runs with the current user's permissions.
-
-## Capture a scenario
-
-`rea capture-process` reads a JSON scenario and writes Process Capture v4
-Evidence to stdout:
-
-```bash
-rea capture-process ./scenario.json > capture.json
-```
-
-A representative scenario is:
+For a small first capture, save this as `scenario.json`:
 
 ```json
 {
-  "approved": true,
-  "executable": "/absolute/path/to/node",
+  "executable": "node",
+  "arguments": ["-e", "console.log('ready')"],
+  "timeout_ms": 5000
+}
+```
+
+Run the scenario through the CLI:
+
+```sh
+rea capture-process ./scenario.json --json > capture.json
+```
+
+`--json` is required when saving input for JSON consumers; the default terminal
+format is TOON. The file contains the complete capture Evidence record.
+Choose an output file distinct from the scenario input: shell redirection opens
+and truncates the output before REA reads the scenario.
+
+Read the result's terminal observations, exit/settlement status, and cleanup
+outcome. [Scenario and result details](#scenario-and-result-details) describe
+limits, normalization, filesystem coverage, and incomplete observations.
+
+## Compare two captures
+
+Compare saved capture Evidence with:
+
+```sh
+rea compare-process-captures authority.json reconstruction.json
+```
+
+The comparison checks terminal, interaction, exit, filesystem, and
+process observations under a shared comparison contract. It reports observed
+differences with their locations, while residual unknowns or truncated
+observations prevent a complete-equivalence claim. Matching scenario
+commitments do not reveal whether redacted sensitive inputs were equal.
+
+For scenarios where independent scheduling can change event order, the CLI
+also accepts an optional trace-specification JSON file as the third argument.
+That specification must state the exact events and ordering constraints to
+accept; it does not discard unmatched observations or make timestamps into
+causal evidence. Trace comparison returns `unknown` when a capture lacks the
+required complete event journal or contains relevant residual unknowns.
+
+Each capture carries commitments for the selected scenario, executable,
+comparison contract, and normalization rules. The comparison contract covers
+the working directory, explicit environment, filesystem observation paths,
+terminal size, scripted events, timeouts, limits, and normalization; the
+executable and its arguments may differ. Comparison rejects captures whose
+comparison contracts differ and names the differing fields, so run both
+scenarios from the same absolute working directory and observation paths.
+Captures are local Evidence files; keep
+their source artifacts and invocation context available when interpreting a
+difference.
+
+## Hash a report independently of terminal output
+
+Select the producer's report directory and give `file_bytes` enough room for
+the complete files you need, including other files in those roots. For example,
+save this scenario and run `rea capture-process ./scenario.json --json > capture.json`:
+
+```json
+{
+  "executable": "node",
+  "arguments": [
+    "-e",
+    "const fs=require('node:fs');fs.mkdirSync('reports',{recursive:true});fs.writeFileSync('reports/final.json',JSON.stringify({status:'complete',data:'X'.repeat(131072)}));console.log('x'.repeat(8192));"
+  ],
+  "working_directory": ".",
+  "filesystem_observation_paths": ["./reports"],
+  "limits": { "output_bytes": 1024, "file_bytes": 262144 }
+}
+```
+
+The report exceeds the terminal budget but fits the independent 256 KiB hash
+budget. Its complete SHA-256 appears in `normalized_result.files_after` at
+`root_0:final.json`; check `truncation_details.filesystem_after` for omissions
+and actual bytes hashed. The verbose terminal output is truncated without
+preventing the report digest. The same scenario object is the MCP
+`capture_process_scenario` input. REA never returns a prefix hash as a full-file
+digest: an insufficient remaining budget produces a null digest and an
+explicit omission reason.
+
+A digest binds the complete bytes observed at that checkpoint, not the
+producer's notion of a finished report. A stable periodic or running report
+can also have a complete digest. Choose the final file and verify the
+producer's documented completion marker, exit outcome and settlement
+observations before calling it final. `after_settlement` names a filesystem
+checkpoint, not a guarantee that an application finished successfully or
+that an unobserved writer will never change the file. REA checks opened-file
+identity/state around hashing and reports observed changes or unavailable
+files; cancellation stops the hash. If an external sealer produces a manifest,
+keep its completion claims and digest separate from REA's checkpoint facts.
+
+## Scenario and result details
+
+### Progress
+
+While the capture runs, REA writes live status to stderr as one JSON object per
+line. Stdout stays the final Evidence document:
+
+```json
+{
+  "rea_progress": {
+    "phase": "running",
+    "completed": 3,
+    "total": null,
+    "message": "elapsed_ms=1200 frames=1 samples=2 interactions=0",
+    "sequence": 4
+  }
+}
+```
+
+`phase` is the observed lifecycle stage: `prepare`, `running`, `settling`, or
+`cleanup`. `completed` counts collected terminal frames, process samples, and
+interaction events. `total` stays null; REA does not invent a unit total or a
+percentage. `message` reports elapsed time and those counts. The final line uses
+`phase` `cleanup`, sets `terminal` to true, and adds `disposition` (`exited`,
+`timeout`, `idle_timeout`, `cancelled`, or `failed`) plus the owned-process,
+renderer, and temporary-root cleanup states. Updates use the shared progress
+boundary and are limited to one intermediate line per 100 ms; the terminal line
+is always emitted. If a receiver is slow, intermediate observations are merged
+into the latest status, and stale live observations are discarded before final
+cleanup status. Progress never copies child output. Child output remains in the
+capture Evidence on stdout.
+
+### Scenario with interactions
+
+```json
+{
+  "executable": "node",
   "arguments": ["./signup.mjs"],
-  "working_directory": "/absolute/project",
-  "filesystem_roots": ["/absolute/project/state"],
+  "working_directory": ".",
+  "environment": { "APP_MODE": "test" },
+  "filesystem_observation_paths": ["./state"],
   "terminal": { "columns": 80, "rows": 24, "scrollback": 1000 },
   "events": [
     {
@@ -82,86 +185,283 @@ A representative scenario is:
       "data": "user@example.test\r",
       "sensitive": true
     },
-    { "type": "resize", "at_ms": 500, "columns": 100, "rows": 30 }
+    { "type": "resize", "at_ms": 500, "columns": 100, "rows": 30 },
+    { "type": "signal", "at_ms": 1000, "signal": "SIGINT" }
   ],
-  "checkpoints": [
-    {
-      "name": "signup_ready",
-      "trigger": { "type": "terminal_literal", "value": "All set!" }
-    },
-    { "name": "root_exited", "trigger": { "type": "root_exit" } }
-  ],
-  "command_shims": [
-    {
-      "name": "codex",
-      "routes": [
-        {
-          "arguments": ["--version"],
-          "outputs": [
-            { "at_ms": 0, "stream": "stdout", "data": "codex 1.2.3\n" }
-          ],
-          "termination": { "type": "exit", "code": 0 },
-          "max_calls": 1
-        }
-      ]
-    }
-  ]
+  "timeout_ms": 30000,
+  "idle_timeout_ms": 30000,
+  "settle_ms": 100
 }
 ```
 
-Input events marked `sensitive` are dispatched to the PTY but stored only as a
-byte-count placeholder. Environment values listed in `secret_aliases` are also
-redacted from recorded text. The command-shim directory is placed first in the
-captured process `PATH`; any remaining `PATH` must be explicitly supplied or
-inherited under operator policy.
+`executable` is required. `arguments`, `working_directory`, `environment`,
+`filesystem_observation_paths`, terminal settings, timed `events`, timeouts,
+resource limits, and normalization settings have defaults; see
+`processScenarioSchema` for the exact contract. Event times are milliseconds
+from launch, must be ordered, and must fall within `timeout_ms`. Inputs marked
+`sensitive` are sent to the process but persisted as a byte-count placeholder.
+Environment overrides are recorded in the scenario commitment; inherited
+values are not copied into Evidence.
 
-## Checkpoints and deterministic shims
+Terminal dimensions must satisfy `columns × (rows + scrollback) ≤ 1,000,000`.
+Every scheduled resize uses the same selected scrollback and must fit this
+working-buffer budget. REA rejects oversized scenarios before launching the
+command; it never clamps the requested dimensions. This limit is independent
+of `limits.output_bytes`, which bounds retained terminal observations.
 
-Checkpoint triggers may use an elapsed time, a terminal literal and occurrence
-count, root exit, or settlement. REA always includes `before` and
-`after_settlement` snapshots. Snapshot effects are relative to the preceding
-checkpoint, so transient files remain visible even when the final tree matches
-the initial tree.
+The capture contains raw PTY output chunks and rendered terminal states,
+interaction dispatch outcomes, exit reason, sampled process-tree observations,
+and settlement status. When filesystem paths are selected, REA records
+`files_before` and `files_after`, then classifies observed entries as created,
+deleted, modified, or unchanged. These are bounded snapshots, not a syscall
+trace; short-lived changes between snapshots may be missed. With no selected
+paths, filesystem effects remain unknown.
 
-Each command shim matches an exact argument array. Routes can emit timed stdout
-or stderr chunks and then exit or receive `SIGINT`, `SIGTERM`, or `SIGKILL`.
-Unmatched and exhausted calls are recorded. Shim observations are bounded by
-the scenario protocol-event limit; exceeding it marks the whole capture
-truncated while replay continues.
+A missing entry proves creation or deletion only when the corresponding
+observation root's path enumeration was exhausted. Otherwise its effect has
+`status: "unknown"`, the available before/after state, and a reason; a null
+state in this variant means unobserved. Paths below symlinks that REA did not
+follow also remain unknown. Partial enumeration of one root does not erase
+known effects in another, and unavailable content hashes do not by themselves
+make path absence unknown.
 
-## Compare captures
+Terminal frame `data` is the comparison text after the selected normalization.
+New captures also preserve `raw_data` when normalization changes a PTY chunk;
+otherwise `data` is already the original text. Older captures may lack the
+original text for changed chunks. Both values participate in Evidence identity,
+while comparisons and trace assertions use the normalized text. Retaining the
+original adds at most `limits.output_bytes` of text, because it comes from the
+same admitted PTY chunks rather than a second unbounded stream.
 
-Compare two saved Evidence records with:
+Rendered frame `lines` hold the visible rows after normalization, with trailing
+U+0020 spaces removed. Blank rows and internal spaces remain. `columns` records
+terminal cell width; normalization and Unicode can make string lengths differ
+from that width. `serialized_state` holds terminal serialization after the
+selected normalization. Original admitted PTY chunks are available through
+`raw_data ?? data`, as described above. Captures commit this line format in their
+comparison contract, so a capture whose lines were padded to full width does not
+compare as the same contract.
 
-```bash
-rea compare-process-captures authority.json reconstruction.json
+Custom `normalization.patterns` replace literal text with the caller's literal
+replacement, including dollar sequences such as `$&` and `$$`. An empty pattern
+also matches the first and last string positions. Captures with custom patterns
+commit `pattern_normalization_version: "literal-replacements-v1"`. Legacy captures
+remain readable. Cross-version comparison is rejected; capture both sides with
+the same replacement semantics. Captures without custom patterns keep their
+existing comparison contract.
+
+Port normalization recognizes explicit `port`, `tcp_port`, `udp_port`, and
+`listen` fields, URL authorities, IP endpoints, and `localhost` endpoints, with
+ports from 0 through 65535. A port may end a sentence, as in `port: 8080.`;
+a period followed by a letter or digit continues a decimal, version, or host
+name instead. Each PTY chunk is normalized on its own, so a port whose period
+ends the chunk is left unchanged because its continuation is not yet known. It preserves ordinary counters, dimensions, file line numbers,
+and ambiguous bare host labels. Use explicit literal `patterns`
+for a different application-specific spelling. Set `ports: false` to preserve
+all endpoint numbers in comparison text. Captures commit the port-normalization
+version so older broad numeric normalization cannot silently compare as the
+same contract.
+
+Output retention, file count, aggregate file-hashing bytes, process sampling, filesystem depth, total
+runtime, idle time, and post-exit settlement are bounded by the scenario's
+limits. The result marks truncated observations and residual unknowns rather
+than treating missing data as proof of equivalence. Cancellation and timeout
+run the same owned-process cleanup path. Settlement reports whether the
+sampled process group quiesced or whether cleanup was needed or unverifiable;
+sampling cannot prove that every short-lived or detached descendant was seen.
+
+### Finalization interval
+
+By default a deadline sends `SIGKILL` at once. Set `finalization_ms` to give the
+target time to finish: when `timeout_ms` or `idle_timeout_ms` fires, REA sends
+`SIGTERM`, keeps capturing output and selected files, and sends `SIGKILL` once
+if the interval ends first. Cancellation is not delayed: it sends `SIGKILL`
+immediately, also during finalization, and ends the run as cancelled.
+
+```json
+{
+  "executable": "node",
+  "arguments": ["./job.mjs"],
+  "filesystem_observation_paths": ["./reports"],
+  "timeout_ms": 30000,
+  "finalization_ms": 1500
+}
 ```
 
-The result classifies terminal, interaction, exit, filesystem, protocol,
-process, and shim behavior. `first_divergence` points to the earliest observed
-difference. Residual unknowns prevent a claim of complete equivalence, but they
-do not hide an observed difference in another dimension.
+REA binds the captured root's first start identity to its ownership token,
+checking the identity before and after reading that token. A missing or
+mismatched token, or an identity change during validation, leaves the identity
+unverified rather than adopting a replacement process. Both finalization
+signals recheck that retained identity immediately before the call; the check
+and signal remain separate operating-system operations. REA does not fall back
+to a bare PID kill for either finalization signal; failed identity or ownership
+validation is recorded as `unverified` with its reason. Cancellation before any
+deadline keeps the existing terminal kill. Descendants are not signalled during
+finalization; owned-process cleanup handles them afterwards.
 
-Captures must have equal comparison-contract commitments, but may identify
-different scenarios and executables. MCP callers may set `max_capture_age_ms`;
-the application clock then rejects stale captures before comparison.
+`exit.reason` keeps the initiating deadline (`timeout` or `idle_timeout`).
+`exit.code` is `null` for every deadline exit; the code of an exit observed
+during finalization is `exit.finalization.exit_code`, and the observed signal
+stays in `exit.signal`. `exit.finalization` records what was observed and is
+absent when no finalization was attempted:
 
-## Limits and lifecycle behavior
+```json
+{
+  "code": null,
+  "signal": 0,
+  "reason": "timeout",
+  "finalization": {
+    "requested_ms": 1500,
+    "elapsed_ms": 12,
+    "exit_code": 0,
+    "signals": [
+      { "signal": "SIGTERM", "sent_at_ms": 0, "delivery": "signaled" }
+    ]
+  }
+}
+```
 
-Scenarios bound output bytes, frames, files, file bytes, process observations,
-protocol/shim events, connections, filesystem depth, total runtime, idle time,
-and settlement time. Process trees are sampled rather than syscall-traced, and
-short-lived descendants may be missed. Filesystem observations are snapshots,
-not filesystem event streams.
+- `signals` lists each attempt in order: `SIGTERM` first, at most one `SIGKILL`.
+  `sent_at_ms` is the attempt time on a monotonic clock, relative to the start of
+  finalization, also for an attempt that could not be delivered.
+- `delivery` is `signaled` (the identity matched and the signal call returned),
+  `gone` (no live process matched), `identity-changed` (the PID now belongs to a
+  different process, which was not signalled) or `unverified` (the identity could
+  not be established or the call failed). None of them proves the process
+  exited.
+  An `unverified` attempt may carry a `reason` string naming why: an unavailable
+  identity and its reason, an inspection or signal error, or delivery that did
+  not settle within the bound (1000 ms). An attempt recorded `unverified` after
+  that bound can still complete later; it stays identity-checked, and its late
+  result is not added to the record.
+- `elapsed_ms` is when REA observed the exit, relative to the start of
+  finalization, or `null` when no exit was observed. The PTY layer can deliver the
+  exit slightly after the operating system ended the process.
+- `exit_code` is the code the PTY reported when the exit was observed during
+  finalization and was not caused by a signal (`exit.signal` is `0`); a
+  finalizer that exits with `3` records `3`, one that exits cleanly records `0`.
+  It is `null` when no exit was observed or the target ended on a signal, and it
+  is never inferred. A target that exited on its own near the deadline is
+  recorded the same way.
+- The observed signal stays in `exit.signal`; `exit.code` is `null` for every
+  deadline exit. The record does not attribute an exit to a particular signal,
+  and a `SIGKILL` from a scenario event next to the escalation cannot be told
+  apart from it.
+- If the `SIGKILL` cannot be delivered, REA stops waiting for an exit, keeps every
+  observation collected so far with the delivery results, and releases the run
+  through owned-process cleanup.
+- The `SIGKILL` is not sequenced after the `SIGTERM` delivery result: the two
+  deliveries are independent, because cancellation must not wait for a slow
+  identity check.
 
-REA tags launched processes with a private run identifier. During cleanup it
-revalidates that identifier before signaling sampled process groups, including
-groups detached from the original parent. Temporary HOME, replay, shim,
-terminal, checkpoint, and sampling resources are released on success, failure,
-timeout, and cancellation.
+`timeout_ms + finalization_ms + settle_ms` must stay at or below
+`Number.MAX_SAFE_INTEGER` (9007199254740991), the largest total exactly
+representable as a JavaScript number; the scenario is rejected otherwise. This is
+a representability limit, not a timer limit. The nominal lifecycle budget is that
+sum; polling, snapshotting and cleanup lie outside it. Scenario `events` keep
+being dispatched during finalization and are recorded as usual. `finalization_ms`
+of `0`, the default, keeps today's behaviour and the committed identity of every
+existing scenario. `elapsed_ms` and `sent_at_ms` are timing data and take part in
+exit comparison like `settlement.elapsed_ms`.
 
-After root exit, REA checks token-owned process groups every 50 ms. Two
-consecutive empty observations establish `quiesced`; the settlement deadline
-otherwise produces `alive_at_deadline`, while inspection or identity failures
-produce `unverifiable`. Sampling can still miss short-lived or early-detached
-descendants, which remains a residual unknown.
+Every capture requires `truncation_details`, with separate accounting for:
+
+- `raw_terminal`: original UTF-8 PTY chunk bytes and observed/retained chunk
+  counts. A chunk that does not fit `limits.output_bytes` is omitted whole;
+  a later smaller chunk can still fit.
+- `rendered_terminal`: cumulative UTF-8 serialized-state and visible-line
+  bytes, plus observed/retained frame counts. This is independent of the raw
+  chunk budget and does not count JSON encoding. Repeated screen snapshots can
+  exhaust it even when all raw output fits. Rendered states use retained PTY
+  input, so raw omissions also limit rendered coverage.
+- `filesystem_before` and `filesystem_after`: file-count/depth limits,
+  enumeration failures, whole-file hash budget and bytes successfully hashed.
+  Directory names are read incrementally within the remaining entry capacity.
+  When a directory exceeds that capacity, the retained subset follows filesystem
+  enumeration order and is then sorted; it is explicitly incomplete and cannot
+  establish that an omitted path is absent.
+  Each retained regular file without a digest has an aliased path, size,
+  remaining budget and reason: `file_bytes_budget`,
+  `file_changed_or_short_read`, or `file_unavailable`. Its `system_code` is
+  null unless an OS file operation failed, in which case it preserves the
+  reported error code. A file too large for the remaining budget is
+  skipped; a later smaller file can still be hashed. Hash omissions do not
+  imply incomplete path enumeration.
+- `process`: sampling limit and whether sampling ended partially. Coverage
+  remains `sampled`, including when that limit was not exhausted.
+
+The aggregate `truncated` flag summarizes these observations. Comparisons retain
+results for unaffected dimensions and mark affected dimensions unknown; an
+incomplete capture cannot locate the first divergence across all dimensions.
+Trace assertions use coverage for the sources they select, so an assertion
+about complete raw terminal output need not fail because rendered snapshots
+were omitted. Captures missing `truncation_details` are rejected on import;
+preserve them as historical files and recapture for current comparisons.
+`limits.file_bytes` is already the cumulative whole-file hashing budget,
+independent of `limits.output_bytes`, which bounds retained terminal content.
+Each filesystem checkpoint starts with a fresh `file_bytes` budget across all
+selected roots; it is not a per-file allowance. File contents are read in
+64 KiB chunks for hashing and are not embedded in capture Evidence.
+
+When the host withholds an unrelated process’s ownership token, REA leaves that
+process untouched and records its PID and reason in `cleanup.unverified_processes`
+and process residual unknowns. Successful cleanup verifies the owned group;
+it does not attribute those unrelated processes. Related or otherwise unexplained
+unreadable processes still prevent successful cleanup.
+
+On macOS, changing a Node process's `process.title` can make its run token
+unreadable. Node documents that [setting the title overwrites argv memory](https://nodejs.org/download/release/v24.18.0/docs/api/process.html#processtitle).
+With the pinned toolchain, a live child retained a readable start identity
+while its token became unavailable after this change; npm changes its title
+as well. A newly started unreadable process can prevent verified cleanup even
+after the selected command exits. REA preserves this uncertainty and leaves
+that process untouched.
+
+Reading those tokens requires compiling a small Swift helper with `xcrun swiftc`.
+By default that compilation reuses Swift's shared module cache, while the
+compiler's intermediate objects stay inside the per-run temporary root that REA
+removes afterwards. Set `REA_DARWIN_MODULE_CACHE_PATH` to a writable directory
+when a shared cache is unavailable, for example under an enforced write
+boundary. REA creates the directory, passes it to the compiler as
+`-module-cache-path`, and exports it as `CLANG_MODULE_CACHE_PATH` so the
+Objective-C header modules the helper builds land there too. REA never removes
+that directory: it outlives each run, so the first compilation into a new
+directory pays a cold-cache build and later runs reuse it. An absent or empty
+value keeps the shared default.
+
+`xcrun` also maintains a separate tool-lookup cache. Its `--no-cache` option
+refreshes entries and does not guarantee a write-free lookup. To avoid that
+lookup while compiling REA's helper, set `REA_DARWIN_SWIFTC_PATH` to the absolute
+path of an installed `swiftc` and `SDKROOT` to the absolute path of a compatible
+macOS SDK. REA invokes that compiler directly with `-sdk` and the selected SDK;
+an unset or empty compiler setting keeps the normal `xcrun swiftc` path. A
+missing or relative SDK/compiler path fails with an actionable prerequisite
+error before compilation. An incompatible installation reports the compiler's
+bounded diagnostics; REA does not repair or replace the toolchain.
+
+For example, select paths from your existing Xcode or Command Line Tools
+installation **before** entering an enforced write boundary:
+
+```sh
+export REA_DARWIN_SWIFTC_PATH="$(xcrun --find swiftc)"
+export SDKROOT="$(xcrun --show-sdk-path)"
+export REA_DARWIN_MODULE_CACHE_PATH="$PWD/rea-cache/modules"
+export TMPDIR="$PWD/rea-cache/tmp"
+mkdir -p "$TMPDIR"
+rea analyze-javascript-application ./fixture --artifact-format directory
+```
+
+Keep the selected compiler and SDK paired. Permit REA's evidence/output paths
+and its temporary directory as well as the caller-owned module cache. REA does
+not create a sandbox or claim that these settings contain every write made by
+arbitrary toolchains or analysis providers. They bypass REA's `xcrun` lookup
+and select the helper's Swift/Clang cache without disabling ownership checks.
+The caller-owned cache survives cancellation and cleanup; per-run compiler
+intermediates and the compiled helper remain REA-owned temporary files.
+
+The boundary must also permit process-table inspection. On macOS, `/bin/ps`
+is setuid and a blanket sandbox may reject its launch with `spawn EPERM`.
+REA then preserves ownership uncertainty and can report `cleanup_incomplete`;
+it does not disable verification to continue. A sandbox that explicitly allows
+this read-only process inspector is a separate prerequisite from the compiler
+and cache settings.

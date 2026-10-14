@@ -1,6 +1,9 @@
-import { HopperProtocolError } from "../domain/errors.js";
+import { HopperProtocolError } from "../domain/hopperErrors.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 import { err, ok, type Result } from "../domain/result.js";
+
+/** Bound cleanup handshakes and the bridge's idle reconnection wait. */
+export const HOPPER_SHUTDOWN_TIMEOUT_MS = 30_000;
 
 /** Authenticated identity returned by the Hopper bridge health handshake. */
 export interface HopperServerInfo {
@@ -25,12 +28,15 @@ export const parseHopperServerInfo = (
   return err(new HopperProtocolError("Hopper bridge health result is invalid"));
 };
 
-/** Require Hopper to confirm both analysis and document shutdown. */
+/** Require confirmation that the REA bridge detached or its document closed. */
 export const isHopperShutdownAcknowledgement = (value: JsonValue): boolean => {
   if (typeof value !== "object" || value === null || Array.isArray(value))
     return false;
   if (value.shutdown !== true) return false;
-  return value.analysis_stopped === true && value.document_closed === true;
+  return (
+    (value.analysis_stopped === true && value.document_closed === true) ||
+    (value.document_closed === false && value.document_retained === true)
+  );
 };
 
 /** Detect the verified Linux bridge response that requires group cleanup. */

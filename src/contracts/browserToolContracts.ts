@@ -1,10 +1,12 @@
-import type { ToolContract } from "./toolContracts.js";
+import type { ToolContract } from "./toolContractTypes.js";
 import {
-  browserTargetListSchema,
   inspectWebPageInputSchema,
   listBrowserTargetsInputSchema,
-  webPageInspectionSchema,
 } from "../domain/browserObservation.js";
+import {
+  browserTargetListSchema,
+  webPageInspectionSchema,
+} from "../domain/browserObservationSchemas.js";
 import {
   analyzeWebBundleInputSchema,
   webBundleAnalysisSchema,
@@ -18,9 +20,9 @@ import {
   webMcpDiscoverySchema,
 } from "../domain/webMcpDiscovery.js";
 import {
-  compareWebCapturesInputSchema,
-  webCaptureDiffSchema,
-} from "../domain/webCaptureDiff.js";
+  browserCaptureComparisonInputSchema,
+  browserCaptureComparisonSchema,
+} from "../domain/browserCaptureComparison.js";
 import {
   captureWebScreenshotInputSchema,
   compareWebScreenshotsInputSchema,
@@ -28,42 +30,113 @@ import {
   webScreenshotSchema,
 } from "../domain/webScreenshot.js";
 import { toolContractMetadata } from "./toolEffects.js";
-import { evidenceResultOf } from "./toolOutputSchemas.js";
+import { evidenceResultOf } from "./toolOutputSchemaPrimitives.js";
 
-const evidenceResult = evidenceResultOf;
-const listOutputSchema = evidenceResult(browserTargetListSchema);
-const inspectionOutputSchema = evidenceResult(webPageInspectionSchema);
-const bundleOutputSchema = evidenceResult(webBundleAnalysisSchema);
-const observationSessionOutputSchema = evidenceResult(
+const listOutputSchema = evidenceResultOf(browserTargetListSchema);
+const inspectionOutputSchema = evidenceResultOf(webPageInspectionSchema);
+const bundleOutputSchema = evidenceResultOf(webBundleAnalysisSchema);
+const observationSessionOutputSchema = evidenceResultOf(
   webObservationSessionSchema,
 );
-const webMcpOutputSchema = evidenceResult(webMcpDiscoverySchema);
-const captureDiffOutputSchema = evidenceResult(webCaptureDiffSchema);
-const screenshotOutputSchema = evidenceResult(webScreenshotSchema);
-const screenshotDiffOutputSchema = evidenceResult(webScreenshotDiffSchema);
+const webMcpOutputSchema = evidenceResultOf(webMcpDiscoverySchema);
+const captureDiffOutputSchema = evidenceResultOf(
+  browserCaptureComparisonSchema,
+);
+const screenshotOutputSchema = evidenceResultOf(webScreenshotSchema);
+const screenshotDiffOutputSchema = evidenceResultOf(webScreenshotDiffSchema);
 
 const endpoint = "http://127.0.0.1:9222";
 const origin = "https://app.example.test";
+const scenarioUrl = {
+  url: `${origin}/`,
+  origin,
+  query_parameter_names: [],
+  redacted: false,
+};
+const scenarioCompleteness = {
+  status: "complete",
+  equality_eligible: true,
+  missing_sections: [],
+  truncated_sections: [],
+};
+const scenarioArtifacts = {
+  screenshot: { state: "not_requested" },
+  dom: { state: "not_requested" },
+  accessibility: { state: "not_requested" },
+  url: { state: "not_requested" },
+  history: { state: "not_requested" },
+  storage: { state: "not_requested" },
+};
+const exampleScenarioCapture = () => ({
+  browser: {
+    mode: "connect",
+    process_ownership: "external",
+    cleanup: "disconnected-external",
+    product: "Chromium",
+    version: "149",
+  },
+  scenario: {
+    start_origin: origin,
+    action_count: 1,
+    secret_references: [],
+    network_content: {
+      request_body: false,
+      response_body: false,
+      header_values: false,
+    },
+    event_families: [],
+  },
+  duration_ms: 10,
+  steps: [
+    {
+      step_index: 0,
+      step_id: "scenario_start",
+      action: "scenario_start",
+      status: "completed",
+      elapsed_ms: 0,
+      before_url: scenarioUrl,
+      after_url: scenarioUrl,
+      error: null,
+      event_sequence_start: 1,
+      event_sequence_end: 0,
+      artifacts: scenarioArtifacts,
+      completeness: scenarioCompleteness,
+    },
+    {
+      step_index: 1,
+      step_id: "open-settings",
+      action: "click",
+      status: "completed",
+      elapsed_ms: 10,
+      before_url: scenarioUrl,
+      after_url: scenarioUrl,
+      error: null,
+      event_sequence_start: 1,
+      event_sequence_end: 0,
+      artifacts: scenarioArtifacts,
+      completeness: scenarioCompleteness,
+    },
+  ],
+  events: { retained: 0, dropped: 0, items: [] },
+  completeness: scenarioCompleteness,
+  limitations: [],
+});
 
-/** Origin-scoped, passive browser reverse-engineering contracts. */
+/** Passive browser reverse-engineering contracts. */
 export const BROWSER_TOOL_CONTRACTS = [
   {
     name: "list_browser_targets",
     ...toolContractMetadata("list_browser_targets"),
     description:
-      "List bounded page targets from an approved user-owned loopback Chrome DevTools Protocol endpoint. Only targets whose current URL matches an approved exact origin are returned; URL credentials, query values, and fragments are redacted.",
+      "List page targets exposed by the selected loopback Chrome DevTools Protocol endpoint. Optionally filter by exact origin. URLs preserve query values and fragments; only URL userinfo credentials are removed.",
     kind: "browser-provider",
     inputSchema: listBrowserTargetsInputSchema,
     outputSchema: listOutputSchema,
     examples: [
       {
-        title: "List approved browser page targets",
+        title: "List browser page targets",
         input: {
           cdp_endpoint: endpoint,
-          allowed_origins: [origin],
-          approved: true,
-          offset: 0,
-          limit: 100,
         },
       },
     ],
@@ -72,52 +145,16 @@ export const BROWSER_TOOL_CONTRACTS = [
     name: "inspect_web_page",
     ...toolContractMetadata("inspect_web_page"),
     description:
-      "Passively inspect one approved page target through CDP without evaluating JavaScript, navigating, clicking, closing, or mutating the page. Returns bounded DOM structure, accessibility, scripts, resources, attach-window network and console metadata, workers, and redacted storage inventory as Evidence v2.",
+      "Passively inspect one selected page target through CDP without evaluating JavaScript, navigating, clicking, closing, or mutating the page. If no origin filter is supplied, capture is scoped to the target's current origin. Returns DOM structure, accessibility, scripts, resources, attach-window network and console metadata, workers, and redacted storage inventory as Evidence.",
     kind: "browser-provider",
     inputSchema: inspectWebPageInputSchema,
     outputSchema: inspectionOutputSchema,
     examples: [
       {
-        title: "Inspect one approved browser page",
+        title: "Inspect one browser page",
         input: {
           cdp_endpoint: endpoint,
-          allowed_origins: [origin],
-          approved: true,
           target_id: "TARGET_ID_FROM_LIST_BROWSER_TARGETS",
-          observation_ms: 500,
-          include_accessibility_text: false,
-          include_console_text: false,
-          console_text_approved: false,
-          include_json_body_shapes: false,
-          json_body_schema_approved: false,
-          include_websocket_shapes: false,
-          websocket_shape_approved: false,
-          include_script_sources: false,
-          include_storage_keys: false,
-          limits: {
-            max_frames: 200,
-            max_dom_nodes: 2_000,
-            max_ax_nodes: 2_000,
-            max_ax_text_field_bytes: 1_024,
-            max_total_ax_text_bytes: 65_536,
-            max_scripts: 200,
-            max_resources: 2_000,
-            max_workers: 500,
-            max_storage_keys: 1_000,
-            max_script_source_bytes: 1_048_576,
-            max_total_script_source_bytes: 4_194_304,
-            max_network_events: 1_000,
-            max_console_events: 200,
-            max_console_text_field_bytes: 1_024,
-            max_total_console_text_bytes: 65_536,
-            max_json_body_bytes: 1_048_576,
-            max_total_json_body_bytes: 4_194_304,
-            max_json_shape_nodes: 5_000,
-            max_json_shape_depth: 20,
-            max_websocket_events: 500,
-            max_websocket_shape_bytes: 65_536,
-            max_total_websocket_shape_bytes: 1_048_576,
-          },
         },
       },
     ],
@@ -126,34 +163,21 @@ export const BROWSER_TOOL_CONTRACTS = [
     name: "analyze_web_bundle",
     ...toolContractMetadata("analyze_web_bundle"),
     description:
-      "Capture explicitly approved JavaScript source from one approved CDP page and statically derive a bounded chunk graph, route and endpoint candidates, vendor fingerprints, page-declared WebMCP metadata, and optional separately approved source-map evidence. JavaScript is parsed but never executed.",
+      "Capture JavaScript source from one selected CDP page and statically derive a chunk graph, route and endpoint candidates, vendor fingerprints, page-declared WebMCP metadata, and optionally fetch source maps from the selected target origin or explicitly requested origins. JavaScript is parsed but never executed.",
     kind: "browser-provider",
     inputSchema: analyzeWebBundleInputSchema,
     outputSchema: bundleOutputSchema,
     examples: [
       {
-        title: "Analyze an approved page bundle",
+        title: "Analyze a page bundle",
         input: {
           cdp_endpoint: endpoint,
-          allowed_origins: [origin],
-          approved: true,
           target_id: "TARGET_ID_FROM_LIST_BROWSER_TARGETS",
           observation_ms: 500,
           include_accessibility_text: false,
           include_script_sources: true,
           include_storage_keys: false,
-          source_capture_approved: true,
           fetch_source_maps: false,
-          source_map_fetch_approved: false,
-          analysis_limits: {
-            max_findings: 1_000,
-            max_ast_nodes: 250_000,
-            max_source_maps: 100,
-            max_source_map_bytes: 4_194_304,
-            max_total_source_map_bytes: 16_777_216,
-            max_source_map_mappings: 10_000,
-            max_original_sources: 2_000,
-          },
         },
       },
     ],
@@ -162,7 +186,7 @@ export const BROWSER_TOOL_CONTRACTS = [
     name: "observe_web_session",
     ...toolContractMetadata("observe_web_session"),
     description:
-      "Arm a bounded CDP observation window while the user operates the page. Allows approved same-origin reload and SPA navigation, records ordered navigation, redirect, lifecycle, and failure metadata, and stops before retaining an out-of-policy destination.",
+      "Arm a CDP observation window of the requested duration while the user operates the page. By default it follows the selected target's current origin; an explicit origin list controls which origins may be retained. Records navigation, redirect, lifecycle, and failure events.",
     kind: "browser-provider",
     inputSchema: observeWebSessionInputSchema,
     outputSchema: observationSessionOutputSchema,
@@ -171,11 +195,8 @@ export const BROWSER_TOOL_CONTRACTS = [
         title: "Observe one external user action",
         input: {
           cdp_endpoint: endpoint,
-          allowed_origins: [origin],
           target_id: "TARGET_ID_FROM_LIST_BROWSER_TARGETS",
-          approved: true,
           observation_ms: 10_000,
-          max_timeline_events: 2_000,
         },
       },
     ],
@@ -184,7 +205,7 @@ export const BROWSER_TOOL_CONTRACTS = [
     name: "discover_webmcp_tools",
     ...toolContractMetadata("discover_webmcp_tools"),
     description:
-      "Passively inventory page-registered WebMCP tools using the experimental CDP WebMCP domain. Metadata is bounded and page-declared-untrusted; REA never registers or invokes discovered tools.",
+      "Passively inventory every page-registered WebMCP tool and its complete structural input-schema summary using the experimental CDP WebMCP domain. Metadata is page-declared-untrusted; REA never registers or invokes discovered tools.",
     kind: "browser-provider",
     inputSchema: discoverWebMcpToolsInputSchema,
     outputSchema: webMcpOutputSchema,
@@ -193,14 +214,8 @@ export const BROWSER_TOOL_CONTRACTS = [
         title: "Discover current WebMCP declarations",
         input: {
           cdp_endpoint: endpoint,
-          allowed_origins: [origin],
           target_id: "TARGET_ID_FROM_LIST_BROWSER_TARGETS",
-          approved: true,
           observation_ms: 100,
-          max_tools: 500,
-          max_schema_bytes: 262_144,
-          max_schema_nodes: 5_000,
-          max_schema_depth: 20,
         },
       },
     ],
@@ -209,17 +224,26 @@ export const BROWSER_TOOL_CONTRACTS = [
     name: "compare_web_captures",
     ...toolContractMetadata("compare_web_captures"),
     description:
-      "Compare two normalized web captures across DOM, scripts, resources, network, safe metadata, and optional WebMCP inventories. Stable observed changes are distinguished from unknown absence caused by incomplete capture coverage.",
+      "Compare passive web captures by providing before and after, each with the complete inspect_web_page normalized_result in inspection and an optional complete discover_webmcp_tools normalized_result in webmcp; or compare recorded scenarios by passing complete capture_browser_scenario normalized_result objects in before_scenario and after_scenario with an optional normalization policy. Use exactly one input group. Network comparison includes observed HTTP requests and WebSocket frame streams; same-URL connections are compared as an unordered collection of ordered streams, retaining connection counts without claiming stable identity between individual connections. Scenario comparison aligns exact step IDs, records deterministic literal normalization, and returns every artifact-level difference plus alignment failures inline. Missing or truncated evidence never proves equality.",
     kind: "browser-provider",
-    inputSchema: compareWebCapturesInputSchema,
+    inputSchema: browserCaptureComparisonInputSchema,
     outputSchema: captureDiffOutputSchema,
     examples: [
       {
-        title: "Compare two normalized captures",
+        title: "Compare two recorded browser scenarios",
         input: {
-          before: { inspection: exampleInspection() },
-          after: { inspection: exampleInspection() },
-          max_changes: 2_000,
+          before_scenario: exampleScenarioCapture(),
+          after_scenario: exampleScenarioCapture(),
+          normalization: {
+            rules: [
+              {
+                rule_id: "volatile-build-id",
+                artifacts: ["dom", "accessibility"],
+                match: "build-123",
+                replacement: "[BUILD_ID]",
+              },
+            ],
+          },
         },
       },
     ],
@@ -228,20 +252,16 @@ export const BROWSER_TOOL_CONTRACTS = [
     name: "capture_web_screenshot",
     ...toolContractMetadata("capture_web_screenshot"),
     description:
-      "Capture the current visible viewport of one approved page as a bounded, content-addressed PNG artifact. Screenshot capture requires separate explicit approval and never scrolls, navigates, or evaluates page JavaScript.",
+      "Capture the current visible viewport of one configured page as an inline, content-addressed PNG artifact. The operation never scrolls, navigates, or evaluates page JavaScript.",
     kind: "browser-provider",
     inputSchema: captureWebScreenshotInputSchema,
     outputSchema: screenshotOutputSchema,
     examples: [
       {
-        title: "Capture an approved viewport",
+        title: "Capture a viewport",
         input: {
           cdp_endpoint: endpoint,
-          allowed_origins: [origin],
           target_id: "TARGET_ID_FROM_LIST_BROWSER_TARGETS",
-          approved: true,
-          screenshot_approved: true,
-          maximum_image_bytes: 4_194_304,
         },
       },
     ],
@@ -250,7 +270,7 @@ export const BROWSER_TOOL_CONTRACTS = [
     name: "compare_web_screenshots",
     ...toolContractMetadata("compare_web_screenshots"),
     description:
-      "Compare two self-verifying PNG screenshot artifacts with bounded local pixel metrics. Returns exact changed-pixel ratios and channel deltas without OCR or external services.",
+      "Compare two self-verifying PNG screenshot artifacts with local pixel metrics. Returns exact changed-pixel ratios and channel deltas without OCR or external services.",
     kind: "browser-provider",
     inputSchema: compareWebScreenshotsInputSchema,
     outputSchema: screenshotDiffOutputSchema,
@@ -261,109 +281,14 @@ export const BROWSER_TOOL_CONTRACTS = [
           before: exampleScreenshot(),
           after: exampleScreenshot(),
           channel_threshold: 0,
-          maximum_pixels: 16_000_000,
         },
       },
     ],
   },
 ] as const satisfies readonly ToolContract[];
 
-function exampleCompleteness() {
-  return {
-    status: "complete_within_window",
-    conditions: ["complete_within_window"],
-    policy_filtered_sections: [],
-    attach_limited_sections: [],
-    truncated_sections: [],
-    unavailable_sections: [],
-    excluded: [],
-    dropped_events: {
-      scripts: 0,
-      network_requests: 0,
-      console_events: 0,
-      websocket_connections: 0,
-      websocket_frames: 0,
-      webmcp_tools: 0,
-      timeline_events: 0,
-      total: 0,
-    },
-  };
-}
-
-function exampleInspection() {
-  return {
-    schema_version: 2,
-    browser: {
-      product: "Chrome/1",
-      protocol_version: "1.3",
-      revision: "example",
-      user_agent: "Chrome",
-      js_version: "1",
-    },
-    target: {
-      target_id: "page-1",
-      type: "page",
-      title: "Example",
-      url: `${origin}/`,
-      origin,
-      attached: false,
-    },
-    capture_window: {
-      started_at: "2026-07-14T00:00:00.000Z",
-      ended_at: "2026-07-14T00:00:01.000Z",
-      observation_ms: 1_000,
-    },
-    completeness: exampleCompleteness(),
-    frames: [],
-    dom: { total_nodes: 0, nodes: [] },
-    accessibility: {
-      total_nodes: 0,
-      text_capture: {
-        status: "not_approved",
-        retained_bytes: 0,
-        excluded_fields: 0,
-        truncated_fields: 0,
-      },
-      nodes: [],
-    },
-    scripts: { total: 0, items: [] },
-    resources: [],
-    network: {
-      requests: [],
-      websocket_events: [],
-      coverage_started_at: "2026-07-14T00:00:00.000Z",
-      prior_activity_available: false,
-    },
-    console: {
-      events: [],
-      coverage_started_at: "2026-07-14T00:00:00.000Z",
-      prior_activity_available: false,
-    },
-    workers: [],
-    metadata: {
-      responses: [],
-      dom_urls: [],
-      agent_hints: [],
-      excluded_dom_urls: 0,
-      headers_allowlisted: true,
-    },
-    storage: {
-      origin,
-      usage_bytes: null,
-      quota_bytes: null,
-      local_storage_keys: [],
-      session_storage_keys: [],
-      indexed_db_names: [],
-      cache_names: [],
-      values_redacted: true,
-    },
-    limitations: [],
-  };
-}
-
 function exampleScreenshot() {
   return {
-    uri: "rea://web-screenshot/sha256/153cf6c9a526a63053a37b10234c2fd85df38887c2dc0a800d90abfa6631d01c",
     sha256: "153cf6c9a526a63053a37b10234c2fd85df38887c2dc0a800d90abfa6631d01c",
     bytes: 70,
     media_type: "image/png",

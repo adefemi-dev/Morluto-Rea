@@ -1,7 +1,10 @@
 import { rename, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 
-const [
+const configuration = JSON.parse(
+  process.env.REA_GHIDRA_FIXTURE_CONFIG ?? "null",
+);
+const {
   endpointPath,
   token,
   runId,
@@ -10,7 +13,7 @@ const [
   targetSha256,
   transport,
   mode = "success",
-] = process.argv.slice(2);
+} = configuration ?? {};
 
 if (
   endpointPath === undefined ||
@@ -28,7 +31,10 @@ if (mode === "exit") process.exit(73);
 if (mode === "silent") setInterval(() => undefined, 1_000);
 else {
   await rm(endpointPath, { force: true });
+  const sockets = new Set();
   const server = createServer((socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
     socket.setEncoding("utf8");
     const state = {
       buffer: { value: "" },
@@ -42,6 +48,11 @@ else {
     };
     socket.on("data", (chunk) => onSocketData(socket, server, chunk, state));
   });
+  process.on("message", (message) => {
+    if (message !== "disconnect") return;
+    for (const socket of sockets) socket.destroy();
+    process.send?.({ event: "disconnected" });
+  });
   if (transport === "unix-socket") server.listen(endpointPath);
   else {
     server.listen(0, "127.0.0.1", async () => {
@@ -51,7 +62,6 @@ else {
       await writeFile(
         pending,
         `${JSON.stringify({
-          schema_version: 1,
           host: "127.0.0.1",
           port: address.port,
         })}\n`,
@@ -70,6 +80,7 @@ const onSocketData = (socket, server, chunk, state) => {
     state.buffer.value = state.buffer.value.slice(newline + 1);
     newline = state.buffer.value.indexOf("\n");
     const request = JSON.parse(line);
+    process.send?.({ method: request.method });
     if (request.token !== state.token) {
       socket.end(
         `${JSON.stringify({
@@ -105,19 +116,43 @@ const handleRequest = (socket, server, request, state) => {
   if (state.mode === "exit_tools" && request.method !== "shutdown")
     process.exit(74);
   if (state.mode === "hang_tools" && request.method !== "shutdown") return;
-  const inventory = inventoryResultFor(request.method);
+  const inventory =
+    request.method === "list_strings" && state.mode === "fragmented"
+      ? [stringItem("0x2000", "fixture 雪🦊")]
+      : request.method === "list_strings" && state.mode === "oversized_result"
+        ? [stringItem("0x2000", "x".repeat(64 * 1024 * 1024 + 1))]
+        : inventoryResultFor(request.method);
   if (inventory !== undefined) {
-    socket.write(
-      `${JSON.stringify({ id: request.id, ok: true, result: inventory })}\n`,
-    );
+    const response = `${JSON.stringify({ id: request.id, ok: true, result: inventory })}\n`;
+    if (state.mode === "fragmented") {
+      const bytes = Buffer.from(response, "utf8");
+      const unicodeOffset = bytes.indexOf(Buffer.from("雪", "utf8"));
+      const midpoint =
+        unicodeOffset >= 0 ? unicodeOffset + 1 : Math.floor(bytes.length / 2);
+      socket.write(bytes.subarray(0, midpoint));
+      setTimeout(() => socket.write(bytes.subarray(midpoint)), 5);
+    } else socket.write(response);
     return;
   }
   if (request.method === "shutdown") {
     socket.end(
       `${JSON.stringify({
         id: request.id,
-        ok: true,
-        result: { shutdown: true, project_ephemeral: true },
+        ...(state.mode === "shutdown_error"
+          ? {
+              ok: false,
+              error: {
+                code: "shutdown_fixture_failure",
+                message: `Shutdown denied for ${state.token}: /tmp/password-fixture http://localhost/secret?token=public-value`,
+              },
+            }
+          : {
+              ok: true,
+              result: {
+                shutdown: state.mode !== "invalid_shutdown_ack",
+                project_ephemeral: true,
+              },
+            }),
       })}\n`,
     );
     server.close(() => process.exit(0));
@@ -126,6 +161,16 @@ const handleRequest = (socket, server, request, state) => {
 
 const handlePing = (socket, request, state) => {
   state.pings.value += 1;
+  if (state.mode === "diagnostic_output" && state.pings.value === 1) {
+    const retainedTokenPrefixBytes = Math.floor(state.token.length / 2);
+    const preservedMarker = "source=/tmp/local-evidence.bin?cursor=keep&";
+    const fillLength = 8 * 1024 * 1024 - retainedTokenPrefixBytes;
+    const fill = "x".repeat(fillLength - Buffer.byteLength(preservedMarker));
+    process.stderr.write(`${fill}${preservedMarker}`);
+    setImmediate(() => {
+      process.stderr.write(state.token);
+    });
+  }
   if (state.mode === "malformed") {
     socket.write("{invalid\n");
     return;
@@ -139,10 +184,6 @@ const handlePing = (socket, request, state) => {
         error: { code: "failure", message: "Failed" },
       })}\n`,
     );
-    return;
-  }
-  if (state.mode === "oversized_whitespace") {
-    socket.write(`${" ".repeat(1024 * 1024 + 1)}\n`);
     return;
   }
   if (state.mode === "future_id") {
@@ -176,16 +217,18 @@ const sessionInfo = ({
   timedOut,
 }) => ({
   name: "REA Ghidra bridge",
-  bridge_version: 4,
   run_id: sessionRunId,
   profile_digest: digest,
   provider: { id: "ghidra", version },
-  read_only: true,
+  read_only: transport !== "unix-socket",
   analysis_complete: !timedOut,
   analysis_timed_out: timedOut,
   capabilities: [
     "ping",
     "shutdown",
+    "inspect_native_load_image",
+    "read_bytes",
+    "address_to_file_offset",
     "address_name",
     "list_documents",
     "list_names",
@@ -196,15 +239,30 @@ const sessionInfo = ({
     "resolve_containing_procedure",
     "search_procedures",
     "search_strings",
+    "set_address_name",
+    "set_addresses_names",
+    "annotate_native_function",
+    "inspect_native_data_type",
+    "inspect_native_instruction",
+    "resolve_native_call_targets",
     "analyze_function",
     "procedure_assembly",
     "procedure_callees",
     "procedure_callers",
     "procedure_info",
     "procedure_pseudo_code",
+    "read_function_instructions",
     "procedure_references",
     "xrefs",
-  ],
+  ].filter(
+    (value) =>
+      transport === "unix-socket" ||
+      ![
+        "annotate_native_function",
+        "set_address_name",
+        "set_addresses_names",
+      ].includes(value),
+  ),
   target: {
     name: "fixture",
     language_id: "x86:LE:64:default",
@@ -222,39 +280,29 @@ const inventoryResultFor = (method) => {
     case "list_documents":
       return ["fixture"];
     case "list_names":
-      return page(method, [nameItem()]);
+      return [nameItem()];
     case "list_procedures":
-      return page(method, [procedureItem()]);
+      return [procedureItem()];
     case "list_segments":
       return [segmentItem()];
     case "list_strings":
-      return page(method, [stringItem("0x2000", "fixture value")]);
+      return [stringItem("0x2000", "fixture value")];
     case "procedure_address":
       return "0x1000";
     case "resolve_containing_procedure":
       return containingProcedureResult();
     case "search_procedures":
-      return page(method, [procedureSearchItem()]);
+      return [procedureSearchItem()];
     case "search_strings":
-      return page(method, [stringSearchItem()]);
+      return [stringSearchItem()];
     default:
       return undefined;
   }
 };
 
-const page = (method, items) => ({
-  items,
-  offset: 0,
-  limit: method.startsWith("search_") ? 100 : 500,
-  total: items.length,
-  next_offset: null,
-  has_more: false,
-});
-
 const nameItem = () => ({
   address: "0x1000",
   value: "fixture_main",
-  value_truncated: false,
   symbol: {
     primary: true,
     dynamic: false,
@@ -267,7 +315,6 @@ const nameItem = () => ({
 const procedureItem = () => ({
   address: "0x1000",
   value: "fixture_main",
-  value_truncated: false,
   procedure: { external: false, thunk: false, thunk_target: null },
 });
 
@@ -290,11 +337,10 @@ const segmentItem = () => ({
 const stringItem = (address, value) => ({
   address,
   value,
-  value_truncated: false,
   string: {
     encoding: "UTF-8",
     termination: "present_or_not_required",
-    byte_length: value.length + 1,
+    byte_length: Buffer.byteLength(value, "utf8") + 1,
   },
 });
 
@@ -316,11 +362,9 @@ const containingProcedureResult = () => ({
 const procedureSearchItem = () => ({
   address: "0x1000",
   value: "fixture_main",
-  value_truncated: false,
 });
 
 const stringSearchItem = () => ({
   address: "0x2000",
   value: "fixture value",
-  value_truncated: false,
 });

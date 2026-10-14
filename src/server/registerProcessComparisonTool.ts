@@ -1,117 +1,195 @@
-import type { McpServer } from "@modelcontextprotocol/server";
+import type { EvidenceMcpServer } from "./EvidenceMcpServer.js";
 
-import type { BinarySessionPort } from "../application/BinarySession.js";
+import type { BinarySessionPort } from "../application/binary/BinarySessionPort.js";
+import { toolContract } from "../contracts/toolContracts.js";
+import { AnalysisInputError } from "../domain/analysisErrorCore.js";
+import type { AnalysisError } from "../domain/analysisErrorBase.js";
+import { describeValidationFailure } from "../domain/evidenceBundle.js";
+import { EvidenceIntegrityError } from "../domain/evidenceErrors.js";
 import {
-  processComparisonInputSchema,
-  SESSION_TOOL_CONTRACTS,
-} from "../contracts/toolContracts.js";
-import { createEvidence } from "../domain/evidence.js";
-import { EvidenceIntegrityError } from "../domain/errors.js";
+  createEvidence,
+  parseEvidence,
+  type Evidence,
+  type EvidenceLocation,
+} from "../domain/evidence.js";
 import { jsonValueSchema } from "../domain/jsonValue.js";
-import type { RecordUnknownInput } from "../domain/residualUnknown.js";
+import { compareProcessCaptures } from "../domain/process/processComparison.js";
 import {
-  compareProcessCaptures,
   parseProcessCapture,
-} from "../domain/processCapture.js";
+  type ProcessCapture,
+} from "../domain/process/processCaptureParsing.js";
+import type { RecordUnknownInput } from "../domain/residualUnknown.js";
+import { err, ok, type Result } from "../domain/result.js";
 import { recordDerivedEvidence } from "./recordDerivedEvidence.js";
-import { err } from "../domain/result.js";
-import { PROCESS_PROVIDER } from "./sessionToolPolicies.js";
-import { toCallToolResult } from "./toolResult.js";
-import { toolRegistrationOptions } from "./toolRegistrationOptions.js";
+import { recordSessionEvidenceSources } from "./sessionEvidence.js";
 import { runDerivedOperation } from "./runDerivedOperation.js";
-import { safeParseToolInput } from "./toolInputValidation.js";
-import { resolveSessionEvidenceIds } from "./sessionEvidence.js";
+import {
+  PROCESS_PROVIDER,
+  isProcessEvidenceProvider,
+} from "../domain/process/processEvidenceProvider.js";
+import { toolRegistrationOptions } from "./toolRegistrationOptions.js";
+import { withAdmittedAnalysis } from "./analysisAdmission.js";
+import { runAdmittedToolOperation } from "./admittedToolOperation.js";
+
+const PROCESS_CAPTURE_EVIDENCE = {
+  operation: "capture_process_scenario",
+  predicate: "rea.process-capture",
+} as const;
+
+const sourceLocations = (
+  left: readonly EvidenceLocation[] | undefined,
+  right: readonly EvidenceLocation[] | undefined,
+): readonly EvidenceLocation[] => [...(left ?? []), ...(right ?? [])];
+
+/**
+ * Parse one side and name the failed constraint: tampered Evidence, Evidence
+ * from another workflow, or an invalid capture result.
+ */
+const parseCaptureSide = (
+  operation: string,
+  side: "left" | "right",
+  value: unknown,
+): Result<
+  { readonly record: Evidence; readonly capture: ProcessCapture },
+  AnalysisError
+> => {
+  let record: Evidence;
+  try {
+    record = parseEvidence(value);
+  } catch (cause: unknown) {
+    return err(
+      new EvidenceIntegrityError(`${side} Evidence failed validation`, {
+        cause,
+        userMessage: `The ${side} Evidence failed validation (${describeValidationFailure(cause)}). Supply unmodified capture Evidence from capture_process_scenario.`,
+      }),
+    );
+  }
+  if (
+    record.operation !== PROCESS_CAPTURE_EVIDENCE.operation ||
+    record.predicate_type !== PROCESS_CAPTURE_EVIDENCE.predicate
+  )
+    return err(
+      new AnalysisInputError(operation, undefined, [
+        {
+          path: [side],
+          reason: "invalid_value",
+          message: `Expected process capture Evidence (operation ${PROCESS_CAPTURE_EVIDENCE.operation}, predicate ${PROCESS_CAPTURE_EVIDENCE.predicate}); the ${side} Evidence has operation ${record.operation} and predicate ${record.predicate_type}.`,
+        },
+      ]),
+    );
+  if (!isProcessEvidenceProvider(record.provider))
+    return err(
+      new AnalysisInputError(operation, undefined, [
+        {
+          path: [side, "provider"],
+          reason: "invalid_value",
+          message: `The ${side} Evidence provider ${record.provider.id} v${record.provider.version} (${record.provider.name}) is not the current or supported legacy ${PROCESS_PROVIDER.id} v${PROCESS_PROVIDER.version} process capture provider.`,
+        },
+      ]),
+    );
+  try {
+    return ok({
+      record,
+      capture: parseProcessCapture(record.normalized_result),
+    });
+  } catch (cause: unknown) {
+    return err(
+      new EvidenceIntegrityError(`${side} process capture failed validation`, {
+        cause,
+        userMessage: `The ${side} Evidence has an invalid process capture result (${describeValidationFailure(cause)}). Recreate the capture with capture_process_scenario.`,
+      }),
+    );
+  }
+};
 
 /** Register deterministic process-capture comparison and contradiction tracking. */
 export const registerProcessComparisonTool = (
-  server: McpServer,
+  server: EvidenceMcpServer,
   session: BinarySessionPort,
-  contract: (typeof SESSION_TOOL_CONTRACTS)[6],
+  contract: ReturnType<typeof toolContract<"compare_process_captures">>,
   now: () => number = Date.now,
 ): void => {
+  const admission = withAdmittedAnalysis({ kind: "session", session });
   server.registerTool(
     contract.name,
     toolRegistrationOptions(contract),
-    async (input, context) => {
-      const parsedInput = safeParseToolInput(
-        processComparisonInputSchema,
-        input,
+    async (input, context) =>
+      runAdmittedToolOperation(
+        server,
+        admission,
         contract.name,
-      );
-      if (!parsedInput.ok) return toCallToolResult(parsedInput, contract);
-      const parsed = parsedInput.value;
-      const expected = {
-        operation: "capture_process_scenario",
-        predicate: "rea.process-capture/v4",
-      };
-      const leftRecord = resolveSessionEvidenceIds(
-        session,
-        [parsed.left_evidence_id],
-        expected,
-      );
-      if (!leftRecord.ok) return toCallToolResult(leftRecord, contract);
-      const rightRecord = resolveSessionEvidenceIds(
-        session,
-        [parsed.right_evidence_id],
-        expected,
-      );
-      if (!rightRecord.ok) return toCallToolResult(rightRecord, contract);
-      let comparison: ReturnType<typeof compareProcessCaptures>;
-      let leftCapture: ReturnType<typeof parseProcessCapture>;
-      let rightCapture: ReturnType<typeof parseProcessCapture>;
-      try {
-        leftCapture = parseProcessCapture(
-          leftRecord.value[0]?.normalized_result,
-        );
-        rightCapture = parseProcessCapture(
-          rightRecord.value[0]?.normalized_result,
-        );
-        const computed = await runDerivedOperation(context, contract.name, () =>
-          compareProcessCaptures(leftCapture, rightCapture, {
-            ...(parsed.max_capture_age_ms === undefined
-              ? {}
-              : { maxCaptureAgeMs: parsed.max_capture_age_ms }),
-            now,
-          }),
-        );
-        if (!computed.ok) return toCallToolResult(computed, contract);
-        comparison = computed.value;
-      } catch (cause: unknown) {
-        return toCallToolResult(
-          err(
-            new EvidenceIntegrityError(
-              cause instanceof Error
-                ? cause.message
-                : "Invalid Process Capture v4",
+        context.mcpReq.signal,
+        async () => {
+          const left = parseCaptureSide(contract.name, "left", input.left);
+          if (!left.ok) return server.delivery.toCallToolResult(left, contract);
+          const right = parseCaptureSide(contract.name, "right", input.right);
+          if (!right.ok)
+            return server.delivery.toCallToolResult(right, contract);
+          const { record: leftRecord, capture: leftCapture } = left.value;
+          const { record: rightRecord, capture: rightCapture } = right.value;
+          const computed = await runDerivedOperation(
+            context,
+            contract.name,
+            () =>
+              compareProcessCaptures(leftCapture, rightCapture, {
+                ...(input.max_capture_age_ms === undefined
+                  ? {}
+                  : { maxCaptureAgeMs: input.max_capture_age_ms }),
+                ...(input.trace_spec === undefined
+                  ? {}
+                  : { traceSpecification: input.trace_spec }),
+                now,
+              }),
+          );
+          if (!computed.ok)
+            return server.delivery.toCallToolResult(computed, contract);
+          const comparison = computed.value;
+          const evidence = createEvidence(undefined, PROCESS_PROVIDER, {
+            predicateType: "rea.process-comparison",
+            operation: contract.name,
+            parameters: {
+              left_evidence_id: leftRecord.evidence_id,
+              right_evidence_id: rightRecord.evidence_id,
+              left_normalization: leftCapture.normalization,
+              right_normalization: rightCapture.normalization,
+              ...(input.trace_spec === undefined
+                ? {}
+                : { trace_spec: jsonValueSchema.parse(input.trace_spec) }),
+            },
+            result: jsonValueSchema.parse(comparison),
+            confidence: "derived",
+            authority: "analyst-inference",
+            limitations: comparison.limitations,
+            locations: sourceLocations(
+              leftRecord.locations,
+              rightRecord.locations,
             ),
-          ),
-          contract,
-        );
-      }
-      const evidence = createEvidence(undefined, PROCESS_PROVIDER, {
-        predicateType: "rea.process-comparison/v3",
-        operation: contract.name,
-        parameters: {
-          left_evidence_id: parsed.left_evidence_id,
-          right_evidence_id: parsed.right_evidence_id,
-          left_normalization: leftCapture.normalization,
-          right_normalization: rightCapture.normalization,
+            evidenceLinks: [leftRecord.evidence_id, rightRecord.evidence_id],
+          });
+          const recordedSources = recordSessionEvidenceSources(
+            (evidence) => session.recordEvidence(evidence),
+            [leftRecord, rightRecord],
+          );
+          if (!recordedSources.ok)
+            return server.delivery.toCallToolResult(recordedSources, contract);
+          return server.delivery.toEvidenceToolResult(
+            evidence,
+            contract,
+            recordDerivedEvidence(
+              session,
+              evidence,
+              comparisonUnknownInput(
+                {
+                  left_evidence_id: leftRecord.evidence_id,
+                  right_evidence_id: rightRecord.evidence_id,
+                  comparison_evidence_id: evidence.evidence_id,
+                },
+                comparison,
+              ),
+            ),
+          );
         },
-        result: jsonValueSchema.parse(comparison),
-        confidence: "derived",
-        authority: "analyst-inference",
-        limitations: comparison.limitations,
-        evidenceLinks: [parsed.left_evidence_id, parsed.right_evidence_id],
-      });
-      return toCallToolResult(
-        recordDerivedEvidence(
-          session,
-          evidence,
-          comparisonUnknownInput(parsed, comparison),
-        ),
-        contract,
-      );
-    },
+      ),
   );
 };
 
@@ -119,34 +197,34 @@ const comparisonUnknownInput = (
   parsed: {
     readonly left_evidence_id: string;
     readonly right_evidence_id: string;
-    readonly unknown_registry_approved?: true | undefined;
+    readonly comparison_evidence_id: string;
   },
   comparison: ReturnType<typeof compareProcessCaptures>,
 ): RecordUnknownInput | undefined => {
-  if (
-    parsed.unknown_registry_approved !== true ||
-    comparison.status === "unchanged"
-  )
-    return undefined;
+  if (comparison.status === "unchanged") return undefined;
   const differingScopes = [
     ["terminal", comparison.terminal],
     ["interaction", comparison.interaction],
     ["exit", comparison.exit],
     ["filesystem", comparison.filesystem],
-    ["protocol", comparison.protocol],
     ["process", comparison.process],
-    ["shim", comparison.shim],
   ]
     .filter(([, status]) => status !== "unchanged")
     .map(([scope]) => scope)
     .join(", ");
+  const contradictory =
+    comparison.status === "changed" &&
+    parsed.left_evidence_id !== parsed.right_evidence_id;
+  // Unknown identity uses the question, not its supporting records. Bind the
+  // question to this comparison so distinct capture pairs and policies coexist.
   return {
-    approved: true,
-    question: `Process captures disagree across: ${differingScopes}`,
+    question: `${contradictory ? "Process captures disagree" : `Process comparison is ${comparison.status}`} across: ${differingScopes} (comparison ${parsed.comparison_evidence_id})`,
     severity: "high",
     domain: "process-comparison",
-    supporting_evidence_ids: [parsed.left_evidence_id],
-    contradicting_evidence_ids: [parsed.right_evidence_id],
+    supporting_evidence_ids: contradictory
+      ? [parsed.left_evidence_id]
+      : [...new Set([parsed.left_evidence_id, parsed.right_evidence_id])],
+    contradicting_evidence_ids: contradictory ? [parsed.right_evidence_id] : [],
     required_authority: "controlled-replay",
     required_confidence: "observed",
     required_environment: null,

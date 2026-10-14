@@ -1,255 +1,309 @@
 <div align="center">
 
-[English](README.md) · [简体中文](README_zh.md) · **日本語** · [한국어](README_ko.md) · [العربية](README_ar.md)
+[English](README.md) · [简体中文](README_zh.md) · [繁體中文](README_zh-TW.md) · **日本語** · [한국어](README_ko.md) · [Türkçe](README_tr.md) · [Русский](README_ru.md) · [Tiếng Việt](README_vi.md) · [ไทย](README_th.md) · [Deutsch](README_de.md) · [Español](README_es.md) · [Français](README_fr.md) · [Українська](README_uk.md) · [Polski](README_pl.md) · [Português (Brasil)](README_pt-BR.md) · [العربية](README_ar.md) · [فارسی](README_fa.md) · [Bahasa Indonesia](README_id.md) · [Italiano](README_it.md)
 
 # REA：あらゆるものをリバースエンジニアリング
 
-### コーディングエージェントがあらゆるものをリバースエンジニアリングするための、ひとつの CLI / MCP サーバー
+### バイナリ、アプリケーション、実行時の動作を、ひとつの MCP でリバースエンジニアリング。
 
-**気になる機能を見つけ、仕組みを理解し、自分の形で実装する。**
+**気に入った機能を見つけたら、その仕組みをバイナリのレベルまで理解する。**
 
 [![npm version](https://img.shields.io/npm/v/rea-agents?style=flat-square&color=cb3837)](https://www.npmjs.com/package/rea-agents)
-[![CI](https://img.shields.io/github/actions/workflow/status/morluto/rea/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/morluto/rea/actions/workflows/ci.yml)
-[![MCP tool catalog](https://img.shields.io/badge/MCP-tool_catalog-5c4ee5?style=flat-square)](#調査ツールカタログ)
-[![Node.js 22+](https://img.shields.io/badge/Node.js-22.19%2B-339933?style=flat-square&logo=nodedotjs&logoColor=white)](https://nodejs.org/)
+[![MCP tool catalog](https://img.shields.io/badge/MCP-tool_catalog-5c4ee5?style=flat-square)](docs/mcp-contracts.md#generated-catalog)
+[![Node.js requirements](https://img.shields.io/badge/Node.js-requirements-339933?style=flat-square&logo=nodedotjs&logoColor=white)](#current-status)
+[![skills.sh](https://skills.sh/b/morluto/rea?style=flat-square)](https://skills.sh/morluto/rea/reverse-engineer-anything)
 [![MIT license](https://img.shields.io/badge/license-MIT-f4c430?style=flat-square)](LICENSE)
+[![Discord](https://img.shields.io/discord/1556595354999332884?logo=discord&logoColor=white&label=Discord&color=5865F2)](https://discord.gg/GkcryMnJDM)
 
-[クイックスタート](#クイックスタート) · [バイナリから動作へ](#バイナリから動作へ) · [ツールカタログ](#調査ツールカタログ) · [仕組み](#仕組み) · [FAQ](#faq)
+<a href="https://trendshift.io/repositories/82054?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-82054" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/82054" alt="morluto%2Frea | Trendshift" width="250" height="55"/></a>
+
+**[ウェブサイト](https://rea.tools/ja/) · [ガイド](https://rea.tools/ja/guides/) · [事例](https://rea.tools/ja/showcase/)**
+
+[クイックスタート](#クイックスタート) · [REA の仕組み](#rea-の仕組み) · [分析できる対象](#分析できる対象) · [事例](#事例) · [よくある質問](#よくある質問) · [ドキュメント](#ドキュメント)
+
+<code>npx rea-agents setup</code>
 
 <br />
 
-<code>curl -fsSL https://raw.githubusercontent.com/morluto/rea/main/install.sh | bash</code>
+<img src="docs/assets/rea-hopper-analysis.png" alt="REA が Hopper 内で分析ブリッジを起動し、ネイティブバイナリを調べる様子" width="1200" />
+
+<br /><br />
+
+<table aria-label="REA コミュニティ">
+<tr>
+<td align="center" width="360">
+  <a href="https://discord.gg/GkcryMnJDM">
+    <img src="docs/assets/discord.svg" height="42" alt="Discord" /><br />
+    <strong>リバースエンジニアリングのコミュニティに参加</strong>
+  </a><br />
+  <sub>Discord · 質問と回答 · 成果の共有</sub>
+</td>
+</tr>
+</table>
+
+<br />
 
 </div>
 
 ---
 
-アプリの気になる機能を自分のプロダクトにも取り入れたいと思ったことはありませんか。ソースコードがなくても、そのアプリをコーディングエージェントに渡せます。REA を使えば、エージェントが機能を調査して仕組みを理解し、あなたの技術スタック、デザイン、要件に合わせた形で実装できます。
+アプリに、自分の製品にも取り入れたい機能を見つけましたか？エージェントに REA で調査を依頼してください。ソースコードがなくてもアプリを調べ、機能の仕組みを説明し、根拠を示したうえで、あなたのプロジェクト向けに実装できます。
 
-REA はこの流れをひとつの CLI / MCP サーバーで実現します。エージェントはコンパイル済みのアプリを調べ、機能の流れを追い、分かったことを通常のコーディング作業に活用できます。複雑なリバースエンジニアリングツールは REA がひとつのインターフェースの裏側で扱います。
+REA はエージェントを分析ツールにつなぎ、ネイティブバイナリ、JavaScript や Electron のアプリ、.NET アセンブリ、ウェブサイトを調べられるようにします。同じツールをターミナルからも使えます。分析はローカルで実行され、結果には各結論を裏付ける根拠と制限事項が含まれます。
 
-## エージェントに頼むだけ
+セットアップはエージェントに REA を登録し、対応するワークフローの手順をインストールします。ネイティブ分析には既存の Hopper または Ghidra を使えます。承認すれば、セットアップで Hopper をインストールすることもできます。静的な JavaScript 分析には、どちらのエンジンも必要ありません。
 
-```bash
-npx skills add morluto/rea
-```
-
-次のように依頼します：
-
-```text
-REA をセットアップしてメモアプリをリバースエンジニアリングしてください。
-検索の仕組みと判断の理由を示し、私のプロジェクト向けに同様の機能を実装してください。
-```
-
-メモアプリは例にすぎません。調べたいアプリを指定するか、まず概要から始めるよう依頼できます。
-
-## バイナリから動作へ
-
-| 逆コンパイル                                                                                                                     | 理解                                                                                                                       | 再現                                                                                       |
-| -------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| ネイティブアプリや実行ファイルから、プロシージャ、疑似コード、アセンブリ、文字列、シンボル、セグメント、メタデータを復元します。 | 呼び出し元、呼び出し先、クロスリファレンス、コールグラフをたどり、機能やアルゴリズムの実際の動作を説明できる状態にします。 | エージェントが得た知見を、あなたの技術スタック、画面、要件に合うプロダクト機能へ変えます。 |
-
-REA は調査をバイナリ上の根拠に結び付けます。元のソースコードを復元したり、アプリ全体を自動複製したりするとは主張しません。
-
-## REA を選ぶ理由
-
-|                        |                                                                                       |
-| ---------------------- | ------------------------------------------------------------------------------------- |
-| **エージェント向け**   | コンパイル済みアプリについて質問し、推測ではなく根拠を集めさせることができます。      |
-| **CLI と MCP**         | ターミナルとコーディングエージェントから同じリバースエンジニアリング機能を使えます。  |
-| **複雑さを処理**       | ツール設定、アプリの読み込み、調査の維持、終了後のクリーンアップを REA が担います。   |
-| **一連の調査に対応**   | 最初の概要から疑似コード、呼び出し関係、型、実装の手掛かりまで掘り下げられます。      |
-| **ローカルで解析**     | 解析は Mac 上で実行され、REA がバイナリをホスト型解析サービスへ送ることはありません。 |
-| **コンテキストを維持** | 質問ごとに解析を最初からやり直さず、複数のバイナリを続けて調査できます。              |
+> **[REA のウェブサイト](https://rea.tools/ja/)**で、セットアップ手順、図解ガイド、実際の事例を確認できます。
 
 ## クイックスタート
 
-### コーディングエージェントから（推奨）
+### エージェントを設定する
+
+Node.js と npm がインストールされている環境で実行します。
 
 ```bash
-npx skills add morluto/rea
-```
-
-エージェントに REA のセットアップを依頼してください。Mac を確認し、必要なインストールを説明して承認を求め、システムプロンプトを案内します。完全なツールを読み込むため再起動を求められた場合は、セットアップ後に再起動してください。
-
-### 始める前に
-
-- macOS 12 以降
-- Ubuntu 24.04+、Fedora 41+、または 64 ビット Arch Linux
-- Node.js 22.19+ または 24.11+ と、Node に付属する npm
-
-`rea setup` は変更計画を表示し、確認後に適用します。Homebrew、Node.js、npm をインストールまたは更新しません。[Hopper](https://www.hopperapp.com/) がない場合は公式パッケージを提案します。Hopper は別製品で、ライセンスは別途必要です。
-
-64 ビット Linux に Ghidra 12.1.2 PUBLIC と完全な 64 ビット JDK 21 がすでにある場合、Setup は承認後に `GHIDRA_INSTALL_DIR` と任意の `JAVA_HOME` も登録できます。REA は Ghidra や Java をダウンロード、インストール、変更しません。Ghidra プロバイダーは隔離された読み取り専用 headless セッションで、インベントリ、逆コンパイル、アセンブリ、呼び出し関係、型付き参照、xref、CFG、関数 dossier を提供します。GUI 状態と変更操作は引き続き利用できません。
-
-#### Linux のインストールとトラブルシューティング
-
-Ubuntu 24.04+、Fedora 41+、64 ビット Arch Linux では、REA が公式の DEB、RPM、または Arch パッケージを取得し、公開されたサイズとチェックサムを検証してから `apt-get`、`dnf`、または `pacman` で依存関係を解決します。root 以外では `pkexec` がシステム承認を表示します。REA は `sudo` を呼び出しません。
-
-既定のランチャーは `/opt/hopper/bin/Hopper` です。別の場所では `HOPPER_LAUNCHER_PATH` を設定してください。Doctor が解析エンジン不足を報告した場合は `ldd /opt/hopper/bin/Hopper | grep 'not found'` を実行し、不足ライブラリを入れて `rea setup` を再実行します。REA は対応する Hopper デモ版を専用 Xvfb ディスプレイで起動し、解析セッションごとに Hopper が提示するデモモードを選択します。デスクトップの `DISPLAY` や有料ライセンスは不要ですが、デモ版にはベンダー所定の制限があります。`~/.local/bin` も `PATH` に追加してください。
-
-```bash
-# 1. REA をセットアップ
-curl -fsSL https://raw.githubusercontent.com/morluto/rea/main/install.sh | bash
 npx rea-agents setup
 ```
 
-macOS やインストーラーから確認を求められた場合は、その操作を完了してから同じコマンドをもう一度実行してください。
+使うエージェントを選び、予定されている変更を確認して承認してください。セットアップは REA の MCP サーバーと対応するワークフローの手順を追加し、既存の設定をバックアップします。完了後にエージェントを再起動してください。
 
-### 2. コーディングエージェントを再起動
+セットアップは Claude Code、Codex、Cursor、Gemini CLI、Grok Build、および[その他のエージェント](docs/installation.md#supported-agents)に対応しています。プロバイダーの設定と MCP の手動登録については、[インストールとセットアップ](docs/installation.md)を参照してください。
 
-Setup は Claude Code、Claude Desktop、Codex、Cursor、Gemini CLI、Windsurf、Devin を検出します。検出した最初の 6 クライアントは自動設定しますが、Devin はローカル MCP 設定境界が文書化されていないため、検出結果を報告するだけで変更しません。設定されたクライアントを再起動して REA を読み込んでください。
-
-### 3. エージェントに依頼
-
-アプリは名前で指定できます。コーディングエージェントがアプリを探し、REA に必要なプログラムファイルを渡します。
+### エージェントに依頼する
 
 ```text
-REA でメモアプリをリバースエンジニアリングしてください。検索機能の仕組みと
-根拠を示し、SQLite を使って私のプロジェクト向けに同様の機能を実装してください。
+Notes アプリの検索機能の仕組みを調べ、根拠を示して、私のプロジェクトにも同様の機能を実装してください。
 ```
 
-問題がある場合は次を実行します：
+Notes を対象のアプリに置き換え、理解したい機能を指定してください。
+
+### ターミナルを使う
+
+展開済みの JavaScript/Electron アプリのディレクトリ、または ASAR を調べます。
 
 ```bash
-npx -y rea-agents@latest doctor
-rea uninstall
-rea uninstall --purge-data
+npx -y rea-agents@latest analyze-javascript-application /absolute/path/to/app --json
 ```
 
-## ひとつのプロンプトで調査を完結
+結果にはモジュール、インポート、Electron の境界と、それらの根拠が含まれます。パスは対象に合わせて変更してください。Windows では、たとえば `"D:/apps/example"` を指定します。
 
-```text
-メモアプリをリバースエンジニアリングし、オフライン検索機能の仕組みを説明して、
-TypeScript と SQLite を使って私のプロジェクト向けに実装してください。
-```
-
-| 手順 | エージェントの処理             | REA ツール                                                       |
-| ---: | ------------------------------ | ---------------------------------------------------------------- |
-|    1 | バイナリを開いて識別           | `open_binary`, `binary_overview`                                 |
-|    2 | オフライン検索の手掛かりを探す | `search_strings`, `search_procedures`, `list_names`              |
-|    3 | 手掛かりと実行コードを接続     | `find_xrefs_to_name`, `xrefs`, `procedure_callers`               |
-|    4 | 制御フローを復元               | `get_call_graph`, `procedure_callees`, `procedure_info`          |
-|    5 | 関連する処理を逆コンパイル     | `procedure_pseudo_code`, `procedure_assembly`, `batch_decompile` |
-|    6 | プロジェクトに機能を実装する   | 技術スタック、プロダクト、要件に合わせたコード                   |
-
-REA は手順 1〜5 のバイナリ解析を処理し、手順 6 はエージェントの通常の編集・テストツールが行います。
-
-## エージェントにできること
-
-- ソースコードがない機能の仕組みを説明する。
-- アプリの認証、保存、更新、ネットワークフローを復元する。
-- 非公開の形式やインターフェースを文書化できる構造を回収する。
-- 文字列やシンボルから疑わしい動作の実装コードまで追跡する。
-- 同じセッションで 2 バージョンを切り替え、実装経路を比較する。
-- 気になる機能を調査し、自分のプロダクトに合わせた形で実装する。
-- 復元した動作をプロダクト機能、テスト、移行ノート、移植、相互運用できる代替実装へ変換する。
-- Swift / Objective-C のメタデータを解析する。
-- Hopper に名前、コメント、ブックマークを残し、人間とエージェントの調査を共有する。
-
-## 調査ツールカタログ
-
-| ツール群               |  数 | 例                                                                                                                                                                                                        |
-| ---------------------- | --: | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| バイナリ調査           |  33 | プロシージャ、疑似コード、アセンブリ、文字列、名前、セグメント、callers、callees、xrefs、注釈                                                                                                             |
-| 合成解析               |  10 | `binary_overview`, `analyze_function`, `batch_decompile`, `get_call_graph`, `find_xrefs_to_name`, Swift / ObjC 検出                                                                                       |
-| macOS ネイティブ       |   5 | Mach-O メタデータ、署名、plist、アーキテクチャ、Swift デマングル。Hopper 起動不要                                                                                                                         |
-| アーティファクトグラフ |   2 | ディレクトリ、ZIP/APK/IPA、ASAR の決定的一覧と明示選択されたトランザクション抽出                                                                                                                          |
-| Managed PE/CLI         |   8 | PE/CLI 識別、メタデータメンバー、CIL ハッシュ、P/Invoke/ネイティブ境界宣言と検証、アプリケーショングラフ投影、逆コンパイル再構成インポート、構造的 token 再マッピング、ランタイム相関計画、バージョン比較 |
-| ブラウザ観察           |   8 | origin 限定 CDP 取得、bundle/source map 解析、WebMCP 検出、セッション、capture diff、視覚証拠                                                                                                             |
-| Electron 解析          |   4 | canonical ファイルルート内の受動観察、有界な静的アプリマッピング、Evidence に基づく静的/実行時の照合                                                                                                      |
-| アプリケーション       |   7 | 有界なクロスレイヤー追跡、一意限定のバージョン比較、承認済み Linux 隔離 extracted-module replay、マネージドランタイム特性評価、再構築カバレッジ閉包                                                       |
-| バイナリセッション     |  18 | `open_binary`、`binary_session`、証拠バンドル、プロセス／成果物／関数比較、残余未知レジストリ                                                                                                             |
-
-## 他のコーディングエージェントで使う
-
-Setup は Claude Code、Claude Desktop、Codex、Cursor、Gemini CLI、Windsurf、Devin を検出し、最初の 6 クライアントを自動設定します。Devin は検出結果を報告するだけで変更しません。ローカル MCP サーバーに対応するコーディングエージェントなら、次の設定で REA を利用できます。
-
-```json
-{
-  "mcpServers": {
-    "rea": {
-      "command": "npx",
-      "args": ["-y", "rea-agents@latest", "mcp"]
-    }
-  }
-}
-```
-
-## 仕組み
-
-```mermaid
-flowchart LR
-    Agent["コーディングエージェント"] --> REA["REA<br/>CLI + MCP"]
-    Terminal["ターミナル"] --> REA
-    REA --> Hopper["Hopper 解析操作"]
-    Hopper --> App["あなたのアプリ"]
-    REA --> Ghidra["Ghidra 読み取り専用解析<br/>インベントリ + 関数解析"]
-    Ghidra --> App
-```
-
-CLI と MCP サーバーは同じ解析エンジンを使います。ターミナルのコマンドは終了時にアプリを閉じ、エージェントのセッションは調査中アプリを開いたままにします。
-
-## CLI
-
-上のエージェントワークフローが、REA を使う最も簡単な方法です。ターミナルから一度だけアプリの概要を調べる場合は、次を実行します。
-
-```bash
-npx -y rea-agents@latest analyze /Applications/Notes.app
-```
-
-直接デコンパイルする方法やその他のオプションは、`npx -y rea-agents@latest --help` で確認できます。
-
-グローバルな `rea` コマンドとしてもインストールできます。
+日常的に使う場合は、`rea` コマンドをインストールできます。
 
 ```bash
 npm install --global rea-agents
 rea --help
-rea mcp
 ```
 
-REA は Mac の `.app` フォルダーを直接開けます。エージェントがアプリを見つけられない場合は、インストール場所を伝えてください。
+ネイティブ分析には、先にプロバイダーの設定が必要です。ネイティブ分析のコマンド、プロバイダーの選択、スナップショット、スクリプトでの利用は、[CLI と Evidence のガイド](docs/cli.md)を参照してください。
 
-## Hopper アプリの動作
+### REA を更新する
 
-REA は必要なときに Hopper を起動します。Hopper のランチャーは内部でアプリをアクティブ化するため、ターゲットを開くと Hopper が前面に出る場合があります。REA はバックグラウンド起動を要求しますが、常に背面に留まる保証はありません。
+REA は更新が速く、新しいリリースには頻繁にバグ修正が含まれます。インストールしたバージョンを最新に保ってください。
 
-明示的な形式・アーキテクチャ引数により一般的な FAT / ARM 選択ダイアログを避けますが、別の Hopper / macOS ダイアログは人の操作を必要とする場合があります。セッションを閉じるとブリッジとソケットを削除しますが、ユーザーが利用中の Hopper は終了しません。
+npm でインストールした CLI の場合：
 
-## セキュリティモデル
+```bash
+rea update
+```
 
-各セッションはランダムな capability token と現在のユーザーだけが使える Unix ソケットを使用します。Ghidra セッションは隔離された一時プロジェクトも使用し、ユーザー所有の Ghidra プロジェクトを開いたり変更したりしません。これはサンドボックスではなく、同じ OS ユーザー権限で動作する悪意あるプロセスを防御しません。信頼できないバイナリの解析は、現在のユーザー権限で選択されたローカルプロバイダーに委譲されます。脆弱性は [SECURITY.md](SECURITY.md) の非公開手順で報告してください。
+エージェントの登録とスキルを更新するには、更新処理が表示するセットアップコマンドを実行してください。
 
-## FAQ
+`npx` を使っている場合は、次のコマンドでエージェントの設定を更新します。
 
-<details><summary><strong>Hopper を先に起動する必要がありますか？</strong></summary>
+```bash
+npx rea-agents@latest setup
+```
 
-いいえ。REA が必要時に起動します。すでに起動している Hopper にも対応します。
+設定の変更を確認し、エージェントを再起動してください。単発の CLI 操作では、`npx rea-agents@latest` に続けてコマンドを指定します。
+
+## REA の仕組み
+
+エージェントは MCP 経由で REA を呼び出し、対象を調べて関連するコードを追跡します。REA は調査結果と根拠を返します。エージェントはそれを使って追加の質問をしたり、動作を説明したり、実装を書いてテストしたりします。CLI コマンドも同じワークフローを使います。
+
+![REA の調査フロー：エージェントがローカルの対象について質問し、REA が分析ツールで調査・追跡します。エージェントは返されたコード、参照、未解明の点を使い、説明、実装、テストを行います。](website/public/assets/figures/rea-investigation-flow.svg)
+
+[原寸大の図を開く](website/public/assets/figures/rea-investigation-flow.svg)。
+
+<a id="current-status"></a>
+
+## 分析できる対象
+
+REA には Node.js 22.x（>=22.19）、24.x（>=24.11）、または 26+ と npm が必要です。追加のツールや対応ホストは、対象によって異なります。
+
+| 対象                             | REA が返すもの                                                                              | 要件とガイド                                                                                                                                       |
+| -------------------------------- | ------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ネイティブバイナリ               | 疑似コード、アセンブリ、文字列、シンボル、呼び出し、参照                                    | Hopper、Ghidra、または IDA；[ネイティブ分析](https://rea.tools/ja/guides/native/)                                                                  |
+| オフライン ELF レイアウト        | セクション、セグメント、元のシンボル／再配置情報、静的解析によるセキュリティ対策の候補      | Linux x64 で利用者が用意する pwntools；[バイナリ診断](docs/binary-diagnostics.md)                                                                  |
+| EVM バイトコード                 | ディスパッチセレクター、バイトオフセット、推定された引数と状態変更の可否                    | Linux x64 上のローカルの生バイト／16 進数の入力ファイル；[オフライン EVM ガイド](docs/evm-bytecode.md)                                             |
+| 記録済みの Linux クラッシュ      | 生の note レコード、記録された全スレッドのレジスター／シグナル、任意のマッピング候補        | Linux x64 で利用者が用意する pwntools；GDB/pwndbg は任意；[記録済みクラッシュ](docs/recorded-crashes.md)                                           |
+| JavaScript / Electron            | モジュール、インポート、ソースマップ、ルート、IPC、ネイティブアドオンの関係                 | Node.js と npm；[アプリケーション分析](https://rea.tools/ja/guides/javascript/)                                                                    |
+| ウェブサイト                     | ページ構造、スクリプト、ネットワークの観測結果、依頼されたスクリーンショット                | Chrome 系ブラウザー；[ブラウザー分析](https://rea.tools/ja/guides/browser/)                                                                        |
+| 保存済みのネットワークキャプチャ | リクエスト、レスポンス、取得可能なペイロード、ソース内の位置                                | HAR；mitmproxy ネイティブ形式のキャプチャには Linux 上の mitmdump；[キャプチャガイド](docs/web-network-captures.md)                                |
+| パケットキャプチャ               | エンドポイント、DNS、TLS SNI、プロトコル分布、HTTPリクエスト                                | 呼び出し側が用意した tshark と capinfos；[pcapガイド](docs/pcap-analysis.md)                                                                       |
+| .NET アセンブリ                  | メタデータ、CIL 命令、宣言されたネイティブ依存関係、ビルドの比較                            | 静的な検査；[マネージドコードのガイド](docs/managed-code-analysis.md)                                                                              |
+| Android APK                      | マニフェストの宣言、クラス、逆コンパイルされたメソッド、参照                                | Linux/macOS/Windows x64 上のヘッドレス JADX と完全な JDK；[Android ガイド](docs/android-analysis.md)                                               |
+| Android デバイス                 | デバイス、パッケージ、プロセス、ログ、ダンプ、スクリーンキャプチャ、APK/ファイル転送        | 呼び出し側が用意した adb（エミュレーターまたは実機）；[ADB ガイド](docs/adb-device-analysis.md)                                                    |
+| JEBプロジェクト                  | エンジンによるプロジェクトユニット、アーティファクトのダイジェスト、型/メソッドの擬似コード | 呼び出し側が起動し MCP を提供する JEB クライアント（REA_JEB_MCP_URL で選択）；[JEB ガイド](docs/jeb-analysis.md)                                   |
+| Android リソース                 | デコードされたマニフェスト、文字列テーブル、ロケール、バージョン情報                        | 呼び出し側が用意した Apktool ランチャー；[リソースガイド](docs/apktool-resource-analysis.md)                                                       |
+| Flutter アプリ                   | Dart スナップショットハッシュ、ABI ごとのライブラリダイジェスト、エンジンビルドの来歴       | 不要（静的 APK 解析）；[Flutter ガイド](docs/flutter-analysis.md)                                                                                  |
+| ファームウェア                   | 領域、抽出結果、ネイティブ分析への引き継ぎ                                                  | Linux 上の Binwalk / Unblob；[ファームウェアガイド](docs/firmware-analysis.md)                                                                     |
+| 記録済みパケット                 | 選択フィールド、繰り返し値、フィルター、デコード指定                                        | Linux: TShark 4.x + prlimit; [キャプチャガイド](docs/packet-captures.md)                                                                           |
+| 記録済みロジック信号             | デコーダ注釈、サンプル範囲、診断情報                                                        | Linux: sigrok-cli 0.7.2 + prlimit; [信号記録ガイド](docs/signal-recordings.md)                                                                     |
+| パッケージとリソース             | ファイル一覧、ダイジェスト、plist、Apple バンドルの構造、抽出されたリソース                 | [アーティファクトと JavaScript のガイド](docs/javascript-artifact-reconstruction.md)、[Apple アプリケーション](docs/apple-application-analysis.md) |
+| プロセスの動作                   | ターミナル出力、対話、終了とファイルシステムの観測結果、実行の比較                          | ネイティブ PTY を備えた Linux/macOS；[プロセスキャプチャ](docs/process-capture.md)                                                                 |
+
+静的な JavaScript と .NET の検査は、指定されたファイルを読み取り、アプリケーションを実行しません。実行時キャプチャは、あなたのユーザー権限で対象を実行したり、対象とやり取りしたりします。それぞれの実行時ガイドに、どのような操作が行われるかを記載しています。
+
+<a id="choosing-a-deep-analysis-provider"></a>
+
+対応するネイティブ形式とホストは、プロバイダーによって異なります。[Hopper と Ghidra のセットアップ](docs/installation.md#hopper)、[IDA ガイド](docs/ida-provider.md)、[Windows 向け Ghidra の実験的対応](docs/windows-ghidra-p0.md)を参照してください。Ghidra は [16 ビット DOS 分析](docs/ghidra-dos.md)にも対応しています。プロバイダーの選択は [CLI ガイド](docs/cli.md#choose-a-provider)を参照してください。最新の npm リリース以降に追加された機能については、[リリースでの利用可否](docs/installation.md#released-package-and-main)を確認してください。
+
+## 事例
+
+[![DX-Ball の音声パン、Notion のクリップボードブリッジ、TH04 の弾幕リングの事例を表すイラスト](docs/assets/rea-showcases.png)](https://rea.tools/ja/showcase/)
+
+### DX-Ball：音声のパン計算を再構築する
+
+音声の呼び出しから位置をパンに変換する補助関数をたどり、命令を調べ、不完全な疑似コードを C に書き直します。再構築した実装は、元の x86 に対する 3,205 ケースの検証を通過し、コンパイル後の関数の全 63 バイトを再現しています。
+
+[事例を読む](https://rea.tools/ja/showcase/dx-ball/) ·
+[再構築リポジトリ](https://github.com/N0zoM1z0/dx-ball)
+
+### Notion：Electron のクリップボードブリッジを追跡する
+
+レンダラーのクリップボード API を見つけ、preload と IPC を経由してメインプロセスまでたどり、リッチなクリップボード形式を調べます。
+
+[事例を読む](https://rea.tools/ja/showcase/notion/)
+
+### TH04：DOS の弾幕リングの計算を復元する
+
+元の PC-98 ゲームの 16 ビット命令を調べ、固定角度と自機を狙う角度の計算を復元し、再構築した C++ を当時のコンパイラーの出力と比較します。
+
+[事例を読む](https://rea.tools/ja/showcase/th04/) ·
+[再構築リポジトリ](https://github.com/N0zoM1z0/th04)
+
+REA で興味深い対象を調べたら、ぜひ共有してください。[issue](https://github.com/morluto/rea/issues) または [pull request](https://github.com/morluto/rea/pulls) に、対象、調べたかったこと、REA がどう役立ったか、何が分かったかを記載してください。
+
+## よくある質問
+
+<details>
+<summary><strong>どのエージェントで REA を使えますか？</strong></summary>
+
+ローカル MCP サーバーに対応するエージェントなら使えます。セットアップは[対応エージェント](docs/installation.md#supported-agents)を設定します。その他のクライアントでは、[MCP の手動登録](docs/installation.md#mcp-registry)を利用できます。
 
 </details>
 
-<details><summary><strong>REA に Hopper は含まれますか？</strong></summary>
+<details>
+<summary><strong>Hopper、Ghidra、IDA は必要ですか？</strong></summary>
 
-含まれません。Setup で Hopper をインストールできますが、Hopper は独自のライセンスを持つ別製品です。REA は CLI、MCP サーバー、エージェント向けワークフローを提供します。
-
-</details>
-
-<details><summary><strong>バイナリはアップロードされますか？</strong></summary>
-
-REA にホスト型解析サービスはありません。ローカル Unix ソケット経由で Hopper を操作します。エージェントやモデル提供者のデータポリシーは別途確認してください。
+深いネイティブ分析には、そのいずれかを使います。静的な JavaScript と .NET の検査には、ネイティブ分析エンジンは必要ありません。セットアップは承認後に Hopper をインストールできます。Ghidra と IDA は既存のインストールを使います。[プロバイダーのセットアップ](docs/installation.md#hopper)を参照してください。
 
 </details>
 
-<details><summary><strong>元のソースコードを復元できますか？</strong></summary>
+<details>
+<summary><strong>先に Hopper を起動する必要はありますか？</strong></summary>
 
-保証できません。REA は疑似コード、アセンブリ、シンボル、文字列、メタデータ、関係を提供し、エージェントが観察した動作を説明または互換再現できるようにします。
+REA は必要な操作の際に Hopper を起動します。macOS では、初回起動時にデモモードを選ぶか、ライセンスを有効化するよう求められることがあります。[Hopper の起動とトラブルシューティング](docs/installation.md#launcher-paths-and-troubleshooting)を参照してください。
 
 </details>
 
-## 開発
+<details>
+<summary><strong>skills.sh からスキルをインストールすると何ができますか？</strong></summary>
 
-開発環境、アーキテクチャ、テスト、リリース手順は [CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。
+スキルはエージェントに調査の手順を提供します。`npx rea-agents setup` で REA の MCP サーバーを登録し、対応する手順をインストールしてから、エージェントを再起動してください。[スキルのみのインストール](docs/installation.md#skill-only-installation)を参照してください。
+
+</details>
+
+<details>
+<summary><strong>REA はどのようなコードを返しますか？</strong></summary>
+
+ネイティブ分析は疑似コードとアセンブリを返します。JavaScript/Electron 分析はモジュールとその関係を復元します。エージェントはその結果を使って実装を書き、テストします。[事例](#事例)に具体的な手順があります。
+
+</details>
+
+<details>
+<summary><strong>REA はアプリをアップロードしますか？</strong></summary>
+
+REA は対象をローカルで分析します。エージェントはツールの結果を受け取り、そのモデルプロバイダーには独自のデータポリシーがあります。
+
+</details>
+
+<details>
+<summary><strong>バグに遭遇したらどうすればよいですか？</strong></summary>
+
+まず更新してください。最近のリリースですでに修正されている可能性があります。
+
+npm でインストールした CLI の場合：
+
+```bash
+rea update
+```
+
+`npx` でエージェントを設定している場合：
+
+```bash
+npx rea-agents@latest setup
+```
+
+エージェントを使っている場合は、[設定の更新](#rea-を更新する)を完了し、再起動してください。同じタスクをもう一度試し、問題が続く場合は [issue を作成](https://github.com/morluto/rea/issues)して、REA のバージョン、対象の種類、再現手順、エラー出力を記載してください。
+
+</details>
+
+## ドキュメント
+
+まずはウェブサイトの[実践ガイド](https://rea.tools/ja/guides/)を参照してください。正確なオプション、前提条件、結果の契約については、以下を参照してください。
+
+- [インストールとセットアップ](docs/installation.md)：エージェントの登録、プロバイダーの設定、更新、アンインストール。
+- [準備状況の確認とトラブルシューティング](docs/installation.md#check-readiness-for-your-task)：特定のエージェントや分析エンジンを診断。
+- [CLI と Evidence](docs/cli.md)：コマンド、プロバイダーの選択、スナップショット、インポート／エクスポート、終了ステータス。
+- [MCP 契約](docs/mcp-contracts.md)と[エージェント向けプロンプト](docs/mcp-prompts.md)：ツールの結果、セッション、ガイド付き調査。
+- [ツールカタログ](docs/mcp-contracts.md#generated-catalog)：ビルド時に生成されるツール、プロバイダー、CLI コマンドの一覧。
+- [ロードマップ](docs/roadmap.md)：計画中の作業と機能の進捗。
+
+脆弱性の報告は [SECURITY.md](SECURITY.md) に従ってください。
+
+## スター履歴
+
+🎉 **GitHub スター 170,000 件、ありがとうございます！**
+
+REA の利用、バグ報告、機能の要望、ビルドのテスト、修正への貢献に感謝します。
+
+<a href="https://www.star-history.com/?repos=morluto%2Frea&amp;type=date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=morluto/rea&amp;type=date&amp;theme=dark&amp;legend=top-left" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=morluto/rea&amp;type=date" />
+    <img alt="REA の GitHub スター履歴" src="https://api.star-history.com/chart?repos=morluto/rea&amp;type=date" />
+  </picture>
+</a>
+
+## 免責事項
+
+責任ある利用については [DISCLAIMER.md](DISCLAIMER.md) を参照してください。
+
+REA は、法令に従った研究、教育、相互運用性の確保、ソフトウェアの保存、および所有するソフトウェアや調査を許可されたソフトウェアの解析を目的としています。
+
+The project's position on illegal or unauthorized use covers all REA
+versions, distribution channels, and platforms; each copy retains its
+applicable licenses.
+
+## 貢献する
+
+REA への貢献を歓迎します！[issue を作成](https://github.com/morluto/rea/issues)してバグや機能の提案を報告したり、[pull request を送信](https://github.com/morluto/rea/pulls)してコードやドキュメントを改善したりできます。
+
+開発環境とチェックは [CONTRIBUTING.md](CONTRIBUTING.md)、検証レーンは[テストガイド](docs/testing.md)、プロジェクト構造は[アーキテクチャ図](docs/architecture.mermaid)を参照してください。
 
 ## ライセンス
 
 [MIT](LICENSE)
+
+REA-authored code is licensed under MIT. Third-party material retains its own
+licenses and copyright notices; see [Third-party notices](THIRD_PARTY_NOTICES.md)
+for the dependency inventory, preserved license texts, and external-tool terms.
+
+**You must legally obtain and be authorized to use commercial tools**, including
+IDA Pro / Hex-Rays decompilers, Hopper, and JEB, under their applicable licenses.
+REA grants no tool license, key, or activation entitlement. Trials and demos
+remain subject to vendor terms, including user, feature, automation, and output
+sharing restrictions. Cracked copies, stolen keys, unauthorized key sharing,
+and bypassing license restrictions are not authorized. This guidance does not
+amend MIT or third-party licenses.

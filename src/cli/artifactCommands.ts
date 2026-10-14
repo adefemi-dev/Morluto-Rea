@@ -1,102 +1,245 @@
 import { z } from "incur";
 
-import { runProviderAnalysis } from "../application/DirectAnalysis.js";
+import type { DirectAnalysis } from "../composition/directAnalysis.js";
+import { createArtifactExtractionDestination } from "../application/artifacts/ArtifactExtractionDestination.js";
 import { logCliCommand } from "../cliLogging.js";
 import { CLI_COMMANDS } from "../cliCommandNames.js";
-import type { Logger } from "../logger.js";
+import type { Logger } from "pino";
 import type { CliInstance } from "./types.js";
 
 export const registerArtifactCommands = (
   cli: CliInstance,
   logger: Logger,
+  runProviderAnalysis: DirectAnalysis["runProviderAnalysis"],
 ): void => {
-  cli.command(CLI_COMMANDS.inventoryArtifact, {
-    description: "Build a bounded deterministic artifact graph",
+  registerInspectionCommand(cli, logger, runProviderAnalysis);
+  registerExtractionCommand(cli, logger, runProviderAnalysis);
+  registerInterfaceBuilderCommand(cli, logger, runProviderAnalysis);
+  registerAssetCatalogCommand(cli, logger, runProviderAnalysis);
+  registerDylibResolutionCommand(cli, logger, runProviderAnalysis);
+  cli.command(CLI_COMMANDS.inspectKeyedArchive, {
+    description:
+      "Inspect a Foundation keyed archive as an object-reference graph",
     args: z.object({
-      path: z.string().describe("Application or package path"),
+      path: z.string().describe("Foundation plist archive or Apple app bundle"),
+      archive: z
+        .string()
+        .default(".")
+        .describe("Relative archive path when the target is a bundle"),
     }),
+    options: z.object({
+      root: z.string().optional().describe("Named $top archive root"),
+      offset: z
+        .number()
+        .int()
+        .min(0)
+        .default(0)
+        .describe("First original object-table index"),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(20000)
+        .default(20000)
+        .describe("Maximum object-table entries to return"),
+    }),
+    run: ({ args, options }) =>
+      logCliCommand(logger, CLI_COMMANDS.inspectKeyedArchive, () =>
+        runProviderAnalysis(
+          args.path,
+          "inspect_keyed_archive",
+          {
+            path: args.archive,
+            offset: options.offset,
+            limit: options.limit,
+            ...(options.root === undefined ? {} : { root: options.root }),
+          },
+          logger,
+        ),
+      ),
+  });
+};
+
+const registerDylibResolutionCommand = (
+  cli: CliInstance,
+  logger: Logger,
+  runProviderAnalysis: DirectAnalysis["runProviderAnalysis"],
+): void => {
+  cli.command(CLI_COMMANDS.traceDylibResolution, {
+    description:
+      "Trace dyld load-path resolution for a Mach-O or every executable in an app bundle",
+    args: z.object({
+      path: z.string().describe("Mach-O file or Apple .app bundle path"),
+    }),
+    options: z.object({
+      root: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Process root relative to the bundle or the Mach-O's directory (repeatable)",
+        ),
+      architecture: z
+        .enum(["arm64", "arm64e", "x86_64"])
+        .optional()
+        .describe("Trace only this slice of each root"),
+    }),
+    run: ({ args, options }) =>
+      logCliCommand(logger, CLI_COMMANDS.traceDylibResolution, () =>
+        runProviderAnalysis(
+          args.path,
+          "trace_dylib_resolution",
+          {
+            ...(options.root === undefined ? {} : { roots: options.root }),
+            ...(options.architecture === undefined
+              ? {}
+              : { architecture: options.architecture }),
+          },
+          logger,
+        ),
+      ),
+  });
+};
+
+const registerAssetCatalogCommand = (
+  cli: CliInstance,
+  logger: Logger,
+  runProviderAnalysis: DirectAnalysis["runProviderAnalysis"],
+): void => {
+  cli.command(CLI_COMMANDS.inspectAssetCatalog, {
+    description: "Inspect compiled Apple asset catalog metadata",
+    args: z.object({ path: z.string().describe("Apple .app bundle path") }),
     options: z.object({
       offset: z
         .number()
         .int()
         .min(0)
         .default(0)
-        .describe("Zero-based offset for graph nodes, occurrences, and edges"),
+        .describe("First metadata record"),
       limit: z
         .number()
         .int()
         .min(1)
-        .max(500)
-        .default(100)
-        .describe("Maximum nodes, occurrences, and edges per result section"),
-      integrityPolicy: z
-        .enum(["fail", "record-and-continue"])
-        .default("fail")
-        .describe("Behavior when declared artifact integrity does not match"),
-      integrityContinueApproved: z
-        .boolean()
-        .default(false)
-        .describe("Approve continuing after recorded integrity mismatches"),
-      maxIntegrityMismatches: z
+        .max(10_000)
+        .default(1_000)
+        .describe("Maximum records to return"),
+    }),
+    run: ({ args, options }) =>
+      logCliCommand(logger, CLI_COMMANDS.inspectAssetCatalog, () =>
+        runProviderAnalysis(
+          args.path,
+          "inspect_asset_catalog",
+          { offset: options.offset, limit: options.limit },
+          logger,
+        ),
+      ),
+  });
+};
+
+const registerInterfaceBuilderCommand = (
+  cli: CliInstance,
+  logger: Logger,
+  runProviderAnalysis: DirectAnalysis["runProviderAnalysis"],
+): void => {
+  cli.command(CLI_COMMANDS.decodeInterfaceBuilder, {
+    description:
+      "Decode compiled storyboard and nib archives from an app bundle",
+    args: z.object({
+      path: z.string().describe("Apple .app bundle path"),
+    }),
+    options: z.object({
+      maxDocuments: z
         .number()
         .int()
         .min(1)
-        .max(100)
-        .default(10)
-        .describe("Maximum integrity mismatches to record before stopping"),
-      nativeMountApproved: z
-        .boolean()
-        .default(false)
-        .describe("Approve read-only native mounting when required"),
+        .max(64)
+        .default(64)
+        .describe("Maximum archives to decode"),
+      maxObjects: z
+        .number()
+        .int()
+        .min(1)
+        .max(20_000)
+        .default(20_000)
+        .describe("Maximum graph objects"),
+      maxConnections: z
+        .number()
+        .int()
+        .min(1)
+        .max(40_000)
+        .default(40_000)
+        .describe("Maximum decoded connections"),
     }),
-    alias: {
-      integrityPolicy: "integrity-policy",
-      integrityContinueApproved: "integrity-continue-approved",
-      maxIntegrityMismatches: "max-integrity-mismatches",
-      nativeMountApproved: "native-mount-approved",
-    },
     run: ({ args, options }) =>
-      logCliCommand(logger, "inventory-artifact", () =>
+      logCliCommand(logger, "decode-interface-builder", () =>
         runProviderAnalysis(
           args.path,
-          "inventory_artifact",
+          "decode_interface_builder",
           {
-            node_offset: options.offset,
-            node_limit: options.limit,
-            occurrence_offset: options.offset,
-            occurrence_limit: options.limit,
-            edge_offset: options.offset,
-            edge_limit: options.limit,
-            integrity_policy: options.integrityPolicy,
-            integrity_continue_approved: options.integrityContinueApproved,
-            max_integrity_mismatches: options.maxIntegrityMismatches,
-            native_mount_approved: options.nativeMountApproved,
+            max_documents: options.maxDocuments,
+            max_objects: options.maxObjects,
+            max_connections: options.maxConnections,
           },
           logger,
         ),
       ),
   });
+};
+
+const registerExtractionCommand = (
+  cli: CliInstance,
+  logger: Logger,
+  runProviderAnalysis: DirectAnalysis["runProviderAnalysis"],
+): void => {
   cli.command(CLI_COMMANDS.extractArtifact, {
-    description: "Extract explicitly selected artifact occurrences safely",
+    description: "Extract all regular artifact contents safely",
     args: z.object({
       path: z.string().describe("Application or package path"),
-      outputRoot: z.string().describe("Absent absolute output root"),
-      occurrenceIds: z
-        .array(z.string().regex(/^occ_[a-f0-9]{64}$/u))
-        .min(1)
-        .max(500)
-        .describe("Exact artifact occurrence IDs selected for extraction"),
     }),
-    alias: { outputRoot: "output-root", occurrenceIds: "occurrence-ids" },
-    run: ({ args }) =>
+    options: z.object({
+      integrityPolicy: z
+        .enum(["fail", "record-and-continue"])
+        .default("fail")
+        .describe("Behavior when declared artifact integrity does not match"),
+    }),
+    run: ({ args, options }) =>
       logCliCommand(logger, "extract-artifact", () =>
         runProviderAnalysis(
           args.path,
           "extract_artifact",
           {
-            approved: true,
-            output_root: args.outputRoot,
-            occurrence_ids: args.occurrenceIds,
+            integrity_policy: options.integrityPolicy,
+            output_root: createArtifactExtractionDestination(),
+          },
+          logger,
+        ),
+      ),
+  });
+};
+
+const registerInspectionCommand = (
+  cli: CliInstance,
+  logger: Logger,
+  runProviderAnalysis: DirectAnalysis["runProviderAnalysis"],
+): void => {
+  cli.command(CLI_COMMANDS.inspectArtifact, {
+    description:
+      "Inspect one artifact and return all available observations and next probes",
+    args: z.object({
+      path: z.string().describe("Application or package path"),
+    }),
+    options: z.object({
+      integrityPolicy: z
+        .enum(["fail", "record-and-continue"])
+        .default("fail")
+        .describe("Behavior when declared artifact integrity does not match"),
+    }),
+    run: ({ args, options }) =>
+      logCliCommand(logger, "inspect-artifact", () =>
+        runProviderAnalysis(
+          args.path,
+          "inspect_artifact",
+          {
+            integrity_policy: options.integrityPolicy,
           },
           logger,
         ),

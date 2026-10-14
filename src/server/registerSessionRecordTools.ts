@@ -1,40 +1,33 @@
-import type { McpServer } from "@modelcontextprotocol/server";
+import type { EvidenceMcpServer } from "./EvidenceMcpServer.js";
 
-import type { BinarySessionPort } from "../application/BinarySession.js";
-import type { PermissionAuthority } from "../application/PermissionAuthority.js";
+import type { BinarySessionPort } from "../application/binary/BinarySessionPort.js";
 import {
-  readEvidenceBundle,
+  readImmutableEvidenceBundle,
   writeEvidenceBundle,
 } from "../application/EvidenceBundleFiles.js";
-import {
-  exportEvidenceBundleInputSchema,
-  importEvidenceBundleInputSchema,
-  listUnknownsInputSchema,
-  SESSION_TOOL_CONTRACTS,
-  verifyUnknownResolutionInputSchema,
-} from "../contracts/toolContracts.js";
-import type { EvidenceFilePolicy } from "../domain/evidenceBundle.js";
-import {
-  AnalysisProtocolError,
-  PermissionRequiredError,
-  type AnalysisError,
-} from "../domain/errors.js";
-import {
-  recordUnknownInputSchema,
-  updateUnknownInputSchema,
-} from "../domain/residualUnknown.js";
-import { err, ok, type Result } from "../domain/result.js";
-import { safeParseToolInput } from "./toolInputValidation.js";
+import { toolContract } from "../contracts/toolContracts.js";
+import type { EvidenceBundle } from "../domain/evidenceBundle.js";
+import type { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
+import { err, ok } from "../domain/result.js";
+import { AnalysisCancelledError } from "../domain/analysisErrorCore.js";
+import { inspectEvidenceBundle } from "../application/investigation/InspectEvidenceBundle.js";
 import { toolRegistrationOptions } from "./toolRegistrationOptions.js";
-import { toCallToolResult } from "./toolResult.js";
+import { withAdmittedAnalysis } from "./analysisAdmission.js";
+import { runAdmittedToolOperation } from "./admittedToolOperation.js";
 
 interface EvidenceToolRegistration {
-  readonly server: McpServer;
+  readonly server: EvidenceMcpServer;
   readonly session: BinarySessionPort;
-  readonly exportContract: (typeof SESSION_TOOL_CONTRACTS)[3];
-  readonly importContract: (typeof SESSION_TOOL_CONTRACTS)[4];
-  readonly filePolicy: EvidenceFilePolicy;
-  readonly permissionAuthority?: PermissionAuthority;
+  readonly resources: ArtifactResourceScope;
+  readonly exportContract: ReturnType<
+    typeof toolContract<"export_evidence_bundle">
+  >;
+  readonly importContract: ReturnType<
+    typeof toolContract<"import_evidence_bundle">
+  >;
+  readonly snapshotContract: ReturnType<
+    typeof toolContract<"get_evidence_bundle">
+  >;
 }
 
 /** Register evidence bundle import and export tools. */
@@ -43,227 +36,200 @@ export const registerEvidenceTools = (
 ): void => {
   registerExportEvidenceTool(registration);
   registerImportEvidenceTool(registration);
+  registerSnapshotEvidenceTool(registration);
 };
 
 const registerExportEvidenceTool = ({
   server,
   session,
+  resources,
   exportContract,
-  filePolicy,
-  permissionAuthority,
 }: EvidenceToolRegistration): void => {
   server.registerTool(
     exportContract.name,
     toolRegistrationOptions(exportContract),
-    async (input) => {
-      const parsedInput = safeParseToolInput(
-        exportEvidenceBundleInputSchema,
-        input,
-        exportContract.name,
-      );
-      if (!parsedInput.ok) return toCallToolResult(parsedInput, exportContract);
-      const parsed = parsedInput.value;
-      const bundle = session.exportEvidenceBundle();
-      if (parsed.path === undefined)
-        return toCallToolResult(ok(bundle), exportContract);
-      const denied = await authorizeEvidencePath({
-        authority: permissionAuthority,
-        capability: "evidence_write",
-        path: parsed.path,
-        access: "write",
-        operationIdentity: `export_evidence:${parsed.path}`,
-      });
-      if (denied !== undefined) return toCallToolResult(denied, exportContract);
+    async (input, context) => {
+      const bundle = bundleForSerialization(session);
       const written = await writeEvidenceBundle(
         bundle,
-        parsed.path,
-        parsed.overwrite,
-        filePolicy,
+        input.path,
+        input.overwrite,
+        resources,
+        context.mcpReq.signal,
       );
       return written.ok
-        ? toCallToolResult(
+        ? server.delivery.toCallToolResult(
             ok({
               path: written.value.path,
               bytes: written.value.bytes,
               records: bundle.records.length,
+              unknowns: bundle.unknowns.length,
             }),
             exportContract,
           )
-        : toCallToolResult(written, exportContract);
+        : server.delivery.toCallToolResult(written, exportContract);
     },
+  );
+};
+
+const registerSnapshotEvidenceTool = ({
+  server,
+  session,
+  snapshotContract,
+}: EvidenceToolRegistration): void => {
+  server.registerTool(
+    snapshotContract.name,
+    toolRegistrationOptions(snapshotContract),
+    (input) =>
+      server.delivery.toCallToolResult(
+        inspectEvidenceBundle(bundleForSerialization(session), input),
+        snapshotContract,
+      ),
   );
 };
 
 const registerImportEvidenceTool = ({
   server,
   session,
+  resources,
   importContract,
-  filePolicy,
-  permissionAuthority,
 }: EvidenceToolRegistration): void => {
+  const admission = withAdmittedAnalysis({ kind: "session", session });
   server.registerTool(
     importContract.name,
     toolRegistrationOptions(importContract),
-    async (input) => {
-      const parsedInput = safeParseToolInput(
-        importEvidenceBundleInputSchema,
-        input,
+    async (input, context) =>
+      runAdmittedToolOperation(
+        server,
+        admission,
         importContract.name,
-      );
-      if (!parsedInput.ok) return toCallToolResult(parsedInput, importContract);
-      const path = parsedInput.value.path;
-      const denied = await authorizeEvidencePath({
-        authority: permissionAuthority,
-        capability: "evidence_read",
-        path,
-        access: "read",
-        operationIdentity: `import_evidence:${path}`,
-      });
-      if (denied !== undefined) return toCallToolResult(denied, importContract);
-      const loaded = await readEvidenceBundle(path, filePolicy);
-      if (!loaded.ok) return toCallToolResult(loaded, importContract);
-      const imported = session.importEvidenceBundle(loaded.value);
-      if (imported.ok && imported.value > 0) server.sendResourceListChanged();
-      return imported.ok
-        ? toCallToolResult(
-            ok({
-              imported: imported.value,
-              total: session.exportEvidenceBundle().records.length,
-            }),
-            importContract,
-          )
-        : toCallToolResult(imported, importContract);
-    },
+        context.mcpReq.signal,
+        async () => {
+          const path = input.path;
+          const signal = context.mcpReq.signal;
+          const loaded = await readImmutableEvidenceBundle(
+            path,
+            signal,
+            resources,
+          );
+          if (!loaded.ok)
+            return server.delivery.toCallToolResult(loaded, importContract);
+          const retainedUnknownRevisions = new Set(
+            bundleForSerialization(session).unknowns.map((unknown) =>
+              unknownRevisionKey(unknown),
+            ),
+          );
+          if (signal.aborted)
+            return server.delivery.toCallToolResult(
+              err(new AnalysisCancelledError("import_evidence_bundle")),
+              importContract,
+            );
+          const imported = session.importEvidenceBundle(loaded.value);
+          return imported.ok
+            ? server.delivery.toCallToolResult(
+                ok({
+                  imported: imported.value,
+                  unknowns_added: loaded.value.unknowns.filter(
+                    (unknown) =>
+                      !retainedUnknownRevisions.has(
+                        unknownRevisionKey(unknown),
+                      ),
+                  ).length,
+                  total: bundleForSerialization(session).records.length,
+                }),
+                importContract,
+              )
+            : server.delivery.toCallToolResult(imported, importContract);
+        },
+      ),
   );
 };
 
-interface EvidenceAuthorizationInput {
-  readonly authority: PermissionAuthority | undefined;
-  readonly capability: "evidence_read" | "evidence_write";
-  readonly path: string;
-  readonly access: "read" | "write";
-  readonly operationIdentity: string;
-}
+const bundleForSerialization = (session: BinarySessionPort): EvidenceBundle =>
+  session.evidenceBundleForSerialization?.() ?? session.exportEvidenceBundle();
 
-const authorizeEvidencePath = async (
-  input: EvidenceAuthorizationInput,
-): Promise<Result<never, AnalysisError> | undefined> => {
-  if (input.authority === undefined) return undefined;
-  const authorized = await input.authority.authorize(
-    {
-      capability: input.capability,
-      roots: [input.path],
-      executables: [],
-      environment_names: [],
-      network: "none",
-      mount: false,
-      operation_identity: input.operationIdentity,
-    },
-    input.access,
-  );
-  return authorized.ok ? undefined : permissionFailure(authorized);
-};
+const unknownRevisionKey = (
+  unknown: EvidenceBundle["unknowns"][number],
+): string => `${unknown.unknown_id}:${String(unknown.revision)}`;
 
 interface UnknownToolRegistration {
-  readonly server: McpServer;
+  readonly server: EvidenceMcpServer;
   readonly session: BinarySessionPort;
-  readonly contracts: typeof SESSION_TOOL_CONTRACTS;
 }
 
 /** Register residual-unknown query and mutation tools. */
-export const registerUnknownTools = ({
+const registerListUnknownsTool = ({
   server,
   session,
-  contracts,
 }: UnknownToolRegistration): void => {
-  const listContract = contracts[14];
-  const recordContract = contracts[15];
-  const updateContract = contracts[16];
-  const verifyContract = contracts[17];
+  const listContract = toolContract("list_unknowns");
   server.registerTool(
     listContract.name,
     toolRegistrationOptions(listContract),
     (input) => {
-      const parsed = safeParseToolInput(
-        listUnknownsInputSchema,
-        input,
-        listContract.name,
-      );
-      if (!parsed.ok) return toCallToolResult(parsed, listContract);
-      const filters = parsed.value;
-      return toCallToolResult(
-        ok(
-          session.listUnknowns({
-            ...(filters.status === undefined ? {} : { status: filters.status }),
-            ...(filters.severity === undefined
-              ? {}
-              : { severity: filters.severity }),
-            ...(filters.domain === undefined ? {} : { domain: filters.domain }),
-          }),
-        ),
-        listContract,
-      );
-    },
-  );
-  server.registerTool(
-    recordContract.name,
-    toolRegistrationOptions(recordContract),
-    (input) => {
-      const parsed = safeParseToolInput(
-        recordUnknownInputSchema,
-        input,
-        recordContract.name,
-      );
-      if (!parsed.ok) return toCallToolResult(parsed, recordContract);
-      const result = session.recordUnknown(parsed.value);
-      if (result.ok) server.sendResourceListChanged();
-      return toCallToolResult(result, recordContract);
-    },
-  );
-  server.registerTool(
-    updateContract.name,
-    toolRegistrationOptions(updateContract),
-    (input) => {
-      const parsed = safeParseToolInput(
-        updateUnknownInputSchema,
-        input,
-        updateContract.name,
-      );
-      if (!parsed.ok) return toCallToolResult(parsed, updateContract);
-      const result = session.updateUnknown(parsed.value);
-      if (result.ok) server.sendResourceListChanged();
-      return toCallToolResult(result, updateContract);
-    },
-  );
-  server.registerTool(
-    verifyContract.name,
-    toolRegistrationOptions(verifyContract),
-    (input) => {
-      const parsed = safeParseToolInput(
-        verifyUnknownResolutionInputSchema,
-        input,
-        verifyContract.name,
-      );
-      return parsed.ok
-        ? toCallToolResult(
-            session.verifyUnknownResolution(parsed.value.unknown_id),
-            verifyContract,
-          )
-        : toCallToolResult(parsed, verifyContract);
+      const page = session.listUnknownsPage({
+        ...(input.status === undefined ? {} : { status: input.status }),
+        ...(input.severity === undefined ? {} : { severity: input.severity }),
+        ...(input.domain === undefined ? {} : { domain: input.domain }),
+        offset: input.offset,
+        ...(input.limit === undefined ? {} : { limit: input.limit }),
+      });
+      return server.delivery.toCallToolResult(ok(page), listContract);
     },
   );
 };
 
-const permissionFailure = (
-  failure: Awaited<ReturnType<PermissionAuthority["authorize"]>>,
-): Result<never, AnalysisError> => {
-  if (failure.ok)
-    return err(new AnalysisProtocolError("Expected a denied permission"));
-  return err(
-    failure.error instanceof PermissionRequiredError
-      ? failure.error
-      : new AnalysisProtocolError(failure.error.message, {
-          cause: failure.error,
-        }),
+const registerRecordUnknownTool = ({
+  server,
+  session,
+}: UnknownToolRegistration): void => {
+  const recordContract = toolContract("record_unknown");
+  server.registerTool(
+    recordContract.name,
+    toolRegistrationOptions(recordContract),
+    (input) => {
+      const result = session.recordUnknown(input);
+      return server.delivery.toCallToolResult(result, recordContract);
+    },
   );
+};
+
+const registerUpdateUnknownTool = ({
+  server,
+  session,
+}: UnknownToolRegistration): void => {
+  const updateContract = toolContract("update_unknown");
+  server.registerTool(
+    updateContract.name,
+    toolRegistrationOptions(updateContract),
+    (input) => {
+      const result = session.updateUnknown(input);
+      return server.delivery.toCallToolResult(result, updateContract);
+    },
+  );
+};
+
+const registerVerifyUnknownTool = ({
+  server,
+  session,
+}: UnknownToolRegistration): void => {
+  const verifyContract = toolContract("verify_unknown_resolution");
+  server.registerTool(
+    verifyContract.name,
+    toolRegistrationOptions(verifyContract),
+    (input) =>
+      server.delivery.toCallToolResult(
+        session.verifyUnknownResolution(input.unknown_id),
+        verifyContract,
+      ),
+  );
+};
+
+export const registerUnknownTools = (
+  registration: UnknownToolRegistration,
+): void => {
+  registerListUnknownsTool(registration);
+  registerRecordUnknownTool(registration);
+  registerUpdateUnknownTool(registration);
+  registerVerifyUnknownTool(registration);
 };

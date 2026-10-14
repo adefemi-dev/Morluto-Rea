@@ -1,4 +1,4 @@
-import type { WebPageInspection } from "../domain/browserObservation.js";
+import type { WebPageInspection } from "../domain/browserObservationSchemas.js";
 import {
   reconcileCapturedWebScript,
   stableWebScriptKey,
@@ -7,13 +7,13 @@ import type { CapturedResource } from "./CdpCaptureDocuments.js";
 import type { CdpCaptureEvents } from "./CdpCaptureEvents.js";
 import type { CapturedScript } from "./CdpCaptureEventTypes.js";
 import {
-  requiredRecord,
+  requiredScriptSource,
   sourceExcluded,
   sourceResult,
-  stringValue,
 } from "./CdpCaptureValues.js";
 import type { CaptureContext } from "./CdpPageCapture.js";
 import type { WebSourceMapRequest } from "./WebSourceMapFetcher.js";
+import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 
 export interface CapturedScripts {
   readonly inventory: WebPageInspection["scripts"];
@@ -34,7 +34,6 @@ interface ScriptDraftState {
   readonly frameIds: ReadonlySet<string>;
   readonly rawResources: readonly CapturedResource[];
   readonly resources: WebPageInspection["resources"];
-  totalSourceBytes: number;
 }
 
 type ScriptDraftItem = Omit<
@@ -52,7 +51,6 @@ export const captureScripts = async (
     frameIds,
     rawResources,
     resources,
-    totalSourceBytes: 0,
   };
   const drafts: {
     readonly item: ScriptDraftItem;
@@ -79,7 +77,7 @@ const buildScriptDraft = async (
   let source: WebPageInspection["scripts"]["items"][number]["source"] = state
     .context.input.include_script_sources
     ? await captureScriptSource(script, state)
-    : sourceExcluded("source capture was not approved");
+    : sourceExcluded("source capture was not selected");
   const inventoryScript = {
     frame_id: state.events.frameForScript(script, state.frameIds),
     url: script.url,
@@ -108,37 +106,16 @@ const captureScriptSource = async (
   script: CapturedScript,
   state: ScriptDraftState,
 ): Promise<WebPageInspection["scripts"]["items"][number]["source"]> => {
-  const { context, events } = state;
-  if (script.length > context.input.limits.max_script_source_bytes) {
-    events.completeness.truncate("script_sources");
-    return sourceExcluded("declared script length exceeds per-script limit");
-  }
-  if (
-    state.totalSourceBytes + script.length >
-    context.input.limits.max_total_script_source_bytes
-  ) {
-    events.completeness.truncate("script_sources");
-    return sourceExcluded("total script source limit reached");
-  }
-  const result = requiredRecord(
+  const { context } = state;
+  const content = requiredScriptSource(
     await context.connection.send(
       "Debugger.getScriptSource",
       { scriptId: script.scriptId },
       context.sessionId,
       context.signal,
     ),
+    context.operation,
   );
-  const content = stringValue(result.scriptSource) ?? "";
-  const bytes = Buffer.byteLength(content);
-  if (
-    bytes > context.input.limits.max_script_source_bytes ||
-    state.totalSourceBytes + bytes >
-      context.input.limits.max_total_script_source_bytes
-  ) {
-    events.completeness.truncate("script_sources");
-    return sourceExcluded("actual source exceeds configured byte limits");
-  }
-  state.totalSourceBytes += bytes;
   return sourceResult(content);
 };
 
@@ -155,11 +132,15 @@ const keyAndBuildInventory = (
   }));
   keyed.sort(
     (left, right) =>
-      left.base.localeCompare(right.base) ||
-      sourceDigest(left.item.source).localeCompare(
+      compareUnicodeCodePoints(left.base, right.base) ||
+      compareUnicodeCodePoints(
+        sourceDigest(left.item.source),
         sourceDigest(right.item.source),
       ) ||
-      (left.item.frame_id ?? "").localeCompare(right.item.frame_id ?? ""),
+      compareUnicodeCodePoints(
+        left.item.frame_id ?? "",
+        right.item.frame_id ?? "",
+      ),
   );
   const totals = new Map<string, number>();
   for (const { base } of keyed) totals.set(base, (totals.get(base) ?? 0) + 1);

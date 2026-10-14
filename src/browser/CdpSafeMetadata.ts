@@ -1,8 +1,8 @@
-import type { WebPageInspection } from "../domain/browserObservation.js";
+import type { WebPageInspection } from "../domain/browserObservationSchemas.js";
 import { sanitizeBrowserUrl } from "../domain/browserObservation.js";
 import {
   numberValue,
-  stringValue,
+  cdpStringValue,
   type UnknownRecord,
 } from "./CdpCaptureValues.js";
 
@@ -42,7 +42,7 @@ export const safeResponseMetadata = (
     response: {
       request_id: requestId,
       url,
-      mime_type: boundedHeader(stringValue(response.mimeType)),
+      mime_type: boundedHeader(cdpStringValue(response.mimeType)),
       content_length: nonnegativeInteger(headers.get("content-length")),
       content_encoding: boundedHeader(headers.get("content-encoding")),
       csp,
@@ -51,7 +51,7 @@ export const safeResponseMetadata = (
         coop: policyToken(headers.get("cross-origin-opener-policy")),
         coep: policyToken(headers.get("cross-origin-embedder-policy")),
         corp: policyToken(headers.get("cross-origin-resource-policy")),
-        referrer_policy: policyToken(headers.get("referrer-policy")),
+        referrer_policy: referrerPolicy(headers.get("referrer-policy")),
         x_content_type_options: policyToken(
           headers.get("x-content-type-options"),
         ),
@@ -68,15 +68,15 @@ const normalizedHeaders = (value: unknown): ReadonlyMap<string, string> => {
   if (typeof value !== "object" || value === null || Array.isArray(value))
     return new Map();
   const headers = new Map<string, string>();
-  for (const [name, raw] of Object.entries(value).slice(0, 500)) {
-    const normalized = name.toLowerCase().slice(0, 256);
+  for (const [name, raw] of Object.entries(value)) {
+    const normalized = name.toLowerCase();
     const header =
       typeof raw === "string"
         ? raw
         : typeof raw === "number" && Number.isFinite(raw)
           ? String(raw)
           : undefined;
-    if (header !== undefined) headers.set(normalized, header.slice(0, 65_536));
+    if (header !== undefined) headers.set(normalized, header);
   }
   return headers;
 };
@@ -89,13 +89,13 @@ const parseCsp = (
   const directives: ResponseMetadata["csp"]["directives"] = [];
   let nonceCount = 0;
   let hashCount = 0;
-  for (const rawDirective of (value ?? "").split(";").slice(0, 100)) {
+  for (const rawDirective of (value ?? "").split(";")) {
     const [rawName, ...tokens] = rawDirective.trim().split(/\s+/u);
     const name = (rawName ?? "").toLowerCase();
-    if (!/^[a-z][a-z0-9-]{0,99}$/u.test(name)) continue;
+    if (!/^[a-z][a-z0-9\x2d]*$/u.test(name)) continue;
     const sources: ResponseMetadata["csp"]["directives"][number]["sources"] =
       [];
-    for (const token of tokens.slice(0, 100)) {
+    for (const token of tokens) {
       const lower = token.toLowerCase();
       if (lower.startsWith("'nonce-")) {
         nonceCount += 1;
@@ -122,17 +122,64 @@ const cspSource = (
   allowedOrigins: ReadonlySet<string>,
 ): ResponseMetadata["csp"]["directives"][number]["sources"][number] => {
   const lower = token.toLowerCase();
-  if (/^'[a-z0-9-]+'$/u.test(lower))
-    return { kind: "keyword", value: lower.slice(0, 100) };
-  if (/^[a-z][a-z0-9+.-]*:$/u.test(lower))
-    return { kind: "scheme", value: lower.slice(0, 100) };
+  if (/^'[a-z0-9\x2d]+'$/u.test(lower))
+    return { kind: "keyword", value: lower };
+  if (/^[a-z][a-z0-9+.\x2d]*:$/u.test(lower))
+    return { kind: "scheme", value: lower };
+  const hostOrigin = cspHostSourceOrigin(token, baseUrl);
+  if (hostOrigin === undefined) return { kind: "other", value: null };
+  return hostOrigin !== null && allowedOrigins.has(hostOrigin)
+    ? { kind: "approved_origin", value: hostOrigin }
+    : { kind: "external_origin", value: null };
+};
+
+/**
+ * Resolve a CSP host-source (CSP3 §2.3.1) to the single origin it names. A
+ * scheme-less source inherits the protected resource's scheme instead of being
+ * resolved as a page-relative path. Returns `null` for a recognized wildcard
+ * host or port, which denotes a set of origins rather than one origin, and
+ * `undefined` when the token is not a host-source at all.
+ */
+const cspHostSourceOrigin = (
+  token: string,
+  baseUrl: string,
+): string | null | undefined => {
+  const match =
+    /^(?:([a-z][a-z0-9+.\x2d]*):\/\/)?([^\x2f?#]+)(?:\/[^?#]*)?$/iu.exec(token);
+  const authority = match?.[2];
+  if (authority === undefined || authority.length === 0) return undefined;
+  const scheme = (match?.[1] ?? schemeOf(baseUrl))?.toLowerCase();
+  if (scheme === undefined || !/^[a-z][a-z0-9+.\x2d]*$/u.test(scheme))
+    return undefined;
+  if (
+    !/^(?:\*|(?:\*\.)?[a-z0-9\x2d]+(?:\.[a-z0-9\x2d]+)*\.?)(?::(?:\*|\d+))?$/iu.test(
+      authority,
+    )
+  )
+    return undefined;
+  if (authority.includes("*")) return null;
   try {
-    const parsed = new URL(token, baseUrl);
-    return allowedOrigins.has(parsed.origin)
-      ? { kind: "approved_origin", value: parsed.origin }
-      : { kind: "external_origin", value: null };
-  } catch {
-    return { kind: "other", value: null };
+    const parsed = new URL(`${scheme}://${authority}`);
+    return parsed.username === "" &&
+      parsed.password === "" &&
+      parsed.pathname === "/" &&
+      parsed.origin !== "null"
+      ? parsed.origin
+      : undefined;
+  } catch (cause: unknown) {
+    // Authorities that are not a bare host[:port] are classified as other.
+    void cause;
+    return undefined;
+  }
+};
+
+const schemeOf = (baseUrl: string): string | undefined => {
+  try {
+    return new URL(baseUrl).protocol.replace(/:$/u, "");
+  } catch (cause: unknown) {
+    // An unparseable protected-resource URL cannot lend a scheme.
+    void cause;
+    return undefined;
   }
 };
 
@@ -142,8 +189,8 @@ const parseLinks = (
   allowedOrigins: ReadonlySet<string>,
 ): LinkMetadata[] => {
   const links: LinkMetadata[] = [];
-  for (const entry of splitLinkHeader(value ?? "").slice(0, 100)) {
-    const match = /^\s*<([^>]{1,4096})>(.*)$/u.exec(entry);
+  for (const entry of splitLinkHeader(value ?? "")) {
+    const match = /^\s*<([^>]*)>(.*)$/u.exec(entry);
     if (match === null) continue;
     const parameters = linkParameters(match[2] ?? "");
     const destination = safeDestination(
@@ -157,8 +204,7 @@ const parseLinks = (
       rel: (parameters.get("rel") ?? "")
         .toLowerCase()
         .split(/\s+/u)
-        .filter(Boolean)
-        .slice(0, 32),
+        .filter(Boolean),
       as: boundedHeader(parameters.get("as")),
       type: boundedHeader(parameters.get("type")),
       crossorigin: boundedHeader(parameters.get("crossorigin")),
@@ -167,16 +213,30 @@ const parseLinks = (
   return links;
 };
 
-const splitLinkHeader = (value: string): string[] => {
+const splitLinkHeader = (
+  value: string,
+  delimiter: "," | ";" = ",",
+): string[] => {
   const entries: string[] = [];
   let start = 0;
   let quoted = false;
+  let escaped = false;
+  let target = false;
   for (let index = 0; index < value.length; index += 1) {
     const character = value[index];
-    if (character === '"' && value[index - 1] !== "\\") quoted = !quoted;
-    if (character !== "," || quoted) continue;
-    entries.push(value.slice(start, index));
-    start = index + 1;
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === '"') quoted = false;
+      continue;
+    }
+    if (character === '"' && !target) quoted = true;
+    else if (delimiter === "," && character === "<") target = true;
+    else if (delimiter === "," && character === ">") target = false;
+    else if (character === delimiter && !target) {
+      entries.push(value.slice(start, index));
+      start = index + 1;
+    }
   }
   entries.push(value.slice(start));
   return entries;
@@ -184,14 +244,14 @@ const splitLinkHeader = (value: string): string[] => {
 
 const linkParameters = (value: string): ReadonlyMap<string, string> => {
   const parameters = new Map<string, string>();
-  for (const raw of value.split(";").slice(1, 50)) {
+  for (const raw of splitLinkHeader(value, ";").slice(1)) {
     const separator = raw.indexOf("=");
     const name = (separator < 0 ? raw : raw.slice(0, separator))
       .trim()
       .toLowerCase();
-    if (!/^[a-z][a-z0-9-]{0,99}$/u.test(name)) continue;
+    if (!/^[a-z][a-z0-9\x2d]*$/u.test(name)) continue;
     const parameter = separator < 0 ? "" : raw.slice(separator + 1).trim();
-    parameters.set(name, unquote(parameter).slice(0, 1_024));
+    parameters.set(name, unquote(parameter));
   }
   return parameters;
 };
@@ -206,13 +266,16 @@ const safeDestination = (
 } => {
   try {
     const parsed = new URL(value, baseUrl);
+    const sanitized = sanitizeBrowserUrl(parsed.href).url;
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:")
-      return { url: null, scope: "unsupported" };
+      return { url: sanitized, scope: "unsupported" };
     if (!allowedOrigins.has(parsed.origin))
-      return { url: null, scope: "outside_policy" };
-    return { url: sanitizeBrowserUrl(parsed.href).url, scope: "approved" };
-  } catch {
-    return { url: null, scope: "unsupported" };
+      return { url: sanitized, scope: "outside_policy" };
+    return { url: sanitized, scope: "approved" };
+  } catch (cause: unknown) {
+    // Unparseable link values keep their raw text for the analyst.
+    void cause;
+    return { url: value, scope: "unsupported" };
   }
 };
 
@@ -222,11 +285,9 @@ const permissionFeatures = (value: string | undefined): string[] =>
       (value ?? "")
         .split(",")
         .map((entry) => entry.split("=", 1)[0]?.trim().toLowerCase() ?? "")
-        .filter((feature) => /^[a-z][a-z0-9-]{0,99}$/u.test(feature)),
+        .filter((feature) => /^[a-z][a-z0-9\x2d]*$/u.test(feature)),
     ),
-  ]
-    .sort()
-    .slice(0, 200);
+  ].sort();
 
 const wellKnownHint = (url: string): AgentHint[] => {
   try {
@@ -234,7 +295,9 @@ const wellKnownHint = (url: string): AgentHint[] => {
     return wellKnownAgentPaths.has(path)
       ? [agentHint("well_known_resource", path, sanitizeBrowserUrl(url).url)]
       : [];
-  } catch {
+  } catch (cause: unknown) {
+    // Non-URL input yields no well-known hint.
+    void cause;
     return [];
   }
 };
@@ -245,7 +308,7 @@ const agentHint = (
   url: string | null,
 ): AgentHint => ({
   mechanism,
-  declaration: declaration.slice(0, 256),
+  declaration,
   url,
   trust: "page-declared-untrusted",
 });
@@ -253,9 +316,31 @@ const agentHint = (
 const isAgentRel = (value: string): boolean =>
   ["mcp", "model-context", "ai-plugin", "service-desc"].includes(value);
 
+const referrerPolicies = new Set([
+  "no-referrer",
+  "no-referrer-when-downgrade",
+  "same-origin",
+  "origin",
+  "strict-origin",
+  "origin-when-cross-origin",
+  "strict-origin-when-cross-origin",
+  "unsafe-url",
+]);
+
+const referrerPolicy = (value: string | undefined): string | null => {
+  let policy: string | null = null;
+  for (const raw of (value ?? "").split(",")) {
+    const token = raw.trim().toLowerCase();
+    if (token === "") continue;
+    if (!/^[a-z\x2d]+$/u.test(token)) return null;
+    if (referrerPolicies.has(token)) policy = token;
+  }
+  return policy;
+};
+
 const policyToken = (value: string | undefined): string | null => {
   const token = (value ?? "").trim().toLowerCase();
-  return /^[a-z][a-z0-9_.-]{0,99}$/u.test(token) ? token : null;
+  return /^[a-z][a-z0-9_.\x2d]*$/u.test(token) ? token : null;
 };
 
 const nonnegativeInteger = (value: string | undefined): number | null => {
@@ -264,7 +349,7 @@ const nonnegativeInteger = (value: string | undefined): number | null => {
 };
 
 const boundedHeader = (value: string | undefined): string | null =>
-  value === undefined ? null : value.trim().toLowerCase().slice(0, 256);
+  value === undefined ? null : value.trim().toLowerCase();
 
 const unquote = (value: string): string =>
   value.startsWith('"') && value.endsWith('"') ? value.slice(1, -1) : value;

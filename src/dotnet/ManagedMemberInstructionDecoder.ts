@@ -1,13 +1,18 @@
+import type { ManagedDecodeBudget } from "./ManagedDecodeBudget.js";
+import { ManagedReaderFailure } from "./ManagedReaderFailure.js";
 import type {
   ManagedExceptionRegion,
   ManagedInstructionAnchor,
   ParsedInstruction,
 } from "./ManagedMemberInspectorCore.js";
 
-const opcode = (
-  code: number,
-): { readonly name: string; readonly operand: string } | undefined =>
-  OPCODES.get(code);
+const PREFIX_OPCODES = new Set([
+  "unaligned.",
+  "volatile.",
+  "tail.",
+  "constrained.",
+  "readonly.",
+]);
 
 const OPCODES = new Map<
   number,
@@ -377,23 +382,26 @@ const readOperand = (
 
 export const decodeInstructions = (
   il: Buffer,
-  limit: number,
+  admitInstruction?: (offset: number) => void,
 ): {
   readonly parsed: readonly ParsedInstruction[];
+  readonly instructionStarts: readonly number[];
   readonly count: number;
   readonly truncated: number;
   readonly issue: string | null;
 } => {
   const parsed: ParsedInstruction[] = [];
+  const instructionStarts: number[] = [];
   let offset = 0;
+  let prefixStart: number | null = null;
   let issue: string | null = null;
   try {
-    while (offset < il.length && parsed.length < limit) {
+    while (offset < il.length) {
       const start = offset;
       const first = il.readUInt8(offset);
       offset += 1;
       const code = first === 0xfe ? 0xfe00 + il.readUInt8(offset++) : first;
-      const descriptor = opcode(code);
+      const descriptor = OPCODES.get(code);
       if (descriptor === undefined) {
         issue = `Unsupported CIL opcode 0x${code.toString(16)} at IL offset ${String(start)}`;
         break;
@@ -403,7 +411,16 @@ export const decodeInstructions = (
         issue = `Instruction ${descriptor.name} at IL offset ${String(start)} leaves method body`;
         break;
       }
+      // Charge each actual instruction before growing the decoded arrays.
+      // A multi-byte operand must not consume a full record per raw IL byte.
+      admitInstruction?.(start);
       offset = operand.next;
+      if (PREFIX_OPCODES.has(descriptor.name)) {
+        prefixStart ??= start;
+      } else {
+        instructionStarts.push(prefixStart ?? start);
+        prefixStart = null;
+      }
       parsed.push({
         offset: start,
         opcode: descriptor.name,
@@ -412,59 +429,134 @@ export const decodeInstructions = (
       });
     }
   } catch (cause: unknown) {
+    if (cause instanceof ManagedReaderFailure) throw cause;
     issue =
       cause instanceof Error ? cause.message : "Instruction decode failed";
   }
   const truncated = offset < il.length && issue === null ? 1 : 0;
-  return { parsed, count: parsed.length, truncated, issue };
+  return { parsed, instructionStarts, count: parsed.length, truncated, issue };
 };
 
 export const parseExceptionRegions = (
   bytes: Buffer,
   offset: number,
   methodEnd: number,
-): ManagedExceptionRegion[] => {
-  if (offset >= methodEnd) return [];
-  const kind = bytes.readUInt8(offset);
-  if ((kind & 0x3f) !== 1) return [];
-  const fat = (kind & 0x40) !== 0;
-  const size = fat
-    ? bytes.readUInt32LE(offset) >>> 8
-    : bytes.readUInt8(offset + 1);
-  const start = fat ? offset + 4 : offset + 4;
-  const clauseSize = fat ? 24 : 12;
-  if (size < 4 || offset > methodEnd - size) return [];
-  const count = Math.floor((size - 4) / clauseSize);
+  budget?: ManagedDecodeBudget,
+): ExceptionRegionParseResult => {
   const regions: ManagedExceptionRegion[] = [];
+  let sectionOffset = offset;
+  let hasMoreSections = true;
+  while (hasMoreSections) {
+    if (
+      !Number.isSafeInteger(sectionOffset) ||
+      sectionOffset < 0 ||
+      sectionOffset > methodEnd - 4 ||
+      sectionOffset > bytes.length - 4
+    )
+      return malformedExceptionRegions(
+        "Exception section header leaves artifact",
+        regions,
+      );
+
+    const kind = bytes.readUInt8(sectionOffset);
+    if ((kind & 0x3f) !== 1)
+      return malformedExceptionRegions(
+        `Unsupported method data section kind ${String(kind & 0x3f)}`,
+        regions,
+      );
+    const fat = (kind & 0x40) !== 0;
+    const size = fat
+      ? bytes.readUInt8(sectionOffset + 1) |
+        (bytes.readUInt8(sectionOffset + 2) << 8) |
+        (bytes.readUInt8(sectionOffset + 3) << 16)
+      : bytes.readUInt8(sectionOffset + 1);
+    const clauseSize = fat ? 24 : 12;
+    if (
+      size < 4 ||
+      sectionOffset > methodEnd - size ||
+      sectionOffset > bytes.length - size
+    )
+      return malformedExceptionRegions(
+        "Exception section size leaves artifact",
+        regions,
+      );
+    if ((size - 4) % clauseSize !== 0)
+      return malformedExceptionRegions(
+        "Exception section size does not contain whole clauses",
+        regions,
+      );
+    if (
+      !fat &&
+      (bytes[sectionOffset + 2] !== 0 || bytes[sectionOffset + 3] !== 0)
+    )
+      return malformedExceptionRegions(
+        "Small exception section reserved bytes are nonzero",
+        regions,
+      );
+
+    const count = (size - 4) / clauseSize;
+    // Accumulates with the method IL bound; the body reserves what it retains.
+    budget?.admitTransient(count * 256, sectionOffset);
+    for (const region of readExceptionClauses(
+      bytes,
+      sectionOffset + 4,
+      count,
+      fat,
+    ))
+      regions.push(region);
+
+    hasMoreSections = (kind & 0x80) !== 0;
+    sectionOffset += size;
+  }
+  return { status: "complete", regions };
+};
+
+export type ExceptionRegionParseResult =
+  | {
+      readonly status: "complete";
+      readonly regions: ManagedExceptionRegion[];
+    }
+  | {
+      readonly status: "malformed";
+      readonly regions: ManagedExceptionRegion[];
+      readonly issue: string;
+    };
+
+const malformedExceptionRegions = (
+  issue: string,
+  regions: ManagedExceptionRegion[] = [],
+): ExceptionRegionParseResult => ({ status: "malformed", regions, issue });
+
+const readExceptionClauses = (
+  bytes: Buffer,
+  start: number,
+  count: number,
+  fat: boolean,
+): ManagedExceptionRegion[] => {
+  const regions: ManagedExceptionRegion[] = [];
+  const clauseSize = fat ? 24 : 12;
   for (let index = 0; index < count; index += 1) {
     const clause = start + index * clauseSize;
-    if (fat) {
-      const flags = bytes.readUInt32LE(clause);
-      const extra = bytes.readUInt32LE(clause + 20);
-      regions.push({
-        flags,
-        try_offset: bytes.readUInt32LE(clause + 4),
-        try_length: bytes.readUInt32LE(clause + 8),
-        handler_offset: bytes.readUInt32LE(clause + 12),
-        handler_length: bytes.readUInt32LE(clause + 16),
-        class_token:
-          flags === 0 ? `0x${extra.toString(16).padStart(8, "0")}` : null,
-        filter_offset: flags === 1 ? extra : null,
-      });
-    } else {
-      const flags = bytes.readUInt16LE(clause);
-      const extra = bytes.readUInt32LE(clause + 8);
-      regions.push({
-        flags,
-        try_offset: bytes.readUInt16LE(clause + 2),
-        try_length: bytes.readUInt8(clause + 4),
-        handler_offset: bytes.readUInt16LE(clause + 5),
-        handler_length: bytes.readUInt8(clause + 7),
-        class_token:
-          flags === 0 ? `0x${extra.toString(16).padStart(8, "0")}` : null,
-        filter_offset: flags === 1 ? extra : null,
-      });
-    }
+    const flags = fat ? bytes.readUInt32LE(clause) : bytes.readUInt16LE(clause);
+    const extra = bytes.readUInt32LE(clause + (fat ? 20 : 8));
+    regions.push({
+      flags,
+      try_offset: fat
+        ? bytes.readUInt32LE(clause + 4)
+        : bytes.readUInt16LE(clause + 2),
+      try_length: fat
+        ? bytes.readUInt32LE(clause + 8)
+        : bytes.readUInt8(clause + 4),
+      handler_offset: fat
+        ? bytes.readUInt32LE(clause + 12)
+        : bytes.readUInt16LE(clause + 5),
+      handler_length: fat
+        ? bytes.readUInt32LE(clause + 16)
+        : bytes.readUInt8(clause + 7),
+      class_token:
+        flags === 0 ? `0x${extra.toString(16).padStart(8, "0")}` : null,
+      filter_offset: flags === 1 ? extra : null,
+    });
   }
   return regions;
 };

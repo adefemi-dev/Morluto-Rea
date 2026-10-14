@@ -1,91 +1,64 @@
 import { z } from "zod";
 
-import type { ToolContract } from "./toolContracts.js";
-import { artifactOutputSchemas } from "./toolOutputSchemas.js";
+import type { ToolContract } from "./toolContractTypes.js";
+import { artifactOutputSchemas } from "./toolOutputSchemaGroups.js";
+import { artifactIntegrityPolicySchema } from "../domain/artifactIntegrityPolicy.js";
 import { jsonValueSchema } from "../domain/jsonValue.js";
 import { toolContractMetadata } from "./toolEffects.js";
-
-const pageInput = {
-  node_offset: z.number().int().min(0).default(0),
-  node_limit: z.number().int().min(1).max(500).default(100),
-  occurrence_offset: z.number().int().min(0).default(0),
-  occurrence_limit: z.number().int().min(1).max(500).default(100),
-  edge_offset: z.number().int().min(0).default(0),
-  edge_limit: z.number().int().min(1).max(500).default(100),
-};
-
-const traversalLimitsInput = {
-  max_entries: z.number().int().min(1).max(1_000_000).default(10_000),
-  max_total_bytes: z
-    .number()
-    .int()
-    .min(1)
-    .max(Number.MAX_SAFE_INTEGER)
-    .default(1_073_741_824),
-  max_entry_bytes: z
-    .number()
-    .int()
-    .min(1)
-    .max(Number.MAX_SAFE_INTEGER)
-    .default(268_435_456),
-  max_compression_ratio: z.number().min(1).max(100_000).default(1_000),
-  max_depth: z.number().int().min(0).max(100).default(20),
-  max_path_bytes: z.number().int().min(1).max(65_535).default(4_096),
-};
-
+import { requireOutputSchema } from "./toolOutputSchemaPrimitives.js";
+import { appleAssetCatalogInputSchema } from "../domain/apple/appleAssetCatalog.js";
+import { dylibResolutionInputSchema } from "../domain/apple/dylibResolution.js";
+import { keyedArchiveInputSchema } from "../domain/apple/keyedArchive.js";
+import { analysisDetailSchema } from "./analysisDetail.js";
 /** Exact caller boundary for deterministic artifact inventory. */
-export const artifactInventoryInputSchema = z
-  .object({
-    native_mount_approved: z.boolean().default(false),
-    integrity_policy: z.enum(["fail", "record-and-continue"]).default("fail"),
-    integrity_continue_approved: z.boolean().default(false),
-    max_integrity_mismatches: z.number().int().min(1).max(100).default(10),
-    ...pageInput,
-    ...traversalLimitsInput,
-  })
-  .superRefine((input, context) => {
-    if (
-      input.integrity_policy === "record-and-continue" &&
-      input.integrity_continue_approved !== true
-    )
-      context.addIssue({
-        code: "custom",
-        path: ["integrity_continue_approved"],
-        message: "record-and-continue requires explicit approval",
-      });
+export const artifactInventoryInputSchema = z.strictObject({
+  integrity_policy: artifactIntegrityPolicySchema,
+});
+
+/** Delivery selection belongs to the adapter, not the inventory producer. */
+export const artifactInspectionInputSchema =
+  artifactInventoryInputSchema.extend({
+    detail: analysisDetailSchema
+      .unwrap()
+      .optional()
+      .describe(
+        "Omitted or complete returns the complete inspection Evidence. summary retains that complete Evidence in this session and returns its inspect_analysis_view summary; use normalized_result.parent_evidence_id for inventory views.",
+      ),
   });
 
-/** Exact caller boundary for approved artifact extraction. */
-export const artifactExtractionInputSchema = z.object({
-  approved: z.literal(true),
-  output_root: z.string().min(1).max(4_096),
-  occurrence_ids: z
-    .array(z.string().regex(/^occ_[a-f0-9]{64}$/u))
-    .min(1)
-    .max(500),
-  offset: z.number().int().min(0).default(0),
-  limit: z.number().int().min(1).max(500).default(100),
-  ...traversalLimitsInput,
+/** Extraction needs no selector: it materializes every regular child file. */
+export const artifactExtractionInputSchema = z.strictObject({
+  integrity_policy: artifactIntegrityPolicySchema,
 });
+
+/** Provider input containing the destination chosen by the local adapter. */
+export const artifactExtractionExecutionSchema =
+  artifactExtractionInputSchema.extend({
+    output_root: z.string().min(1),
+  });
 
 const exampleInputSchema = z.record(z.string(), jsonValueSchema);
 const examples: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
-  inventory_artifact: {},
-  extract_artifact: {
-    approved: true,
-    output_root: "/tmp/rea-extracted",
-    occurrence_ids: [`occ_${"0".repeat(64)}`],
+  inspect_artifact: {},
+  extract_artifact: {},
+  decode_interface_builder: {},
+  inspect_asset_catalog: { offset: 0, limit: 1000 },
+  inspect_keyed_archive: { path: "Contents/Resources/Model.plist" },
+  trace_dylib_resolution: {
+    roots: ["Contents/MacOS/App"],
+    architecture: "arm64",
   },
 };
 
-const artifact = <Name extends string>(
+const artifact = <
+  Name extends string,
+  Schema extends z.ZodType<Readonly<Record<string, unknown>>>,
+>(
   name: Name,
   description: string,
-  inputSchema: z.ZodObject,
-): ToolContract<Name> => {
-  const outputSchema = artifactOutputSchemas[name];
-  if (outputSchema === undefined)
-    throw new Error(`Missing artifact output schema for ${name}`);
+  inputSchema: Schema,
+) => {
+  const outputSchema = requireOutputSchema(artifactOutputSchemas, name);
   return {
     name,
     ...toolContractMetadata(name),
@@ -99,22 +72,53 @@ const artifact = <Name extends string>(
         input: exampleInputSchema.parse(examples[name] ?? {}),
       },
     ],
-  };
+  } satisfies ToolContract<Name, Schema, typeof outputSchema>;
 };
 
-/** Artifact-graph inventory and explicitly approved safe extraction contracts. */
+/** Artifact-graph inventory and safe extraction contracts. */
 export const ARTIFACT_TOOL_CONTRACTS = [
   artifact(
-    "inventory_artifact",
-    "Inventory the active application or package as a deterministic, content-addressed artifact graph. Returns bounded node and edge pages without extracting or mounting by default.",
-    artifactInventoryInputSchema,
+    "inspect_artifact",
+    "Inspect an active archive or application package in one call. By default returns the complete content-addressed artifact graph once, as the typed nested inventory Evidence, with root and integrity observations, integrity contradictions, hypotheses, unexplored branches, limitations, and next probes inline. Optional detail summary retains the complete inspection and returns its derived summary view; read exact paths or inventory pages with inspect_analysis_view using parent_evidence_id. This changes delivery, not inventory coverage. Read-only DMG mounting is used automatically on supported macOS hosts. Integrity mismatches fail by default; record-and-continue keeps mismatches explicitly untrusted. It does not extract files; use extract_artifact to materialize its regular contents.",
+    artifactInspectionInputSchema,
   ),
   artifact(
     "extract_artifact",
-    "Extract selected graph artifacts beneath an explicit output root. Requires approval, rejects traversal and symlink escapes, never overwrites, enforces bomb limits, and verifies cleanup.",
+    "Extract all regular files from the active archive or application package into a fresh temporary directory chosen by REA. The result includes its location. Rejects traversal and symlink escapes, never overwrites, and verifies cleanup. Integrity mismatches fail by default; record-and-continue extracts the observed bytes and returns each mismatch as an explicitly untrusted integrity contradiction.",
     artifactExtractionInputSchema,
+  ),
+  artifact(
+    "decode_interface_builder",
+    "Decode compiled storyboard and nib archives inside the active Apple app bundle, including keyed property lists and NIBArchive object tables, into a bounded object, hierarchy, and connection graph. This is static archive parsing; unrecognized archive classes and unresolved code handlers remain explicit unknowns.",
+    z.strictObject({
+      max_documents: z.number().int().min(1).max(64).default(64),
+      max_objects: z.number().int().min(1).max(20_000).default(20_000),
+      max_connections: z.number().int().min(1).max(40_000).default(40_000),
+    }),
+  ),
+  artifact(
+    "inspect_keyed_archive",
+    "Inspect one Foundation NSKeyedArchiver plist in the active app bundle as original object-table nodes, class descriptors, named roots, and UID edges. Preserves shared and cyclic references without instantiating classes. The path is relative to the bundle; root selection and object pagination preserve original identities.",
+    keyedArchiveInputSchema,
+  ),
+  artifact(
+    "inspect_asset_catalog",
+    "Inspect compiled Assets.car metadata in an active Apple app bundle. Returns stable paginated catalog and rendition records with raw assetutil metadata and catalog digests; rendition bytes are not extracted.",
+    appleAssetCatalogInputSchema,
+  ),
+  artifact(
+    "trace_dylib_resolution",
+    "Trace how dyld would resolve each Mach-O dylib load for the active Mach-O, or for every executable in the active .app bundle (the main app, XPC services, extensions, login items, helpers). Expands @executable_path, @loader_path, and @rpath through each process's LC_RPATH stack in dependents-first load order, and reports every candidate path with its outcome, the resolved image and digest, weak, re-export, and upward flags, and derived findings such as unresolved required loads or absent earlier @rpath candidates. Pure header parsing: nothing is executed, and absolute or system paths outside the analyzed root stay undetermined. Select roots or one architecture to narrow large bundles.",
+    dylibResolutionInputSchema,
   ),
 ] as const satisfies readonly ToolContract[];
 
-/** Names of provider-neutral artifact graph operations. */
-export type ArtifactToolName = (typeof ARTIFACT_TOOL_CONTRACTS)[number]["name"];
+/** Provider operations; inventory remains an internal primitive of inspection. */
+export const ARTIFACT_ANALYSIS_OPERATIONS = [
+  "inventory_artifact",
+  ...ARTIFACT_TOOL_CONTRACTS.map(({ name }) => name),
+] as const;
+
+/** Provider-level operations including the inventory primitive used internally. */
+export type ArtifactAnalysisOperation =
+  (typeof ARTIFACT_ANALYSIS_OPERATIONS)[number];

@@ -1,103 +1,56 @@
 import { z } from "zod";
 
-import { ConfigurationError } from "../domain/errors.js";
+import { ConfigurationError } from "../domain/configurationErrors.js";
+import { nulFreeStringSchema } from "../domain/localPath.js";
 import { err, ok, type Result } from "../domain/result.js";
-import {} from "../domain/browserObservation.js";
-import { electronFileRootsSchema } from "../domain/electronObservation.js";
+import { safeParseJson } from "../domain/safeJson.js";
 
+/** Decode explicitly selected reference-source exclusion patterns. */
 export const parseStringArray = (
   encoded: string,
   name: string,
 ): Result<readonly string[], ConfigurationError> => {
-  try {
-    const parsed = z
-      .array(z.string().min(1))
-      .max(128)
-      .safeParse(JSON.parse(encoded));
-    return parsed.success
-      ? ok(parsed.data)
-      : err(
-          new ConfigurationError(
-            parsed.error.issues.some(({ code }) => code === "too_big")
-              ? `${name} must encode at most 128 strings`
-              : `${name} must encode an array of strings`,
-            { cause: parsed.error },
-          ),
-        );
-  } catch (cause: unknown) {
-    return err(new ConfigurationError(`${name} must be valid JSON`, { cause }));
-  }
+  return parseConfiguredStringArray(encoded, name, z.string().min(1));
 };
 
-export const parseBrowserArray = (
-  encoded: string,
-  name: string,
-  itemSchema: z.ZodType<string>,
-  maximum: number,
-): Result<readonly string[], ConfigurationError> => {
-  try {
-    const parsed = z
-      .array(itemSchema)
-      .max(maximum)
-      .safeParse(JSON.parse(encoded));
-    return parsed.success
-      ? ok([...new Set(parsed.data)].sort())
-      : err(
-          new ConfigurationError(`${name} must encode valid browser scopes`, {
-            cause: parsed.error,
-          }),
-        );
-  } catch (cause: unknown) {
-    return err(new ConfigurationError(`${name} must be valid JSON`, { cause }));
-  }
-};
-
-export const parseElectronFileRoots = (
-  encoded: string,
-): Result<readonly string[], ConfigurationError> => {
-  try {
-    const decoded: unknown = JSON.parse(encoded);
-    if (Array.isArray(decoded) && decoded.length === 0) return ok([]);
-    const parsed = electronFileRootsSchema.safeParse(decoded);
-    return parsed.success
-      ? ok(parsed.data)
-      : err(
-          new ConfigurationError(
-            "REA_ELECTRON_FILE_ROOTS_JSON must encode absolute roots",
-            { cause: parsed.error },
-          ),
-        );
-  } catch (cause: unknown) {
-    return err(
-      new ConfigurationError(
-        "REA_ELECTRON_FILE_ROOTS_JSON must be valid JSON",
-        { cause },
-      ),
-    );
-  }
-};
-
+/** Decode Hopper arguments while preserving meaningful empty argv entries. */
 export const parseLoaderArgs = (
   encoded: string | undefined,
 ): Result<readonly string[], ConfigurationError> => {
   if (encoded === undefined) return ok([]);
-  let decoded: unknown;
-  try {
-    decoded = JSON.parse(encoded);
-  } catch (cause: unknown) {
+  return parseConfiguredStringArray(
+    encoded,
+    "HOPPER_LOADER_ARGS_JSON",
+    nulFreeStringSchema,
+    "must encode an array of strings without NUL bytes",
+  );
+};
+
+const parseConfiguredStringArray = (
+  encoded: string,
+  setting: string,
+  itemSchema: z.ZodString,
+  requirement = "must encode an array of strings",
+): Result<readonly string[], ConfigurationError> => {
+  const decoded = safeParseJson(encoded);
+  if (!decoded.ok)
     return err(
-      new ConfigurationError("HOPPER_LOADER_ARGS_JSON must be valid JSON", {
-        cause,
-      }),
+      configuredArrayError(setting, "must be valid JSON", decoded.cause),
     );
-  }
-  const parsed = z.array(z.string()).safeParse(decoded);
+  const parsed = z.array(itemSchema).safeParse(decoded.value);
   return parsed.success
     ? ok(parsed.data)
-    : err(
-        new ConfigurationError(
-          "HOPPER_LOADER_ARGS_JSON must encode an array of strings",
-          { cause: parsed.error },
-        ),
-      );
+    : err(configuredArrayError(setting, requirement, parsed.error));
+};
+
+const configuredArrayError = (
+  setting: string,
+  requirement: string,
+  cause: unknown,
+): ConfigurationError => {
+  const constraint = `${setting} ${requirement}`;
+  return new ConfigurationError(constraint, {
+    cause,
+    settings: [{ setting, constraint }],
+  });
 };

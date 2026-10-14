@@ -1,22 +1,27 @@
+import { z } from "zod";
+
 import type {
+  AnalysisExecution,
   AnalysisOperation,
   AnalysisOperationPort,
+  ExecutionOptions,
 } from "./AnalysisProvider.js";
 import type { EnhancedToolName } from "../contracts/enhancedInputs.js";
 import { enhancedInputSchemas } from "../contracts/enhancedInputs.js";
 import {
   AnalysisCancelledError,
+  AnalysisCapabilityUnavailableError,
   AnalysisOutputError,
-  projectAnalysisError,
-  type AnalysisError,
-} from "../domain/errors.js";
+} from "../domain/analysisErrorCore.js";
+import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
+import type { AnalysisError } from "../domain/analysisErrorBase.js";
 import {
   addressDistance,
-  parseAddressedPage,
-  parseDocuments,
+  functionDossierSchema,
   parseFunctionDossier,
   parseListCount,
   parseRelatedAddresses,
+  parseSegmentImageBase,
   parseSegments,
 } from "../domain/hopperValues.js";
 import { err, ok, type Result } from "../domain/result.js";
@@ -24,20 +29,23 @@ import {
   categorizeSwiftTypes,
   discoverObjcClasses,
   discoverObjcProtocols,
-  discoverSwiftClasses,
 } from "../domain/symbolAnalysis.js";
-import type { JsonValue } from "../domain/jsonValue.js";
+import { inspectNativeDispatch } from "./native/NativeDispatchMetadataInspection.js";
+import { traceNativeValues } from "./native/NativeValueTrace.js";
+import { traceNativeUiAction } from "./native/NativeUiActionTrace.js";
+import { jsonValueSchema, type JsonValue } from "../domain/jsonValue.js";
+import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 
 import {
   invalidEnhancedInput,
   type EnhancedResult,
-  type TraceMatch,
-  type TraceReference,
   type ValidatedEnhancedCall,
 } from "./EnhancedToolTypes.js";
-import { readAllAddressed } from "./EnhancedToolPagination.js";
-export type { ValidatedEnhancedCall } from "./EnhancedToolTypes.js";
-
+import { resolveAnalysisDocument } from "./AnalysisDocument.js";
+import { traceCallPath } from "./CallPathTracing.js";
+import { resolveProcedureAddress } from "./ProcedureAddressResolution.js";
+import { traceLiteralFeature } from "./EnhancedLiteralTracing.js";
+import { projectNativeApiInspection } from "./native/NativeApiInspection.js";
 /**
  * Composes direct provider operations into bounded reverse-engineering tools.
  * Direct callers use `execute`; adapters that own validation use
@@ -52,9 +60,29 @@ export class EnhancedTools {
     input: unknown,
     signal?: AbortSignal,
   ): EnhancedResult {
+    if (name === "trace_feature" || name === "trace_call_path")
+      return this.#executeTracing(name, input, signal);
+    if (name === "trace_native_values") {
+      const parsed = enhancedInputSchemas.trace_native_values.safeParse(input);
+      return parsed.success
+        ? this.executeValidated({ name, input: parsed.data }, signal)
+        : invalidEnhancedInput(name, parsed.error);
+    }
+    if (name === "trace_native_ui_action") {
+      const parsed =
+        enhancedInputSchemas.trace_native_ui_action.safeParse(input);
+      return parsed.success
+        ? this.executeValidated({ name, input: parsed.data }, signal)
+        : invalidEnhancedInput(name, parsed.error);
+    }
+    if (name === "analyze_function" || name === "inspect_native_api")
+      return this.#executeFunctionAnalysis(name, input, signal);
     switch (name) {
-      case "swift_classes": {
-        const parsed = enhancedInputSchemas.swift_classes.safeParse(input);
+      case "inspect_native_dispatch_metadata": {
+        const parsed =
+          enhancedInputSchemas.inspect_native_dispatch_metadata.safeParse(
+            input,
+          );
         return parsed.success
           ? this.executeValidated({ name, input: parsed.data }, signal)
           : invalidEnhancedInput(name, parsed.error);
@@ -79,8 +107,13 @@ export class EnhancedTools {
           ? this.executeValidated({ name, input: parsed.data }, signal)
           : invalidEnhancedInput(name, parsed.error);
       }
-      case "analyze_swift_types":
-        return this.executeValidated({ name, input: {} }, signal);
+      case "analyze_swift_types": {
+        const parsed =
+          enhancedInputSchemas.analyze_swift_types.safeParse(input);
+        return parsed.success
+          ? this.executeValidated({ name, input: parsed.data }, signal)
+          : invalidEnhancedInput(name, parsed.error);
+      }
       case "find_xrefs_to_name": {
         const parsed = enhancedInputSchemas.find_xrefs_to_name.safeParse(input);
         return parsed.success
@@ -89,18 +122,6 @@ export class EnhancedTools {
       }
       case "binary_overview": {
         const parsed = enhancedInputSchemas.binary_overview.safeParse(input);
-        return parsed.success
-          ? this.executeValidated({ name, input: parsed.data }, signal)
-          : invalidEnhancedInput(name, parsed.error);
-      }
-      case "analyze_function": {
-        const parsed = enhancedInputSchemas.analyze_function.safeParse(input);
-        return parsed.success
-          ? this.executeValidated({ name, input: parsed.data }, signal)
-          : invalidEnhancedInput(name, parsed.error);
-      }
-      case "trace_feature": {
-        const parsed = enhancedInputSchemas.trace_feature.safeParse(input);
         return parsed.success
           ? this.executeValidated({ name, input: parsed.data }, signal)
           : invalidEnhancedInput(name, parsed.error);
@@ -114,8 +135,11 @@ export class EnhancedTools {
     signal?: AbortSignal,
   ): EnhancedResult {
     switch (call.name) {
-      case "swift_classes":
-        return this.#swiftClasses(call.input.pattern, signal);
+      case "inspect_native_dispatch_metadata":
+        return this.#inspectNativeDispatchMetadata(
+          call.input.max_records,
+          signal,
+        );
       case "get_objc_classes":
         return this.#objcClasses(call.input.pattern, signal);
       case "get_objc_protocols":
@@ -125,16 +149,67 @@ export class EnhancedTools {
       case "get_call_graph":
         return this.#callGraph(call.input, signal);
       case "analyze_swift_types":
-        return this.#analyzeSwiftTypes(signal);
+        return this.#analyzeSwiftTypes(call.input, signal);
       case "find_xrefs_to_name":
         return this.#findXrefs(call.input.name, signal);
       case "binary_overview":
-        return this.#binaryOverview(call.input, signal);
+        return this.#binaryOverview(signal);
       case "analyze_function":
         return this.#analyzeFunction(call.input, signal);
+      case "inspect_native_api":
+        return this.#inspectNativeApi(call.input, signal);
       case "trace_feature":
-        return this.#traceFeature(call.input, signal);
+        return traceLiteralFeature(
+          (name, arguments_, operationSignal) =>
+            this.#call(name, arguments_, operationSignal),
+          call.input,
+          signal,
+        );
+      case "trace_call_path":
+        return traceCallPath(
+          (name, arguments_, operationSignal, selectorOrigin) =>
+            this.#call(name, arguments_, operationSignal, selectorOrigin),
+          (name, arguments_, operationSignal, selectorOrigin) =>
+            this.#observe(name, arguments_, operationSignal, selectorOrigin),
+          call.input,
+          signal,
+        );
+      case "trace_native_values":
+        return traceNativeValues(this.analysis, call.input, signal);
+      case "trace_native_ui_action": {
+        return traceNativeUiAction(this.analysis, call.input, signal);
+      }
     }
+  }
+
+  #executeTracing(
+    name: "trace_feature" | "trace_call_path",
+    input: unknown,
+    signal?: AbortSignal,
+  ): EnhancedResult {
+    if (name === "trace_call_path") {
+      const parsed = enhancedInputSchemas.trace_call_path.safeParse(input);
+      if (!parsed.success) return invalidEnhancedInput(name, parsed.error);
+      return this.executeValidated({ name, input: parsed.data }, signal);
+    }
+    const parsed = enhancedInputSchemas.trace_feature.safeParse(input);
+    if (!parsed.success) return invalidEnhancedInput(name, parsed.error);
+    return this.executeValidated({ name, input: parsed.data }, signal);
+  }
+
+  #executeFunctionAnalysis(
+    name: "analyze_function" | "inspect_native_api",
+    input: unknown,
+    signal?: AbortSignal,
+  ): EnhancedResult {
+    if (name === "analyze_function") {
+      const parsed = enhancedInputSchemas.analyze_function.safeParse(input);
+      if (!parsed.success) return invalidEnhancedInput(name, parsed.error);
+      return this.executeValidated({ name, input: parsed.data }, signal);
+    }
+    const parsed = enhancedInputSchemas.inspect_native_api.safeParse(input);
+    if (!parsed.success) return invalidEnhancedInput(name, parsed.error);
+    return this.executeValidated({ name, input: parsed.data }, signal);
   }
 
   async #analyzeFunction(
@@ -145,16 +220,31 @@ export class EnhancedTools {
     return result.ok ? parseFunctionDossier(result.value) : result;
   }
 
-  async #swiftClasses(pattern: string, signal?: AbortSignal): EnhancedResult {
-    const procedures = await this.#allAddressed("list_procedures", signal);
-    return procedures.ok
-      ? ok(discoverSwiftClasses(procedures.value, pattern))
-      : procedures;
+  async #inspectNativeApi(
+    input: z.output<typeof enhancedInputSchemas.inspect_native_api>,
+    signal?: AbortSignal,
+  ): EnhancedResult {
+    const analysisInput = enhancedInputSchemas.analyze_function.parse({
+      procedure: input.procedure,
+    });
+    const result = await this.#call("analyze_function", analysisInput, signal);
+    if (!result.ok) return result;
+    const parsed = parseFunctionDossier(result.value);
+    if (!parsed.ok) return parsed;
+    const dossier = functionDossierSchema.parse(parsed.value);
+    return ok(jsonValueSchema.parse(projectNativeApiInspection(dossier)));
   }
 
   async #objcClasses(pattern: string, signal?: AbortSignal): EnhancedResult {
     const names = await this.#allAddressed("list_names", signal);
     return names.ok ? ok(discoverObjcClasses(names.value, pattern)) : names;
+  }
+
+  #inspectNativeDispatchMetadata(
+    maxRecords: number,
+    signal?: AbortSignal,
+  ): EnhancedResult {
+    return inspectNativeDispatch(this.analysis, maxRecords, signal);
   }
 
   async #objcProtocols(signal?: AbortSignal): EnhancedResult {
@@ -168,20 +258,34 @@ export class EnhancedTools {
   ): EnhancedResult {
     const items = await Promise.all(
       addresses.map(async (address) => {
+        const resolved = await resolveProcedureAddress(
+          this.#call.bind(this),
+          address,
+          signal,
+        );
+        const procedure = resolved.ok
+          ? await this.#batchProcedureIdentity(resolved.value, signal)
+          : {
+              status: "unknown" as const,
+              error: projectAnalysisError(resolved.error),
+            };
         const result = await this.#call(
           "procedure_pseudo_code",
-          { procedure: address },
+          { procedure: resolved.ok ? resolved.value : address },
           signal,
+          resolved.ok ? "provider" : undefined,
         );
         if (!result.ok)
           return {
             address,
+            procedure,
             status: "error" as const,
             error: projectAnalysisError(result.error),
           };
         if (typeof result.value !== "string" || result.value.length === 0)
           return {
             address,
+            procedure,
             status: "error" as const,
             error: projectAnalysisError(
               new AnalysisOutputError(
@@ -190,7 +294,12 @@ export class EnhancedTools {
               ),
             ),
           };
-        return { address, status: "ok" as const, pseudocode: result.value };
+        return {
+          address,
+          procedure,
+          status: "ok" as const,
+          pseudocode: result.value,
+        };
       }),
     );
     const succeeded = items.filter(({ status }) => status === "ok").length;
@@ -202,36 +311,75 @@ export class EnhancedTools {
     });
   }
 
+  async #batchProcedureIdentity(address: string, signal?: AbortSignal) {
+    const observed = await this.#call("address_name", { address }, signal);
+    const named =
+      observed.ok &&
+      (typeof observed.value === "string" || observed.value === null);
+    return {
+      status: "resolved" as const,
+      address,
+      name: named ? observed.value : null,
+      ...(named
+        ? {}
+        : {
+            name_error: projectAnalysisError(
+              observed.ok
+                ? new AnalysisOutputError(
+                    "address_name",
+                    "provider returned an invalid entry label",
+                  )
+                : observed.error,
+            ),
+          }),
+    };
+  }
+
   async #callGraph(
     input: {
       readonly address: string;
       readonly direction: "forward" | "backward";
-      readonly depth: number;
     },
     signal?: AbortSignal,
   ): EnhancedResult {
     const relation = input.direction === "forward" ? "callees" : "callers";
     const tool =
       input.direction === "forward" ? "procedure_callees" : "procedure_callers";
-    const discovered = new Set([input.address]);
+    const limitations = new Set<string>();
+    const resolved = await this.#observe(
+      "procedure_address",
+      { procedure: input.address },
+      signal,
+    );
+    if (!resolved.ok) return resolved;
+    for (const limitation of resolved.value.limitations)
+      limitations.add(limitation);
+    const startAddress = resolved.value.result;
+    if (typeof startAddress !== "string" || startAddress.length === 0)
+      return err(
+        new AnalysisOutputError(
+          "procedure_address",
+          "provider returned no canonical procedure address",
+        ),
+      );
+    const discovered = new Set([startAddress]);
     const queue: Array<{ address: string; depth: number }> = [
-      { address: input.address, depth: 0 },
+      { address: startAddress, depth: 0 },
     ];
     let queueIndex = 0;
     const graph: Record<string, JsonValue[]> = {};
 
     while (queueIndex < queue.length) {
       const current = queue[queueIndex++];
-      if (current === undefined || current.depth >= input.depth) {
-        continue;
-      }
+      if (current === undefined) continue;
       const level = String(current.depth);
       graph[level] ??= [];
 
-      const result = await this.#call(
+      const result = await this.#observe(
         tool,
         { procedure: current.address },
         signal,
+        "provider",
       );
       if (!result.ok) {
         graph[level].push({
@@ -241,7 +389,7 @@ export class EnhancedTools {
         });
         continue;
       }
-      const related = parseRelatedAddresses(result.value, relation);
+      const related = parseRelatedAddresses(result.value.result, relation);
       if (!related.ok) {
         graph[level].push({
           address: current.address,
@@ -250,28 +398,83 @@ export class EnhancedTools {
         });
         continue;
       }
+      for (const limitation of result.value.limitations)
+        limitations.add(limitation);
+      const reportedCoverage = result.value.relationshipCoverage;
+      const coverage = reportedCoverage ?? {
+        status: "unknown" as const,
+        reason: "Provider did not report relationship coverage.",
+      };
+      const relationshipLimitations =
+        reportedCoverage === undefined
+          ? [
+              ...result.value.limitations,
+              "Provider did not report relationship coverage.",
+            ]
+          : [
+              ...(reportedCoverage.status === "partial"
+                ? reportedCoverage.limitations
+                : reportedCoverage.status === "unknown"
+                  ? [reportedCoverage.reason]
+                  : []),
+              ...("diagnostics" in reportedCoverage
+                ? reportedCoverage.diagnostics
+                : []),
+            ];
+      const nodeLimitations = [...new Set(relationshipLimitations)].sort(
+        compareUnicodeCodePoints,
+      );
       graph[level].push({
         address: current.address,
         status: "ok",
         calls: [...related.value],
+        relationship_coverage: coverage,
+        ...(nodeLimitations.length === 0
+          ? {}
+          : { limitations: nodeLimitations }),
       });
-      if (current.depth + 1 < input.depth) {
-        for (const address of related.value) {
-          if (!discovered.has(address)) {
-            discovered.add(address);
-            queue.push({ address, depth: current.depth + 1 });
-          }
+      for (const address of related.value) {
+        if (!discovered.has(address)) {
+          discovered.add(address);
+          queue.push({ address, depth: current.depth + 1 });
         }
       }
     }
-    return ok(graph);
+    return ok({
+      graph,
+      limitations: [...limitations].sort(compareUnicodeCodePoints),
+    });
   }
 
-  async #analyzeSwiftTypes(signal?: AbortSignal): EnhancedResult {
+  async #analyzeSwiftTypes(
+    input: z.output<typeof enhancedInputSchemas.analyze_swift_types>,
+    signal?: AbortSignal,
+  ): EnhancedResult {
     const procedures = await this.#allAddressed("list_procedures", signal);
-    return procedures.ok
-      ? ok(categorizeSwiftTypes(procedures.value))
-      : procedures;
+    if (!procedures.ok) return procedures;
+    const symbols = await this.#allAddressed("list_names", signal);
+    if (
+      !symbols.ok &&
+      !(symbols.error instanceof AnalysisCapabilityUnavailableError)
+    )
+      return symbols;
+    const result = categorizeSwiftTypes(
+      procedures.value,
+      input,
+      symbols.ok ? symbols.value : [],
+    );
+    return ok(
+      symbols.ok
+        ? result
+        : {
+            ...result,
+            symbol_inventory_error: projectAnalysisError(symbols.error),
+            limitations: [
+              ...result.limitations,
+              "The provider's symbol inventory is unavailable; demangled procedures could not be joined to their Swift aliases.",
+            ],
+          },
+    );
   }
 
   async #findXrefs(name: string, signal?: AbortSignal): EnhancedResult {
@@ -305,197 +508,44 @@ export class EnhancedTools {
     });
   }
 
-  async #binaryOverview(
-    input: { detail: "concise" | "detailed"; limit: number },
-    signal?: AbortSignal,
-  ): EnhancedResult {
-    const [segmentsResult, documentsResult, procedures, stringsResult] =
-      await Promise.all([
+  async #binaryOverview(signal?: AbortSignal): EnhancedResult {
+    const document = await resolveAnalysisDocument(
+      this.analysis,
+      undefined,
+      signal,
+    );
+    if (!document.ok) return document;
+    const [segmentsResult, proceduresResult, stringsResult] = await Promise.all(
+      [
         this.#call("list_segments", {}, signal),
-        this.#call("list_documents", {}, signal),
-        this.#allAddressed("list_procedures", signal),
+        this.#call("list_procedures", {}, signal),
         this.#call("list_strings", {}, signal),
-      ]);
+      ],
+    );
     if (!segmentsResult.ok) return segmentsResult;
-    if (!documentsResult.ok) return documentsResult;
-    if (!procedures.ok) return procedures;
+    if (!proceduresResult.ok) return proceduresResult;
     if (!stringsResult.ok) return stringsResult;
 
     const segments = parseSegments(segmentsResult.value);
     if (!segments.ok) return segments;
-    const documents = parseDocuments(documentsResult.value);
-    if (!documents.ok) return documents;
+    const imageBase = parseSegmentImageBase(segmentsResult.value);
+    const procedureCount = parseListCount(proceduresResult.value, "procedures");
+    if (!procedureCount.ok) return procedureCount;
     const stringCount = parseListCount(stringsResult.value, "strings");
     if (!stringCount.ok) return stringCount;
 
     return ok({
-      document: documents.value[0] ?? "unknown",
-      detail: input.detail,
-      segments: segments.value
-        .slice(0, input.limit)
-        .map(({ name, start, end }) =>
-          input.detail === "detailed"
-            ? { name, start, end, length: addressDistance(start, end) }
-            : { name, start, end },
-        ),
+      document: document.value,
+      segments: segments.value.map(({ name, start, end }) => ({
+        name,
+        start,
+        end,
+        length: addressDistance(start, end),
+      })),
       segment_count: segments.value.length,
-      procedure_count: procedures.value.length,
+      procedure_count: procedureCount.value,
       string_count: stringCount.value,
-    });
-  }
-
-  async #traceFeature(
-    input: {
-      readonly query: string;
-      readonly case_sensitive: boolean;
-      readonly limit: number;
-      readonly max_operations: number;
-    },
-    signal?: AbortSignal,
-  ): EnhancedResult {
-    const searched = await this.#literalMatches(input, signal);
-    if (!searched.ok) return searched;
-    const residual = new Set<string>();
-    const traced = await this.#traceReferences(
-      searched.value.matches,
-      input.limit,
-      input.max_operations - searched.value.operations,
-      signal,
-    );
-    if (!traced.ok) return traced;
-    for (const reason of traced.value.residual) residual.add(reason);
-    const operations = searched.value.operations + traced.value.operations;
-    if (operations >= input.max_operations)
-      residual.add("Investigation reached the operation budget.");
-    if (searched.value.matches.length >= input.limit)
-      residual.add("Literal matches reached the configured limit.");
-    return ok({
-      query: input.query,
-      search_mode: "literal",
-      operations_used: operations,
-      operation_budget: input.max_operations,
-      matches: searched.value.matches,
-      references: traced.value.references,
-      truncated: residual.size > 0,
-      residual_unknowns: [...residual],
-    });
-  }
-
-  async #literalMatches(
-    input: {
-      readonly query: string;
-      readonly case_sensitive: boolean;
-      readonly limit: number;
-      readonly max_operations: number;
-    },
-    signal?: AbortSignal,
-  ): Promise<
-    Result<{ matches: TraceMatch[]; operations: number }, AnalysisError>
-  > {
-    let operations = 0;
-    const matches: TraceMatch[] = [];
-    const needle = input.case_sensitive
-      ? input.query
-      : input.query.toLowerCase();
-    for (const [tool, type] of [
-      ["list_strings", "string"],
-      ["list_procedures", "procedure"],
-    ] as const) {
-      let offset = 0;
-      while (
-        operations < input.max_operations &&
-        matches.length < input.limit
-      ) {
-        operations += 1;
-        const result = await this.#call(tool, { offset, limit: 500 }, signal);
-        if (!result.ok) return result;
-        const page = parseAddressedPage(result.value);
-        if (!page.ok) return page;
-        for (const item of page.value.items) {
-          const haystack = input.case_sensitive
-            ? item.name
-            : item.name.toLowerCase();
-          if (haystack.includes(needle))
-            matches.push({ type, address: item.address, value: item.name });
-          if (matches.length >= input.limit) break;
-        }
-        if (!page.value.hasMore || page.value.nextOffset === null) break;
-        offset = page.value.nextOffset;
-      }
-    }
-    return ok({ matches, operations });
-  }
-
-  async #traceReferences(
-    matches: readonly TraceMatch[],
-    limit: number,
-    operationBudget: number,
-    signal?: AbortSignal,
-  ): Promise<
-    Result<
-      { references: TraceReference[]; operations: number; residual: string[] },
-      AnalysisError
-    >
-  > {
-    let operations = 0;
-    const references: TraceReference[] = [];
-    const residual = new Set<string>();
-    for (const match of matches) {
-      if (operations >= operationBudget) {
-        residual.add("Reference traversal stopped at the operation budget.");
-        break;
-      }
-      operations += 1;
-      const xrefs = await this.#call(
-        "xrefs",
-        { address: match.address },
-        signal,
-      );
-      if (!xrefs.ok) return xrefs;
-      if (!Array.isArray(xrefs.value))
-        return err(
-          new AnalysisOutputError(
-            "xrefs",
-            "provider returned a non-array result",
-          ),
-        );
-      for (const source of xrefs.value) {
-        if (typeof source !== "string")
-          return err(
-            new AnalysisOutputError(
-              "xrefs",
-              "provider returned a non-address value",
-            ),
-          );
-        if (operations >= operationBudget) {
-          residual.add(
-            "Containing-procedure resolution stopped at the operation budget.",
-          );
-          break;
-        }
-        operations += 1;
-        const resolved = await this.#call(
-          "resolve_containing_procedure",
-          { address: source },
-          signal,
-        );
-        if (!resolved.ok) return resolved;
-        references.push({
-          target_address: match.address,
-          source_address: source,
-          containing_procedure: resolved.value,
-        });
-        if (references.length >= limit) {
-          residual.add("Reference results reached the configured limit.");
-          break;
-        }
-      }
-      if (references.length >= limit) break;
-    }
-    return ok({
-      references,
-      operations,
-      residual: [...residual],
+      ...(imageBase === undefined ? {} : { image_base: imageBase }),
     });
   }
 
@@ -503,25 +553,52 @@ export class EnhancedTools {
     tool: "list_names" | "list_procedures",
     signal?: AbortSignal,
   ) {
-    return readAllAddressed({
-      call: (name, arguments_, operationSignal) =>
-        this.#call(name, arguments_, operationSignal),
-      tool,
-      ...(signal === undefined ? {} : { signal }),
-    });
+    const result = await this.#call(tool, {}, signal);
+    if (!result.ok) return result;
+    const parsed = z
+      .array(z.object({ address: z.string(), value: z.string() }))
+      .safeParse(result.value);
+    return parsed.success
+      ? ok(parsed.data.map(({ address, value: name }) => ({ address, name })))
+      : err(
+          new AnalysisOutputError(
+            tool,
+            "provider returned an invalid inventory",
+          ),
+        );
   }
 
   async #call(
     name: AnalysisOperation,
     arguments_: Readonly<Record<string, JsonValue>>,
     signal?: AbortSignal,
+    selectorOrigin?: ExecutionOptions["selectorOrigin"],
   ): Promise<Result<JsonValue, AnalysisError>> {
-    if (signal?.aborted === true) return err(new AnalysisCancelledError(name));
-    const execution = await this.analysis.execute(
+    const execution = await this.#observe(
       name,
       arguments_,
-      signal === undefined ? {} : { signal },
+      signal,
+      selectorOrigin,
     );
     return execution.ok ? ok(execution.value.result) : execution;
   }
+
+  async #observe(
+    name: AnalysisOperation,
+    arguments_: Readonly<Record<string, JsonValue>>,
+    signal?: AbortSignal,
+    selectorOrigin?: ExecutionOptions["selectorOrigin"],
+  ): Promise<Result<AnalysisExecution, AnalysisError>> {
+    if (isAborted(signal)) return err(new AnalysisCancelledError(name));
+    const execution = await this.analysis.execute(name, arguments_, {
+      ...(signal === undefined ? {} : { signal }),
+      ...(selectorOrigin === undefined ? {} : { selectorOrigin }),
+    });
+    if (!execution.ok) return execution;
+    if (isAborted(signal)) return err(new AnalysisCancelledError(name));
+    return execution;
+  }
 }
+
+const isAborted = (signal: AbortSignal | undefined): boolean =>
+  signal?.aborted === true;

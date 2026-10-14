@@ -1,12 +1,12 @@
+import type { EvidenceMcpServer } from "./EvidenceMcpServer.js";
 import {
   completable,
-  type McpServer,
   type RegisteredPrompt,
 } from "@modelcontextprotocol/server";
 import { z } from "zod";
 
 import type { AnalysisOperationPort } from "../application/AnalysisProvider.js";
-import type { BinarySessionPort } from "../application/BinarySession.js";
+import type { BinarySessionPort } from "../application/binary/BinarySessionPort.js";
 import {
   PROMPT_CONTRACTS,
   renderGuidedPrompt,
@@ -27,7 +27,7 @@ export interface GuidedPromptRegistry {
 
 /** Register every guided workflow and its session-scoped argument completers. */
 export const registerGuidedPrompts = (
-  server: McpServer,
+  server: EvidenceMcpServer,
   analysis: AnalysisOperationPort,
   session?: BinarySessionPort,
 ): GuidedPromptRegistry => {
@@ -52,7 +52,7 @@ export const registerGuidedPrompts = (
 };
 
 const registerPrompt = (
-  server: McpServer,
+  server: EvidenceMcpServer,
   contract: PromptContract,
   completion: PromptCompletionSource,
 ): RegisteredPrompt => {
@@ -84,9 +84,8 @@ const argumentSchema = (
 ): z.ZodType => {
   const value = z
     .string()
-    .trim()
     .min(1)
-    .max(4_096)
+    .refine((value) => value.trim().length > 0)
     .describe(argument.description);
   const kind = argument.completion;
   const completed =
@@ -98,18 +97,24 @@ const argumentSchema = (
   return argument.required ? completed : completed.optional();
 };
 
-const promptResult = (contract: PromptContract, arguments_: unknown) => ({
-  description: contract.description,
-  messages: [
-    {
-      role: "user" as const,
-      content: {
-        type: "text" as const,
-        text: renderGuidedPrompt(
-          contract,
-          promptValuesSchema.parse(arguments_),
-        ),
+const promptResult = (contract: PromptContract, arguments_: unknown) => {
+  const values = promptValuesSchema.parse(arguments_);
+  for (const [name, argument] of Object.entries(contract.arguments))
+    if (
+      argument.required &&
+      (values[name] === undefined || values[name]?.trim().length === 0)
+    )
+      throw new TypeError(`Invalid arguments: ${name} must not be empty`);
+  return {
+    description: contract.description,
+    messages: [
+      {
+        role: "user" as const,
+        content: {
+          type: "text" as const,
+          text: renderGuidedPrompt(contract, values),
+        },
       },
-    },
-  ],
-});
+    ],
+  };
+};

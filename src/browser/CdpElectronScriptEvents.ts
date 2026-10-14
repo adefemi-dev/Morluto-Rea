@@ -1,23 +1,23 @@
 import type { CdpEvent } from "./CdpConnection.js";
 import { CdpCaptureCompleteness } from "./CdpCaptureCompleteness.js";
 import {
-  boundedText,
   numberValue,
   recordValue,
-  stringValue,
+  scriptMetadataValues,
+  cdpStringValue,
 } from "./CdpCaptureValues.js";
 
 export interface ElectronScriptDraft {
   readonly scriptId: string;
   readonly rawUrl: string;
-  readonly hash: string;
-  readonly length: number;
-  readonly isModule: boolean;
+  readonly hash: string | null;
+  readonly length: number | null;
+  readonly isModule: boolean | null;
   readonly language: string | null;
   readonly executionContextKey: string | null;
 }
 
-/** Retain only bounded script/frame metadata from passive Electron events. */
+/** Retain script/frame metadata from passive Electron events. */
 export const ingestElectronScriptEvent = (input: {
   readonly event: CdpEvent;
   readonly scripts: ElectronScriptDraft[];
@@ -35,18 +35,14 @@ export const ingestElectronScriptEvent = (input: {
     return;
   }
   if (input.event.method === "Runtime.executionContextCreated") {
-    retainExecutionContext(
-      input.event,
-      input.executionContextFrames,
-      input.completeness,
-    );
+    retainExecutionContext(input.event, input.executionContextFrames);
     return;
   }
   if (input.event.method !== "Debugger.scriptParsed") return;
   const value = recordValue(input.event.params);
-  const scriptId = stringValue(value?.scriptId);
-  const rawUrl = stringValue(value?.url);
-  if (scriptId === undefined || scriptId.length > 256) {
+  const scriptId = cdpStringValue(value?.scriptId);
+  const rawUrl = cdpStringValue(value?.url);
+  if (scriptId === undefined) {
     input.completeness.exclude("scripts", "invalid_protocol_value");
     return;
   }
@@ -54,17 +50,11 @@ export const ingestElectronScriptEvent = (input: {
     input.completeness.exclude("scripts", "unattributed_origin");
     return;
   }
-  if (input.scripts.length >= 2_000) {
-    input.completeness.drop("scripts");
-    return;
-  }
   input.scripts.push({
     scriptId,
     rawUrl,
-    hash: (stringValue(value?.hash) ?? "").slice(0, 512),
-    length: nonnegativeInteger(value?.length),
-    isModule: value?.isModule === true,
-    language: boundedText(value?.scriptLanguage, 100),
+    ...scriptMetadataValues(value),
+    language: cdpStringValue(value?.scriptLanguage) ?? null,
     executionContextKey: executionContextKey(value?.executionContextId),
   });
 };
@@ -72,24 +62,13 @@ export const ingestElectronScriptEvent = (input: {
 const retainExecutionContext = (
   event: CdpEvent,
   frames: Map<string, string>,
-  completeness: CdpCaptureCompleteness,
 ): void => {
   const parameters = recordValue(event.params);
   const runtimeContext = recordValue(parameters?.context);
   const contextKey = executionContextKey(runtimeContext?.id);
-  const frameId = stringValue(recordValue(runtimeContext?.auxData)?.frameId);
-  if (contextKey === null || frameId === undefined || frameId.length > 256)
-    return;
-  if (frames.size >= 2_000 && !frames.has(contextKey)) {
-    completeness.truncate("scripts");
-    return;
-  }
+  const frameId = cdpStringValue(recordValue(runtimeContext?.auxData)?.frameId);
+  if (contextKey === null || frameId === undefined) return;
   frames.set(contextKey, frameId);
-};
-
-const nonnegativeInteger = (value: unknown): number => {
-  const number = numberValue(value);
-  return number === undefined ? 0 : Math.max(0, Math.trunc(number));
 };
 
 const executionContextKey = (value: unknown): string | null => {

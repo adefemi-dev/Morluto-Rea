@@ -3,20 +3,32 @@ import { createHash } from "node:crypto";
 import canonicalize from "canonicalize";
 import { z } from "zod";
 
+import {
+  compareUnicodeCodePoints,
+  compositeKey,
+} from "./unicodeCodePointOrder.js";
+
 import { evidenceBundleSchema, parseEvidenceBundle } from "./evidenceBundle.js";
 import {
   evaluateReconstructionClaims,
   evaluateReconstructionPackageProofs,
   evaluateReconstructionSurfaces,
-  evaluateReconstructionWorkspaceRisks,
+  evaluateReconstructionCoverageRisks,
   recommendedReconstructionProbes,
   type ReconstructionEvaluationContext,
 } from "./reconstructionCoverageEvaluation.js";
+import { digestSchema } from "./../domain/digests.js";
+import { prefixedDigestSchema } from "./../domain/digests.js";
+import {
+  offsetDateTimeInstantFromEpochMilliseconds,
+  offsetDateTimeSchema,
+} from "./offsetDateTime.js";
 
-const digestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
-const evidenceIdSchema = z.string().regex(/^ev_[a-f0-9]{64}$/u);
-const stableIdSchema = z.string().regex(/^[A-Za-z][A-Za-z0-9._:/-]{0,199}$/u);
-const boundedTextSchema = z.string().trim().min(1).max(4_096);
+const evidenceIdSchema = prefixedDigestSchema("ev");
+const stableIdSchema = z
+  .string()
+  .regex(/^[A-Za-z][A-Za-z0-9._:\x2f\x2d]{0,199}$/u);
+const boundedTextSchema = z.string().trim().min(1);
 
 const authoritySchema = z.enum([
   "observed",
@@ -29,26 +41,26 @@ const authoritySchema = z.enum([
 const artifactSchema = z.strictObject({
   artifact_id: stableIdSchema,
   artifact_sha256: digestSchema,
-  version: z.string().trim().min(1).max(500),
+  version: z.string().trim().min(1),
   environment_sha256: digestSchema,
-  evidence_ids: z.array(evidenceIdSchema).min(1).max(1_000),
+  evidence_ids: z.array(evidenceIdSchema).min(1),
 });
 
 const surfaceSchema = z.strictObject({
   surface_id: stableIdSchema,
-  family: z.string().trim().min(1).max(100),
+  family: z.string().trim().min(1),
   artifact_id: stableIdSchema,
-  occurrence_id: z.string().trim().min(1).max(500).nullable(),
+  occurrence_id: z.string().trim().min(1).nullable(),
   location: boundedTextSchema,
   authority: authoritySchema,
-  dependency_surface_ids: z.array(stableIdSchema).max(1_000),
-  evidence_ids: z.array(evidenceIdSchema).min(1).max(1_000),
+  dependency_surface_ids: z.array(stableIdSchema),
+  evidence_ids: z.array(evidenceIdSchema).min(1),
 });
 
 const implementationOwnerSchema = z.strictObject({
   disposition: z.literal("implemented"),
   owner_path: boundedTextSchema,
-  owner_export: z.string().trim().min(1).max(500).nullable(),
+  owner_export: z.string().trim().min(1).nullable(),
   owner_sha256: digestSchema,
   path_state: z.enum(["present", "missing", "unknown"]),
   package_state: z.enum(["distributed", "missing", "unknown"]),
@@ -70,10 +82,10 @@ const ownerSchema = z.strictObject({
 
 const claimSchema = z.strictObject({
   claim_id: stableIdSchema,
-  title: z.string().trim().min(1).max(500),
-  kind: z.string().trim().min(1).max(100),
-  surface_ids: z.array(stableIdSchema).min(1).max(1_000),
-  required_dimensions: z.array(stableIdSchema).min(1).max(100),
+  title: z.string().trim().min(1),
+  kind: z.string().trim().min(1),
+  surface_ids: z.array(stableIdSchema).min(1),
+  required_dimensions: z.array(stableIdSchema).min(1),
   required_authority: z.enum([
     "shipped-artifact",
     "controlled-replay",
@@ -84,16 +96,16 @@ const claimSchema = z.strictObject({
 
 const verifierContractBaseSchema = z.strictObject({
   verifier_id: stableIdSchema,
-  claim_ids: z.array(stableIdSchema).min(1).max(1_000),
-  dimensions: z.array(stableIdSchema).min(1).max(100),
+  claim_ids: z.array(stableIdSchema).min(1),
+  dimensions: z.array(stableIdSchema).min(1),
   authority: z.enum([
     "shipped-artifact",
     "controlled-replay",
     "live-observation",
     "external",
   ]),
-  max_age_ms: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
-  minimum_repeats: z.number().int().min(1).max(1_000),
+  max_age_ms: z.number().int().min(1),
+  minimum_repeats: z.number().int().min(1),
   normalization_sha256: digestSchema,
   normalization_removes_dimensions: z.literal(false),
 });
@@ -105,7 +117,7 @@ const verifierContractSchema = verifierContractBaseSchema.extend({
 const verifierResultSchema = z.strictObject({
   verifier_id: stableIdSchema,
   contract_sha256: digestSchema,
-  observed_at: z.string().datetime({ offset: true }),
+  observed_at: offsetDateTimeSchema,
   status: z.enum([
     "pass",
     "fail",
@@ -114,21 +126,21 @@ const verifierResultSchema = z.strictObject({
     "truncated",
     "skipped",
   ]),
-  covered_claim_ids: z.array(stableIdSchema).min(1).max(1_000),
-  covered_dimensions: z.array(stableIdSchema).min(1).max(100),
-  artifact_sha256s: z.array(digestSchema).min(1).max(1_000),
-  owner_sha256s: z.array(digestSchema).max(1_000),
+  covered_claim_ids: z.array(stableIdSchema).min(1),
+  covered_dimensions: z.array(stableIdSchema).min(1),
+  artifact_sha256s: z.array(digestSchema).min(1),
+  owner_sha256s: z.array(digestSchema),
   normalization_sha256: digestSchema,
-  repeats: z.number().int().min(1).max(1_000),
-  evidence_ids: z.array(evidenceIdSchema).min(1).max(1_000),
+  repeats: z.number().int().min(1),
+  evidence_ids: z.array(evidenceIdSchema).min(1),
 });
 
 const contradictionSchema = z.strictObject({
   contradiction_id: stableIdSchema,
   status: z.enum(["active", "resolved"]),
-  surface_ids: z.array(stableIdSchema).max(1_000),
-  claim_ids: z.array(stableIdSchema).max(1_000),
-  evidence_ids: z.array(evidenceIdSchema).min(2).max(1_000),
+  surface_ids: z.array(stableIdSchema),
+  claim_ids: z.array(stableIdSchema),
+  evidence_ids: z.array(evidenceIdSchema).min(2),
 });
 
 const packageProofSchema = z.strictObject({
@@ -141,51 +153,49 @@ const packageProofSchema = z.strictObject({
     "authority-independence",
   ]),
   status: z.enum(["pass", "fail", "unknown", "unsupported", "skipped"]),
-  artifact_sha256s: z.array(digestSchema).min(1).max(1_000),
-  evidence_ids: z.array(evidenceIdSchema).min(1).max(1_000),
+  artifact_sha256s: z.array(digestSchema).min(1),
+  evidence_ids: z.array(evidenceIdSchema).min(1),
 });
 
 const boundarySchema = z.strictObject({
   boundary_id: stableIdSchema,
-  title: z.string().trim().min(1).max(500),
-  required_surface_ids: z.array(stableIdSchema).min(1).max(10_000),
-  required_claim_ids: z.array(stableIdSchema).min(1).max(10_000),
-  required_package_proof_kinds: z
-    .array(packageProofSchema.shape.kind)
-    .min(1)
-    .max(5),
-  allowed_dispositions: z.array(z.enum(["external", "non-goal"])).max(2),
-  allowed_unknown_ids: z.array(stableIdSchema).max(1_000),
+  title: z.string().trim().min(1),
+  required_surface_ids: z.array(stableIdSchema).min(1),
+  required_claim_ids: z.array(stableIdSchema).min(1),
+  required_package_proof_kinds: z.array(packageProofSchema.shape.kind).min(1),
+  allowed_dispositions: z.array(z.enum(["external", "non-goal"])),
+  allowed_unknown_ids: z.array(stableIdSchema),
 });
 
-const workspaceSemanticSchema = z.strictObject({
-  schema_version: z.literal(1),
-  workspace_id: z.string().regex(/^rcw_[a-f0-9]{64}$/u),
-  name: z.string().trim().min(1).max(200),
-  revision: z.number().int().min(1),
-  previous_revision_sha256: digestSchema.nullable(),
+export const reconstructionCoverageDataSchema = z.strictObject({
   evidence_bundle: evidenceBundleSchema,
-  artifacts: z.array(artifactSchema).max(1_000),
-  surfaces: z.array(surfaceSchema).max(10_000),
-  owners: z.array(ownerSchema).max(10_000),
-  claims: z.array(claimSchema).max(10_000),
-  verifier_contracts: z.array(verifierContractSchema).max(10_000),
-  verifier_results: z.array(verifierResultSchema).max(100_000),
-  residual_unknown_ids: z.array(stableIdSchema).max(10_000),
-  contradictions: z.array(contradictionSchema).max(10_000),
-  package_proofs: z.array(packageProofSchema).max(10_000),
-  boundaries: z.array(boundarySchema).max(1_000),
+  artifacts: z.array(artifactSchema),
+  surfaces: z.array(surfaceSchema),
+  owners: z.array(ownerSchema),
+  claims: z.array(claimSchema),
+  verifier_contracts: z.array(verifierContractSchema),
+  verifier_results: z.array(verifierResultSchema),
+  residual_unknown_ids: z.array(stableIdSchema),
+  contradictions: z.array(contradictionSchema),
+  package_proofs: z.array(packageProofSchema),
+  boundaries: z.array(boundarySchema),
 });
 
-export const reconstructionCoverageWorkspaceSchema =
-  workspaceSemanticSchema.extend({ revision_sha256: digestSchema });
-
-export type ReconstructionCoverageWorkspace = z.infer<
-  typeof reconstructionCoverageWorkspaceSchema
+export type ReconstructionCoverageData = z.infer<
+  typeof reconstructionCoverageDataSchema
 >;
 export type ReconstructionVerifierContract = z.infer<
   typeof verifierContractSchema
 >;
+
+/** Parse inline coverage data and validate every evidence and authority link. */
+export const createReconstructionCoverageData = (
+  input: unknown,
+): ReconstructionCoverageData => {
+  const coverage = reconstructionCoverageDataSchema.parse(input);
+  validateCoverageReferences(coverage);
+  return coverage;
+};
 
 const closureReasonSchema = z.strictObject({
   code: z.enum([
@@ -206,6 +216,7 @@ const closureReasonSchema = z.strictObject({
     "verifier-result-missing",
     "verifier-result-stale",
     "verifier-result-incompatible",
+    "verifier-result-ambiguous",
     "verifier-failed",
     "verifier-unknown",
     "active-unknown",
@@ -221,30 +232,27 @@ const closureReasonSchema = z.strictObject({
 export const reconstructionClosureResultSchema = z.strictObject({
   boundary_id: stableIdSchema,
   status: z.enum(["partial", "failed", "unknown", "ready"]),
-  workspace_revision_sha256: digestSchema,
   summary: z.strictObject({
     required_surfaces: z.number().int().min(0),
     required_claims: z.number().int().min(0),
     reasons: z.number().int().min(0),
   }),
-  reasons: z.array(closureReasonSchema).max(100_000),
-  recommended_probes: z
-    .array(
-      z.strictObject({
-        operation: stableIdSchema,
-        subject_id: stableIdSchema,
-        rationale: boundedTextSchema,
-      }),
-    )
-    .max(100_000),
-  evidence_ids: z.array(evidenceIdSchema).max(100_000),
+  reasons: z.array(closureReasonSchema),
+  recommended_probes: z.array(
+    z.strictObject({
+      operation: stableIdSchema,
+      subject_id: stableIdSchema,
+      rationale: boundedTextSchema,
+    }),
+  ),
+  evidence_ids: z.array(evidenceIdSchema),
 });
 
 export type ReconstructionClosureResult = z.infer<
   typeof reconstructionClosureResultSchema
 >;
 
-type WorkspaceSemantic = z.infer<typeof workspaceSemanticSchema>;
+type CoverageData = z.infer<typeof reconstructionCoverageDataSchema>;
 type ClosureReason = z.infer<typeof closureReasonSchema>;
 
 /** Build a verifier contract whose digest prevents retrospective coverage edits. */
@@ -258,98 +266,35 @@ export const createReconstructionVerifierContract = (
   });
 };
 
-/** Build one canonical immutable coverage-workspace revision. */
-export const createReconstructionCoverageWorkspace = (
-  input: Omit<
-    z.input<typeof workspaceSemanticSchema>,
-    "schema_version" | "workspace_id"
-  >,
-): ReconstructionCoverageWorkspace => {
-  const semanticInput = {
-    schema_version: 1 as const,
-    workspace_id: `rcw_${digest({ schema: "rea.reconstruction-coverage-workspace/v1", name: input.name })}`,
-    ...input,
-  };
-  const semantic = canonicalWorkspace(
-    workspaceSemanticSchema.parse(semanticInput),
-  );
-  validateWorkspaceReferences(semantic);
-  return reconstructionCoverageWorkspaceSchema.parse({
-    ...semantic,
-    revision_sha256: digest(semantic),
-  });
-};
-
-/** Parse persisted coverage state and verify canonical order, references, and digests. */
-export const parseReconstructionCoverageWorkspace = (
-  input: unknown,
-): ReconstructionCoverageWorkspace => {
-  const parsed = reconstructionCoverageWorkspaceSchema.parse(input);
-  const rebuilt = createReconstructionCoverageWorkspace({
-    name: parsed.name,
-    revision: parsed.revision,
-    previous_revision_sha256: parsed.previous_revision_sha256,
-    evidence_bundle: parsed.evidence_bundle,
-    artifacts: parsed.artifacts,
-    surfaces: parsed.surfaces,
-    owners: parsed.owners,
-    claims: parsed.claims,
-    verifier_contracts: parsed.verifier_contracts,
-    verifier_results: parsed.verifier_results,
-    residual_unknown_ids: parsed.residual_unknown_ids,
-    contradictions: parsed.contradictions,
-    package_proofs: parsed.package_proofs,
-    boundaries: parsed.boundaries,
-  });
-  if (
-    parsed.workspace_id !== rebuilt.workspace_id ||
-    parsed.revision_sha256 !== rebuilt.revision_sha256 ||
-    JSON.stringify(parsed) !== JSON.stringify(rebuilt)
-  )
-    throw new TypeError("Reconstruction coverage workspace is not canonical");
-  return rebuilt;
-};
-
-/** Serialize one validated coverage revision as byte-stable canonical JSON. */
-export const serializeReconstructionCoverageWorkspace = (
-  workspace: ReconstructionCoverageWorkspace,
-): string => {
-  const encoded = canonicalize(parseReconstructionCoverageWorkspace(workspace));
-  if (encoded === undefined)
-    throw new TypeError(
-      "Reconstruction coverage workspace is not canonical JSON",
-    );
-  return encoded;
-};
-
-/** Evaluate one named completion boundary without inferring undiscovered coverage. */
+/** Evaluate inline coverage data against one named fail-closed boundary. */
 export const evaluateReconstructionClosure = (
-  workspaceInput: unknown,
+  coverageInput: unknown,
   boundaryId: string,
   nowEpochMs: number,
 ): ReconstructionClosureResult => {
-  const workspace = parseReconstructionCoverageWorkspace(workspaceInput);
-  const boundary = workspace.boundaries.find(
+  const coverage = createReconstructionCoverageData(coverageInput);
+  const boundary = coverage.boundaries.find(
     ({ boundary_id: id }) => id === boundaryId,
   );
   if (boundary === undefined)
     throw new TypeError(`Unknown reconstruction boundary: ${boundaryId}`);
+  const nowInstant = offsetDateTimeInstantFromEpochMilliseconds(nowEpochMs);
   const context: ReconstructionEvaluationContext = {
-    workspace,
+    coverage,
     boundary,
     nowEpochMs,
+    nowInstant,
     reasons: [],
     evidenceIds: new Set<string>(),
   };
   evaluateReconstructionSurfaces(context);
   evaluateReconstructionClaims(context);
-  evaluateReconstructionWorkspaceRisks(context);
+  evaluateReconstructionCoverageRisks(context);
   evaluateReconstructionPackageProofs(context);
   const reasons = [...context.reasons].sort(reasonOrder);
   return reconstructionClosureResultSchema.parse({
     boundary_id: boundary.boundary_id,
     status: closureStatus(reasons),
-    workspace_revision_sha256: workspace.revision_sha256,
     summary: {
       required_surfaces: boundary.required_surface_ids.length,
       required_claims: boundary.required_claim_ids.length,
@@ -361,7 +306,7 @@ export const evaluateReconstructionClosure = (
   });
 };
 
-const validateWorkspaceReferences = (workspace: WorkspaceSemantic): void => {
+const validateCoverageReferences = (workspace: CoverageData): void => {
   const evidenceBundle = parseEvidenceBundle(workspace.evidence_bundle);
   const evidenceIds = new Set(
     evidenceBundle.records.map(({ evidence_id: id }) => id),
@@ -423,34 +368,6 @@ const validateWorkspaceReferences = (workspace: WorkspaceSemantic): void => {
     );
 };
 
-const canonicalWorkspace = (
-  workspace: WorkspaceSemantic,
-): WorkspaceSemantic => ({
-  ...workspace,
-  artifacts: sorted(workspace.artifacts, "artifact_id"),
-  surfaces: sorted(workspace.surfaces, "surface_id"),
-  owners: [...workspace.owners].sort((left, right) =>
-    left.surface_id.localeCompare(right.surface_id),
-  ),
-  claims: sorted(workspace.claims, "claim_id"),
-  verifier_contracts: sorted(workspace.verifier_contracts, "verifier_id"),
-  verifier_results: [...workspace.verifier_results].sort((left, right) =>
-    `${left.verifier_id}:${left.observed_at}`.localeCompare(
-      `${right.verifier_id}:${right.observed_at}`,
-    ),
-  ),
-  residual_unknown_ids: [...new Set(workspace.residual_unknown_ids)].sort(),
-  contradictions: sorted(workspace.contradictions, "contradiction_id"),
-  package_proofs: sorted(workspace.package_proofs, "proof_id"),
-  boundaries: sorted(workspace.boundaries, "boundary_id"),
-});
-
-const sorted = <Item extends Record<Key, string>, Key extends keyof Item>(
-  items: readonly Item[],
-  key: Key,
-): Item[] =>
-  [...items].sort((left, right) => left[key].localeCompare(right[key]));
-
 const assertUnique = <Item extends Record<Key, string>, Key extends keyof Item>(
   items: readonly Item[],
   key: Key,
@@ -483,6 +400,7 @@ const closureStatus = (
       [
         "verifier-result-stale",
         "verifier-result-incompatible",
+        "verifier-result-ambiguous",
         "verifier-unknown",
         "active-unknown",
         "owner-path-unknown",
@@ -497,8 +415,9 @@ const closureStatus = (
 };
 
 const reasonOrder = (left: ClosureReason, right: ClosureReason): number =>
-  `${left.code}:${left.subject_id}`.localeCompare(
-    `${right.code}:${right.subject_id}`,
+  compareUnicodeCodePoints(
+    compositeKey([left.code, left.subject_id]),
+    compositeKey([right.code, right.subject_id]),
   );
 
 const digest = (value: unknown): string => {

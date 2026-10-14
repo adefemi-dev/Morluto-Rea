@@ -1,85 +1,222 @@
-import type { McpServer } from "@modelcontextprotocol/server";
-import type { z } from "zod";
+import type { ToolResultDelivery } from "./toolResult.js";
+import type { EvidenceMcpServer } from "./EvidenceMcpServer.js";
+import type {
+  EvidenceWriter,
+  UnknownRegistryPort,
+} from "../application/investigation/InvestigationRecordPort.js";
+import type {
+  CallToolResult,
+  ServerContext,
+} from "@modelcontextprotocol/server";
 
-import {
-  EnhancedTools,
-  type ValidatedEnhancedCall,
-} from "../application/EnhancedTools.js";
 import type { AnalysisOperationPort } from "../application/AnalysisProvider.js";
-import type { BinarySessionPort } from "../application/BinarySession.js";
+import type { BinarySessionPort } from "../application/binary/BinarySessionPort.js";
+import { EnhancedTools } from "../application/EnhancedTools.js";
+import type { ValidatedEnhancedCall } from "../application/EnhancedToolTypes.js";
 import {
-  enhancedInputSchemas,
-  enhancedToolNameSchema,
-} from "../contracts/enhancedInputs.js";
-import {
-  ENHANCED_TOOL_CONTRACTS,
-  type ToolContract,
-} from "../contracts/toolContracts.js";
-import { toCallToolResult } from "./toolResult.js";
-import type { Logger } from "../logger.js";
-import { logToolExecution } from "./toolLogging.js";
-import type { BinaryTarget } from "../domain/binaryTarget.js";
-import { createEvidence } from "../domain/evidence.js";
-import type { JsonValue } from "../domain/jsonValue.js";
-import { AnalysisInputError, UnknownRegistryError } from "../domain/errors.js";
-import { ok, type Result } from "../domain/result.js";
-import { mcpProgressReporter } from "./mcpProgress.js";
+  createWorkflowEvidence,
+  workflowSnapshotRecord,
+  recordWorkflowUnknowns,
+} from "../application/WorkflowEvidence.js";
+import { toolContract } from "../contracts/toolContracts.js";
+import type { ToolContract } from "../contracts/toolContractTypes.js";
 import type { AnalysisProfileCommitment } from "../domain/analysisProfile.js";
-import {
-  REA_WORKFLOW_PROVIDER,
-  workflowAnalysisProfile,
-} from "../application/InvestigationProviders.js";
+import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
+import type { JsonValue } from "../domain/jsonValue.js";
+import type { Logger } from "pino";
+import { mcpProgressReporter } from "./mcpProgress.js";
+import { logToolExecution } from "./toolLogging.js";
 import { toolRegistrationOptions } from "./toolRegistrationOptions.js";
-import { safeParseToolInput } from "./toolInputValidation.js";
+import { executeFunctionAnalysisEvidence } from "../application/FunctionAnalysisEvidence.js";
+import type { WithAdmittedAnalysis } from "./analysisAdmission.js";
 
 /** Optional session services used by enhanced tool registration. */
 export interface EnhancedToolRegistration {
+  readonly withAdmittedAnalysis: WithAdmittedAnalysis;
   readonly logger: Logger;
   readonly activeTarget: (() => BinaryTarget | undefined) | undefined;
   readonly analysisProfile:
     | (() => AnalysisProfileCommitment | undefined)
     | undefined;
-  readonly recordEvidence: BinarySessionPort["recordEvidence"] | undefined;
-  readonly recordUnknown: BinarySessionPort["recordUnknown"] | undefined;
+  readonly recordEvidence: EvidenceWriter["recordEvidence"] | undefined;
+  readonly recordUnknown: UnknownRegistryPort["recordUnknown"] | undefined;
+  readonly allowsSnapshotReplay:
+    | ((operation: ValidatedEnhancedCall["name"]) => boolean)
+    | undefined;
+  readonly recordWorkflowSnapshot:
+    | ((
+        input: Parameters<BinarySessionPort["recordWorkflowSnapshot"]>[0],
+      ) => ReturnType<BinarySessionPort["recordWorkflowSnapshot"]>)
+    | undefined;
 }
 
 /** Register composed workflows against the same port as direct bridge tools. */
+// oxlint-disable-next-line max-lines-per-function -- direct SDK calls retain each schema-handler type correlation.
 export const registerEnhancedTools = (
-  server: McpServer,
-  analysis: AnalysisOperationPort,
+  server: EvidenceMcpServer,
   options: EnhancedToolRegistration,
 ): void => {
-  const services = new EnhancedTools(analysis);
-  for (const contract of ENHANCED_TOOL_CONTRACTS) {
-    registerEnhancedTool(server, services, contract, {
-      logger: options.logger,
-      activeTarget: options.activeTarget,
-      analysisProfile: options.analysisProfile,
-      recordEvidence: options.recordEvidence,
-      recordUnknown: options.recordUnknown,
-    });
-  }
+  const registration = { ...options, delivery: server.delivery };
+  const nativeDispatchMetadata = toolContract(
+    "inspect_native_dispatch_metadata",
+  );
+  const objcClasses = toolContract("get_objc_classes");
+  const objcProtocols = toolContract("get_objc_protocols");
+  const batchDecompile = toolContract("batch_decompile");
+  const callGraph = toolContract("get_call_graph");
+  const swiftTypes = toolContract("analyze_swift_types");
+  const xrefsToName = toolContract("find_xrefs_to_name");
+  const binaryOverview = toolContract("binary_overview");
+  const analyzeFunction = toolContract("analyze_function");
+  const inspectNativeApi = toolContract("inspect_native_api");
+  const traceFeature = toolContract("trace_feature");
+  const traceCallPath = toolContract("trace_call_path");
+  const traceNativeUiAction = toolContract("trace_native_ui_action");
+  const traceNativeValues = toolContract("trace_native_values");
+  server.registerTool(
+    traceNativeValues.name,
+    toolRegistrationOptions(traceNativeValues),
+    (input, context) =>
+      executeEnhancedTool(registration, traceNativeValues, {
+        validatedCall: { name: "trace_native_values", input },
+        context,
+      }),
+  );
+  server.registerTool(
+    nativeDispatchMetadata.name,
+    toolRegistrationOptions(nativeDispatchMetadata),
+    (input, context) =>
+      executeEnhancedTool(registration, nativeDispatchMetadata, {
+        validatedCall: { name: "inspect_native_dispatch_metadata", input },
+        context,
+      }),
+  );
+  server.registerTool(
+    objcClasses.name,
+    toolRegistrationOptions(objcClasses),
+    (input, context) =>
+      executeEnhancedTool(registration, objcClasses, {
+        validatedCall: { name: "get_objc_classes", input },
+        context,
+      }),
+  );
+  server.registerTool(
+    objcProtocols.name,
+    toolRegistrationOptions(objcProtocols),
+    (input, context) =>
+      executeEnhancedTool(registration, objcProtocols, {
+        validatedCall: { name: "get_objc_protocols", input },
+        context,
+      }),
+  );
+  server.registerTool(
+    batchDecompile.name,
+    toolRegistrationOptions(batchDecompile),
+    (input, context) =>
+      executeEnhancedTool(registration, batchDecompile, {
+        validatedCall: { name: "batch_decompile", input },
+        context,
+      }),
+  );
+  server.registerTool(
+    callGraph.name,
+    toolRegistrationOptions(callGraph),
+    (input, context) =>
+      executeEnhancedTool(registration, callGraph, {
+        validatedCall: { name: "get_call_graph", input },
+        context,
+      }),
+  );
+  server.registerTool(
+    swiftTypes.name,
+    toolRegistrationOptions(swiftTypes),
+    (input, context) =>
+      executeEnhancedTool(registration, swiftTypes, {
+        validatedCall: { name: "analyze_swift_types", input },
+        context,
+      }),
+  );
+  server.registerTool(
+    xrefsToName.name,
+    toolRegistrationOptions(xrefsToName),
+    (input, context) =>
+      executeEnhancedTool(registration, xrefsToName, {
+        validatedCall: { name: "find_xrefs_to_name", input },
+        context,
+      }),
+  );
+  server.registerTool(
+    binaryOverview.name,
+    toolRegistrationOptions(binaryOverview),
+    (input, context) =>
+      executeEnhancedTool(registration, binaryOverview, {
+        validatedCall: { name: "binary_overview", input },
+        context,
+      }),
+  );
+  server.registerTool(
+    analyzeFunction.name,
+    toolRegistrationOptions(analyzeFunction),
+    (input, context) =>
+      executeEnhancedTool(registration, analyzeFunction, {
+        validatedCall: { name: "analyze_function", input },
+        context,
+      }),
+  );
+  server.registerTool(
+    inspectNativeApi.name,
+    toolRegistrationOptions(inspectNativeApi),
+    (input, context) =>
+      executeEnhancedTool(registration, inspectNativeApi, {
+        validatedCall: { name: "inspect_native_api", input },
+        context,
+      }),
+  );
+  server.registerTool(
+    traceFeature.name,
+    toolRegistrationOptions(traceFeature),
+    (input, context) =>
+      executeEnhancedTool(registration, traceFeature, {
+        validatedCall: { name: "trace_feature", input },
+        context,
+      }),
+  );
+  server.registerTool(
+    traceCallPath.name,
+    toolRegistrationOptions(traceCallPath),
+    (input, context) =>
+      executeEnhancedTool(registration, traceCallPath, {
+        validatedCall: { name: "trace_call_path", input },
+        context,
+      }),
+  );
+  server.registerTool(
+    traceNativeUiAction.name,
+    toolRegistrationOptions(traceNativeUiAction),
+    (input, context) =>
+      executeEnhancedTool(registration, traceNativeUiAction, {
+        validatedCall: { name: "trace_native_ui_action", input },
+        context,
+      }),
+  );
 };
 
-const registerEnhancedTool = (
-  server: McpServer,
-  services: EnhancedTools,
-  contract: ToolContract,
-  registration: {
-    readonly logger: Logger;
-    readonly activeTarget: (() => BinaryTarget | undefined) | undefined;
-    readonly analysisProfile:
-      | (() => AnalysisProfileCommitment | undefined)
-      | undefined;
-    readonly recordEvidence: BinarySessionPort["recordEvidence"] | undefined;
-    readonly recordUnknown: BinarySessionPort["recordUnknown"] | undefined;
+const executeEnhancedTool = async (
+  registration: EnhancedToolRegistration & {
+    readonly delivery: ToolResultDelivery;
   },
-): void => {
-  const name = enhancedToolNameSchema.parse(contract.name);
-  server.registerTool(
-    name,
-    toolRegistrationOptions(contract),
-    async (input, context) => {
+  contract: ToolContract,
+  request: {
+    readonly validatedCall: ValidatedEnhancedCall;
+    readonly context: ServerContext;
+  },
+): Promise<CallToolResult> => {
+  const admitted = await registration.withAdmittedAnalysis(
+    request.validatedCall.name,
+    request.context.mcpReq.signal,
+    async (admittedAnalysis) => {
+      const { validatedCall, context } = request;
+      const name = validatedCall.name;
       const progress = mcpProgressReporter(context);
       await progress.report({
         phase: name,
@@ -87,12 +224,22 @@ const registerEnhancedTool = (
         total: 1,
         message: "started",
       });
-      const validatedCall = parseEnhancedCall(name, input);
-      if (!validatedCall.ok) return toCallToolResult(validatedCall, contract);
-      const parsedInput = validatedCall.value.input;
+      const parsedInput = validatedCall.input;
       const parameters = jsonParameters(parsedInput);
+      if (name === "analyze_function")
+        return executeFunctionTool(admittedAnalysis, registration, contract, {
+          context,
+          parameters,
+        });
+      const services = new EnhancedTools({
+        execute: (operation, operationParameters, executionOptions) =>
+          admittedAnalysis.execute(operation, operationParameters, {
+            ...executionOptions,
+            progress,
+          }),
+      });
       const result = await logToolExecution(registration.logger, name, () =>
-        services.executeValidated(validatedCall.value, context.mcpReq.signal),
+        services.executeValidated(validatedCall, context.mcpReq.signal),
       );
       await progress.report({
         phase: name,
@@ -102,42 +249,90 @@ const registerEnhancedTool = (
         terminal: true,
       });
       if (result.ok) {
-        const upstreamProfile = registration.analysisProfile?.();
-        const evidence = createEvidence(
-          registration.activeTarget?.(),
-          REA_WORKFLOW_PROVIDER,
-          {
-            operation: name,
-            parameters,
-            result: result.value,
-            ...(upstreamProfile === undefined
-              ? {}
-              : {
-                  analysisProfile: workflowAnalysisProfile(upstreamProfile),
-                }),
-            confidence: "derived",
-            limitations: [
-              "Derived by an REA workflow from one or more provider observations.",
-            ],
-          },
-        );
+        const evidence = createWorkflowEvidence({
+          target: registration.activeTarget?.(),
+          operation: name,
+          parameters,
+          result: result.value,
+          upstreamProfile: registration.analysisProfile?.(),
+        });
         const recorded = registration.recordEvidence?.(evidence);
         if (recorded !== undefined && !recorded.ok)
-          return toCallToolResult(recorded, contract);
+          return registration.delivery.toCallToolResult(recorded, contract);
+        if (
+          name !== "trace_native_ui_action" &&
+          registration.allowsSnapshotReplay?.(name) === true
+        ) {
+          const workflowRecord = workflowSnapshotRecord(evidence, name);
+          if (workflowRecord !== undefined) {
+            const snapshot =
+              registration.recordWorkflowSnapshot?.(workflowRecord);
+            if (snapshot !== undefined && !snapshot.ok)
+              return registration.delivery.toCallToolResult(snapshot, contract);
+          }
+        }
         const unknowns = recordWorkflowUnknowns({
           name,
-          input: parameters,
           result: result.value,
           evidenceId: evidence.evidence_id,
           recordUnknown: registration.recordUnknown,
         });
-        if (!unknowns.ok) return toCallToolResult(unknowns, contract);
-        return toCallToolResult({ ok: true, value: evidence }, contract, {
-          evidenceResourcesAvailable: recorded !== undefined,
-        });
+        if (!unknowns.ok)
+          return registration.delivery.toCallToolResult(unknowns, contract);
+        return registration.delivery.toEvidenceToolResult(
+          evidence,
+          contract,
+          recorded,
+        );
       }
-      return toCallToolResult(result, contract);
+      return registration.delivery.toCallToolResult(result, contract);
     },
+  );
+  return admitted.ok
+    ? admitted.value
+    : registration.delivery.toCallToolResult(admitted, contract);
+};
+
+const executeFunctionTool = async (
+  analysis: AnalysisOperationPort,
+  registration: EnhancedToolRegistration & {
+    readonly delivery: ToolResultDelivery;
+  },
+  contract: ToolContract,
+  request: {
+    readonly context: ServerContext;
+    readonly parameters: Readonly<Record<string, JsonValue>>;
+  },
+): Promise<CallToolResult> => {
+  const { context, parameters } = request;
+  const progress = mcpProgressReporter(context);
+  const result = await logToolExecution(
+    registration.logger,
+    "analyze_function",
+    () =>
+      executeFunctionAnalysisEvidence(
+        analysis,
+        parameters,
+        registration.activeTarget?.(),
+        {
+          signal: context.mcpReq.signal,
+          progress,
+        },
+      ),
+  );
+  await progress.report({
+    phase: "analyze_function",
+    completed: 1,
+    total: 1,
+    message: result.ok ? "completed" : "failed",
+    terminal: true,
+  });
+  if (!result.ok)
+    return registration.delivery.toCallToolResult(result, contract);
+  return registration.delivery.toEvidenceToolResult(
+    result.value,
+    contract,
+    registration.recordEvidence?.(result.value),
   );
 };
 
@@ -149,201 +344,3 @@ const jsonParameters = (
       (entry): entry is [string, JsonValue] => entry[1] !== undefined,
     ),
   );
-
-type EnhancedToolName = ValidatedEnhancedCall["name"];
-
-type EnhancedInputOf<Name extends EnhancedToolName> = z.output<
-  (typeof enhancedInputSchemas)[Name]
->;
-
-type EnhancedInputParser<Name extends EnhancedToolName> = (
-  input: unknown,
-) => Result<EnhancedInputOf<Name>, AnalysisInputError>;
-
-const ENHANCED_INPUT_PARSERS: {
-  [Name in EnhancedToolName]: EnhancedInputParser<Name>;
-} = {
-  swift_classes: (input) =>
-    safeParseToolInput(
-      enhancedInputSchemas.swift_classes,
-      input,
-      "swift_classes",
-    ),
-  get_objc_classes: (input) =>
-    safeParseToolInput(
-      enhancedInputSchemas.get_objc_classes,
-      input,
-      "get_objc_classes",
-    ),
-  get_objc_protocols: (input) =>
-    safeParseToolInput(
-      enhancedInputSchemas.get_objc_protocols,
-      input,
-      "get_objc_protocols",
-    ),
-  batch_decompile: (input) =>
-    safeParseToolInput(
-      enhancedInputSchemas.batch_decompile,
-      input,
-      "batch_decompile",
-    ),
-  get_call_graph: (input) =>
-    safeParseToolInput(
-      enhancedInputSchemas.get_call_graph,
-      input,
-      "get_call_graph",
-    ),
-  analyze_swift_types: (input) =>
-    safeParseToolInput(
-      enhancedInputSchemas.analyze_swift_types,
-      input,
-      "analyze_swift_types",
-    ),
-  find_xrefs_to_name: (input) =>
-    safeParseToolInput(
-      enhancedInputSchemas.find_xrefs_to_name,
-      input,
-      "find_xrefs_to_name",
-    ),
-  binary_overview: (input) =>
-    safeParseToolInput(
-      enhancedInputSchemas.binary_overview,
-      input,
-      "binary_overview",
-    ),
-  analyze_function: (input) =>
-    safeParseToolInput(
-      enhancedInputSchemas.analyze_function,
-      input,
-      "analyze_function",
-    ),
-  trace_feature: (input) =>
-    safeParseToolInput(
-      enhancedInputSchemas.trace_feature,
-      input,
-      "trace_feature",
-    ),
-};
-
-const parseEnhancedCall = (
-  name: ValidatedEnhancedCall["name"],
-  input: unknown,
-): Result<ValidatedEnhancedCall, AnalysisInputError> => {
-  switch (name) {
-    case "swift_classes":
-      return mapEnhancedCall(
-        ENHANCED_INPUT_PARSERS.swift_classes(input),
-        (value) => ({ name, input: value }),
-      );
-    case "get_objc_classes":
-      return mapEnhancedCall(
-        ENHANCED_INPUT_PARSERS.get_objc_classes(input),
-        (value) => ({ name, input: value }),
-      );
-    case "get_objc_protocols":
-      return mapEnhancedCall(
-        ENHANCED_INPUT_PARSERS.get_objc_protocols(input),
-        (value) => ({ name, input: value }),
-      );
-    case "batch_decompile":
-      return mapEnhancedCall(
-        ENHANCED_INPUT_PARSERS.batch_decompile(input),
-        (value) => ({ name, input: value }),
-      );
-    case "get_call_graph":
-      return mapEnhancedCall(
-        ENHANCED_INPUT_PARSERS.get_call_graph(input),
-        (value) => ({ name, input: value }),
-      );
-    case "analyze_swift_types":
-      return mapEnhancedCall(
-        ENHANCED_INPUT_PARSERS.analyze_swift_types(input),
-        (value) => ({ name, input: value }),
-      );
-    case "find_xrefs_to_name":
-      return mapEnhancedCall(
-        ENHANCED_INPUT_PARSERS.find_xrefs_to_name(input),
-        (value) => ({ name, input: value }),
-      );
-    case "binary_overview":
-      return mapEnhancedCall(
-        ENHANCED_INPUT_PARSERS.binary_overview(input),
-        (value) => ({ name, input: value }),
-      );
-    case "analyze_function":
-      return mapEnhancedCall(
-        ENHANCED_INPUT_PARSERS.analyze_function(input),
-        (value) => ({ name, input: value }),
-      );
-    case "trace_feature":
-      return mapEnhancedCall(
-        ENHANCED_INPUT_PARSERS.trace_feature(input),
-        (value) => ({ name, input: value }),
-      );
-  }
-};
-
-const mapEnhancedCall = <Input, Call extends ValidatedEnhancedCall>(
-  parsed: Result<Input, AnalysisInputError>,
-  project: (input: Input) => Call,
-): Result<Call, AnalysisInputError> =>
-  parsed.ok ? ok(project(parsed.value)) : parsed;
-
-interface WorkflowUnknownInput {
-  readonly name: string;
-  readonly input: Readonly<Record<string, JsonValue>>;
-  readonly result: JsonValue;
-  readonly evidenceId: string;
-  readonly recordUnknown: BinarySessionPort["recordUnknown"] | undefined;
-}
-
-const recordWorkflowUnknowns = ({
-  name,
-  input,
-  result,
-  evidenceId,
-  recordUnknown,
-}: WorkflowUnknownInput):
-  | ReturnType<BinarySessionPort["recordUnknown"]>
-  | { readonly ok: true; readonly value: null } => {
-  if (
-    name !== "trace_feature" ||
-    input.unknown_registry_approved !== true ||
-    recordUnknown === undefined ||
-    typeof result !== "object" ||
-    result === null ||
-    Array.isArray(result) ||
-    !Array.isArray(result.residual_unknowns)
-  )
-    return { ok: true, value: null };
-  for (const question of result.residual_unknowns) {
-    if (typeof question !== "string") continue;
-    const recorded = recordUnknown({
-      approved: true,
-      question,
-      severity: "medium",
-      domain: "control-flow",
-      supporting_evidence_ids: [evidenceId],
-      contradicting_evidence_ids: [],
-      required_authority: "shipped-artifact",
-      required_confidence: "observed",
-      required_environment: null,
-      recommended_probes: [
-        {
-          operation: "trace_feature",
-          rationale: "Continue with a larger bounded budget.",
-        },
-      ],
-      relationships: [],
-    });
-    if (
-      !recorded.ok &&
-      !(
-        recorded.error instanceof UnknownRegistryError &&
-        recorded.error.reason === "already-exists"
-      )
-    )
-      return recorded;
-  }
-  return { ok: true, value: null };
-};

@@ -1,7 +1,21 @@
 import { z } from "zod";
-
-import { AnalysisInputError, AnalysisOutputError } from "../domain/errors.js";
 import {
+  nativeFunctionAnnotationsInputSchema,
+  nativeFunctionAnnotationsSchema,
+} from "../domain/native/nativeFunctionAnnotations.js";
+import { nativeDataTypeSchema } from "../domain/native/nativeDataType.js";
+import {
+  nativeInstructionSchema,
+  nativeCallTargetsSchema,
+} from "../domain/native/nativeInstruction.js";
+
+import {
+  type AnalysisInputError,
+  AnalysisOutputError,
+} from "../domain/analysisErrorCore.js";
+import {
+  functionBodyEntryAgrees,
+  functionInstructionWindowSchema,
   functionDossierSchema,
   type FunctionDossier,
 } from "../domain/hopperValues.js";
@@ -10,20 +24,32 @@ import {
   jsonValueSchema,
   type JsonValue,
 } from "../domain/jsonValue.js";
+import { nativeApiBoundarySchema } from "../domain/native/nativeApiBoundary.js";
+import { nativeValueFlowSchema } from "../domain/native/nativeValueFlow.js";
 import { err, ok, type Result } from "../domain/result.js";
+import { analysisInputErrorFromIssues } from "../domain/inputIssueProjection.js";
 import {
-  ghidraBoundedIdentifierSchema,
+  ghidraIdentifierSchema,
+  ghidraInputAddressSchema,
   ghidraCanonicalAddressSchema,
+  ghidraFunctionClassificationSchema as classification,
+  ghidraFunctionBodySchema as ghidraFunctionBody,
+  ghidraProcedureIdentitySchema as procedureIdentity,
 } from "./GhidraInventoryValues.js";
 
-/** Read-only function operations admitted by the Ghidra adapter. */
+/** Function analysis and annotation operations admitted by the Ghidra adapter. */
 export const GHIDRA_FUNCTION_OPERATIONS = [
+  "annotate_native_function",
+  "inspect_native_data_type",
+  "inspect_native_instruction",
+  "resolve_native_call_targets",
   "analyze_function",
   "procedure_assembly",
   "procedure_callees",
   "procedure_callers",
   "procedure_info",
   "procedure_pseudo_code",
+  "read_function_instructions",
   "procedure_references",
   "xrefs",
 ] as const;
@@ -39,65 +65,43 @@ export const isGhidraFunctionOperation = (
   operation: string,
 ): operation is GhidraFunctionOperation => operationSet.has(operation);
 
-const document = ghidraBoundedIdentifierSchema.nullable().default(null);
-const procedure = ghidraBoundedIdentifierSchema;
+const document = ghidraIdentifierSchema.nullable().default(null);
+const procedure = ghidraIdentifierSchema;
 const directProcedure = { document, procedure };
-const collectionOffsets = z
-  .object({
-    comments: z.number().int().min(0).default(0),
-    callers: z.number().int().min(0).default(0),
-    callees: z.number().int().min(0).default(0),
-    incoming_references: z.number().int().min(0).default(0),
-    outgoing_references: z.number().int().min(0).default(0),
-    referenced_strings: z.number().int().min(0).default(0),
-    referenced_names: z.number().int().min(0).default(0),
-    basic_blocks: z.number().int().min(0).default(0),
-  })
-  .strict()
-  .default({
-    comments: 0,
-    callers: 0,
-    callees: 0,
-    incoming_references: 0,
-    outgoing_references: 0,
-    referenced_strings: 0,
-    referenced_names: 0,
-    basic_blocks: 0,
-  });
 
 const inputSchemas = {
-  analyze_function: z
+  annotate_native_function: nativeFunctionAnnotationsInputSchema,
+  inspect_native_data_type: z
     .object({
-      procedure,
-      include_assembly: z.boolean().default(false),
-      limit: z.number().int().min(1).max(500).default(100),
-      max_pseudocode_chars: z
-        .number()
-        .int()
-        .min(1)
-        .max(100_000)
-        .default(20_000),
-      max_instructions: z.number().int().min(1).max(5_000).default(500),
-      pseudocode_offset: z.number().int().min(0).default(0),
-      assembly_offset: z.number().int().min(0).default(0),
-      collection_offset: collectionOffsets,
+      document,
+      type: z.string().min(1).nullable().default(null),
+      address: ghidraInputAddressSchema.nullable().default(null),
     })
+    .strict()
+    .refine(
+      (value) => (value.type === null) !== (value.address === null),
+      "Supply exactly one of type or address",
+    ),
+  inspect_native_instruction: z
+    .object({ document, address: ghidraInputAddressSchema })
     .strict(),
+  resolve_native_call_targets: z
+    .object({ document, address: ghidraInputAddressSchema })
+    .strict(),
+  analyze_function: z.object({ procedure }).strict(),
   procedure_assembly: z.object(directProcedure).strict(),
   procedure_callees: z.object(directProcedure).strict(),
   procedure_callers: z.object(directProcedure).strict(),
   procedure_info: z.object(directProcedure).strict(),
   procedure_pseudo_code: z.object(directProcedure).strict(),
+  read_function_instructions: z.object(directProcedure).strict(),
   procedure_references: z
     .object({
       ...directProcedure,
       direction: z.enum(["incoming", "outgoing"]).default("outgoing"),
-      offset: z.number().int().min(0).default(0),
-      limit: z.number().int().min(1).max(500).default(100),
-      max_instructions: z.number().int().min(1).max(5_000).default(500),
     })
     .strict(),
-  xrefs: z.object({ document, address: ghidraCanonicalAddressSchema }).strict(),
+  xrefs: z.object({ document, address: ghidraInputAddressSchema }).strict(),
 } satisfies Readonly<Record<GhidraFunctionOperation, z.ZodType>>;
 
 /** Validate and default one function request before it crosses the socket. */
@@ -107,25 +111,22 @@ export const parseGhidraFunctionInput = (
 ): Result<Readonly<Record<string, JsonValue>>, AnalysisInputError> => {
   const parsed = inputSchemas[operation].safeParse(value);
   return parsed.success
-    ? ok(jsonObjectSchema.parse(parsed.data))
-    : err(new AnalysisInputError(operation, { cause: parsed.error }));
+    ? ok(
+        jsonObjectSchema.parse(
+          Object.fromEntries(
+            Object.entries(parsed.data).filter(
+              ([, value]) => value !== undefined,
+            ),
+          ),
+        ),
+      )
+    : err(
+        analysisInputErrorFromIssues(operation, parsed.error.issues, value, {
+          cause: parsed.error,
+        }),
+      );
 };
 
-const classification = z
-  .object({
-    external: z.boolean(),
-    thunk: z.boolean(),
-    thunk_target: ghidraCanonicalAddressSchema.nullable(),
-    provenance: z.literal("ghidra-function-manager"),
-  })
-  .strict();
-const procedureIdentity = z
-  .object({
-    address: ghidraCanonicalAddressSchema,
-    name: z.string().min(1),
-    classification,
-  })
-  .strict();
 const localVariable = z
   .object({
     description: z.string(),
@@ -161,42 +162,18 @@ const referenceEdge = z
     kind: referenceKind,
   })
   .strict();
-const boundedReferences = z
-  .object({
-    items: z.array(referenceEdge),
-    total: z.number().int().min(0).nullable(),
-    returned: z.number().int().min(0),
-    truncated: z.boolean(),
-    next_offset: z.number().int().min(0).nullable(),
-  })
-  .strict()
-  .superRefine((value, context) => {
-    if (value.returned !== value.items.length)
-      context.addIssue({
-        code: "custom",
-        path: ["returned"],
-        message: "returned must equal the number of reference items",
-      });
-    if (value.total !== null && value.total < value.returned)
-      context.addIssue({
-        code: "custom",
-        path: ["total"],
-        message: "total cannot be smaller than returned",
-      });
-    if (value.next_offset !== null && !value.truncated)
-      context.addIssue({
-        code: "custom",
-        path: ["next_offset"],
-        message: "a continuation requires truncated output",
-      });
-  });
 const procedureReferences = z
   .object({
     procedure: procedureIdentity,
     direction: z.enum(["incoming", "outgoing"]),
-    references: boundedReferences,
-    instructions_scanned: z.number().int().min(0),
-    instruction_scan_truncated: z.boolean(),
+    references: z.array(referenceEdge),
+    reference_kinds_available: z.boolean(),
+    unresolved_calls: z.array(
+      z.strictObject({
+        address: ghidraCanonicalAddressSchema,
+        reason: z.string(),
+      }),
+    ),
   })
   .strict();
 const procedureInfo = z
@@ -208,26 +185,129 @@ const procedureInfo = z
     signature: z.string().nullable(),
     locals: z.array(localVariable),
     classification,
+    body: ghidraFunctionBody,
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    if (
+      !functionBodyEntryAgrees(value.body, value.entrypoint) ||
+      (value.body.available &&
+        (value.length !== value.body.total_bytes ||
+          (!value.classification.external && !value.body.contains_entry)))
+    )
+      context.addIssue({
+        code: "custom",
+        message: "Ghidra function body disagrees with entry point or length",
+      });
+  });
 
-const ghidraFunctionDossier = functionDossierSchema.superRefine(
+const ghidraNativeApiBoundary = nativeApiBoundarySchema.superRefine(
   (value, context) => {
+    if (!value.available) return;
+    if (value.provenance !== "ghidra-high-function")
+      context.addIssue({
+        code: "custom",
+        message:
+          "Ghidra native API observations require HighFunction provenance",
+      });
+    const addresses = value.jump_tables.flatMap((table) => [
+      table.dispatch_address,
+      ...table.data_sources.map(({ address }) => address),
+      ...table.mappings.map(({ target_address }) => target_address),
+      ...table.default_targets.map(({ target_address }) => target_address),
+    ]);
+    if (
+      addresses.some(
+        (address) => !ghidraCanonicalAddressSchema.safeParse(address).success,
+      )
+    )
+      context.addIssue({
+        code: "custom",
+        message:
+          "Ghidra native API observation contains a non-canonical address",
+      });
+  },
+);
+
+const ghidraNativeValueFlow = nativeValueFlowSchema.superRefine(
+  (value, context) => {
+    if (!value.available) return;
+    const operations = value.operations;
+    const addresses = operations.flatMap((operation) => [
+      operation.address,
+      ...operation.inputs.flatMap(({ location }) =>
+        location === null ? [] : [location],
+      ),
+      ...(operation.output?.location == null
+        ? []
+        : [operation.output.location]),
+    ]);
+    if (
+      addresses.some(
+        (address) => !ghidraCanonicalAddressSchema.safeParse(address).success,
+      )
+    )
+      context.addIssue({
+        code: "custom",
+        message: "Ghidra p-code flow contains a non-canonical address",
+      });
+    const operationIds = new Set(operations.map(({ id }) => id));
+    if (operationIds.size !== operations.length)
+      context.addIssue({
+        code: "custom",
+        message: "Ghidra p-code operation identifiers are not unique",
+      });
+    if (
+      value.def_use.some(
+        ({ definition, use }) =>
+          !operationIds.has(definition) || !operationIds.has(use),
+      ) ||
+      value.effects.some(({ operation }) => !operationIds.has(operation))
+    )
+      context.addIssue({
+        code: "custom",
+        message: "Ghidra p-code relationship references a missing operation",
+      });
+    if (
+      value.truncated !==
+      (value.omitted_operations_lower_bound > 0 ||
+        value.known_omitted_inputs > 0 ||
+        value.known_omitted_edges > 0)
+    )
+      context.addIssue({
+        code: "custom",
+        message: "Ghidra p-code truncation flag contradicts omitted counts",
+      });
+  },
+);
+
+const ghidraFunctionDossier = functionDossierSchema
+  .extend({
+    procedure: functionDossierSchema.shape.procedure.safeExtend({
+      classification,
+      body: ghidraFunctionBody,
+    }),
+    native_api: ghidraNativeApiBoundary,
+    native_value_flow: ghidraNativeValueFlow,
+  })
+  .strict()
+  .superRefine((value, context) => {
     const addresses = [
       value.procedure.address,
-      ...value.comments.items.map(({ address }) => address),
-      ...value.callers.items.map(({ address }) => address),
-      ...value.callees.items.map(({ address }) => address),
-      ...value.incoming_references.items.flatMap(referenceAddresses),
-      ...value.outgoing_references.items.flatMap(referenceAddresses),
-      ...value.referenced_strings.items.flatMap(
-        ({ address, source_address }) => [address, source_address],
-      ),
-      ...value.referenced_names.items.flatMap(({ address, source_address }) => [
+      ...value.comments.map(({ address }) => address),
+      ...value.callers.map(({ address }) => address),
+      ...value.callees.map(({ address }) => address),
+      ...value.incoming_references.flatMap(referenceAddresses),
+      ...value.outgoing_references.flatMap(referenceAddresses),
+      ...value.referenced_strings.flatMap(({ address, source_address }) => [
         address,
         source_address,
       ]),
-      ...value.basic_blocks.items.flatMap(({ start, end, successors }) => [
+      ...value.referenced_names.flatMap(({ address, source_address }) => [
+        address,
+        source_address,
+      ]),
+      ...value.basic_blocks.flatMap(({ start, end, successors }) => [
         start,
         end,
         ...successors,
@@ -244,14 +324,20 @@ const ghidraFunctionDossier = functionDossierSchema.superRefine(
       });
     const identities = [
       value.procedure,
-      ...value.callers.items,
-      ...value.callees.items,
-      ...value.incoming_references.items.flatMap(referenceProcedures),
-      ...value.outgoing_references.items.flatMap(referenceProcedures),
+      ...value.callers,
+      ...value.callees,
+      ...value.incoming_references.flatMap(referenceProcedures),
+      ...value.outgoing_references.flatMap(referenceProcedures),
     ];
     if (
       identities.some(
-        ({ classification: facts }) => !classification.safeParse(facts).success,
+        (identity) =>
+          !classification.safeParse(identity.classification).success ||
+          !ghidraFunctionBody.safeParse(identity.body).success ||
+          !functionBodyEntryAgrees(identity.body, identity.address) ||
+          (identity.body.available &&
+            identity.classification?.external === false &&
+            !identity.body.contains_entry),
       )
     )
       context.addIssue({
@@ -262,10 +348,9 @@ const ghidraFunctionDossier = functionDossierSchema.superRefine(
       value.procedure.locals.some(
         (variable) => !localVariable.safeParse(variable).success,
       ) ||
-      [
-        ...value.incoming_references.items,
-        ...value.outgoing_references.items,
-      ].some(({ kind }) => !referenceKind.safeParse(kind).success)
+      [...value.incoming_references, ...value.outgoing_references].some(
+        ({ kind }) => !referenceKind.safeParse(kind).success,
+      )
     )
       context.addIssue({
         code: "custom",
@@ -279,28 +364,77 @@ const ghidraFunctionDossier = functionDossierSchema.superRefine(
         code: "custom",
         message: "Ghidra dossier omitted required uncertainty limitations",
       });
-  },
-);
+  });
+const ghidraFunctionInstructionWindow = functionInstructionWindowSchema
+  .extend({ procedure: procedureIdentity })
+  .strict();
 
 const resultSchemas = {
+  annotate_native_function: nativeFunctionAnnotationsSchema.safeExtend({
+    dossier: ghidraFunctionDossier,
+  }),
   analyze_function: ghidraFunctionDossier,
   procedure_assembly: z.string(),
   procedure_callees: z.array(ghidraCanonicalAddressSchema),
   procedure_callers: z.array(ghidraCanonicalAddressSchema),
   procedure_info: procedureInfo,
   procedure_pseudo_code: z.string().nullable(),
+  read_function_instructions: ghidraFunctionInstructionWindow,
+  inspect_native_instruction: nativeInstructionSchema,
+  inspect_native_data_type: nativeDataTypeSchema,
+  resolve_native_call_targets: nativeCallTargetsSchema,
   procedure_references: procedureReferences,
   xrefs: z.array(ghidraCanonicalAddressSchema),
 } satisfies Readonly<Record<GhidraFunctionOperation, z.ZodType>>;
+
+const functionBoundaryObservationOperations: ReadonlySet<GhidraFunctionOperation> =
+  new Set([
+    "analyze_function",
+    "procedure_assembly",
+    "procedure_info",
+    "procedure_pseudo_code",
+    "read_function_instructions",
+  ]);
+
+const functionObservationEnvelope = z.strictObject({
+  value: z.unknown(),
+  limitations: z.array(z.string()),
+});
+
+export interface ParsedGhidraFunctionResult {
+  readonly value: JsonValue;
+  readonly limitations: readonly string[];
+}
 
 /** Require exact, bounded Java-bridge function output before creating Evidence. */
 export const parseGhidraFunctionResult = (
   operation: GhidraFunctionOperation,
   value: JsonValue,
-): Result<JsonValue, AnalysisOutputError> => {
-  const parsed = resultSchemas[operation].safeParse(value);
+): Result<ParsedGhidraFunctionResult, AnalysisOutputError> => {
+  let observation: {
+    readonly value: unknown;
+    readonly limitations: readonly string[];
+  };
+  if (functionBoundaryObservationOperations.has(operation)) {
+    const envelope = functionObservationEnvelope.safeParse(value);
+    if (!envelope.success)
+      return err(
+        new AnalysisOutputError(
+          operation,
+          "Ghidra bridge omitted the function observation envelope",
+          { cause: envelope.error },
+        ),
+      );
+    observation = envelope.data;
+  } else {
+    observation = { value, limitations: [] };
+  }
+  const parsed = resultSchemas[operation].safeParse(observation.value);
   return parsed.success
-    ? ok(jsonValueSchema.parse(parsed.data))
+    ? ok({
+        value: jsonValueSchema.parse(parsed.data),
+        limitations: observation.limitations,
+      })
     : err(
         new AnalysisOutputError(
           operation,
@@ -311,7 +445,7 @@ export const parseGhidraFunctionResult = (
 };
 
 const referenceAddresses = (
-  edge: FunctionDossier["incoming_references"]["items"][number],
+  edge: FunctionDossier["incoming_references"][number],
 ): readonly string[] => [
   edge.source_address,
   edge.target_address,
@@ -320,9 +454,9 @@ const referenceAddresses = (
 ];
 
 const referenceProcedures = (
-  edge: FunctionDossier["incoming_references"]["items"][number],
+  edge: FunctionDossier["incoming_references"][number],
 ): readonly NonNullable<
-  FunctionDossier["incoming_references"]["items"][number]["source_procedure"]
+  FunctionDossier["incoming_references"][number]["source_procedure"]
 >[] => [
   ...(edge.source_procedure === null ? [] : [edge.source_procedure]),
   ...(edge.target_procedure === null ? [] : [edge.target_procedure]),

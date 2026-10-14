@@ -1,120 +1,113 @@
-import type { McpServer } from "@modelcontextprotocol/server";
+import type { EvidenceMcpServer } from "./EvidenceMcpServer.js";
+import type { EvidenceWriter } from "../application/investigation/InvestigationRecordPort.js";
+import type { ServerContext } from "@modelcontextprotocol/server";
 
-import type { AnalysisOperationPort } from "../application/AnalysisProvider.js";
-import type { AnalysisExecution } from "../application/AnalysisProvider.js";
-import type { BinarySessionPort } from "../application/BinarySession.js";
-import { OFFICIAL_TOOL_CONTRACTS } from "../contracts/toolContracts.js";
-import {
-  jsonObjectSchema,
-  jsonValueSchema,
-  type JsonValue,
-} from "../domain/jsonValue.js";
-import { toCallToolResult } from "./toolResult.js";
-import type { Logger } from "../logger.js";
-import { logToolExecution } from "./toolLogging.js";
-import type { BinaryTarget } from "../domain/binaryTarget.js";
-import { createEvidence } from "../domain/evidence.js";
-import {
-  AnalysisCapabilityUnavailableError,
-  type AnalysisError,
-  UnknownRegistryError,
-} from "../domain/errors.js";
-import { mcpProgressReporter } from "./mcpProgress.js";
-import { toolRegistrationOptions } from "./toolRegistrationOptions.js";
-import { safeParseToolInput } from "./toolInputValidation.js";
-import type { ToolContract } from "../contracts/toolContracts.js";
-import type { Result } from "../domain/result.js";
+import type {
+  AnalysisExecution,
+  AnalysisOperationPort,
+} from "../application/AnalysisProvider.js";
 import type { ProgressReporter } from "../application/ProgressReporter.js";
+import { OFFICIAL_TOOL_CONTRACTS } from "../contracts/officialToolContracts.js";
+import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
+import type { AnalysisError } from "../domain/analysisErrorBase.js";
+import { createEvidence } from "../domain/evidence.js";
+import { jsonObjectSchema, type JsonValue } from "../domain/jsonValue.js";
+import type { Result } from "../domain/result.js";
+import type { Logger } from "pino";
+import { mcpProgressReporter } from "./mcpProgress.js";
+import { logToolExecution } from "./toolLogging.js";
+import { toolRegistrationOptions } from "./toolRegistrationOptions.js";
+import type { WithAdmittedAnalysis } from "./analysisAdmission.js";
 
 /** Optional session services used by direct tool registration. */
 export interface OfficialToolRegistration {
   readonly logger: Logger;
   readonly activeTarget: (() => BinaryTarget | undefined) | undefined;
-  readonly recordEvidence: BinarySessionPort["recordEvidence"] | undefined;
-  readonly recordUnknown: BinarySessionPort["recordUnknown"] | undefined;
+  readonly recordEvidence: EvidenceWriter["recordEvidence"] | undefined;
+  readonly withAdmittedAnalysis: WithAdmittedAnalysis;
 }
 
 /** Register direct bridge proxies, preserving MCP cancellation and typed errors. */
 export const registerOfficialTools = (
-  server: McpServer,
-  analysis: AnalysisOperationPort,
+  server: EvidenceMcpServer,
   options: OfficialToolRegistration,
 ): void => {
   for (const contract of OFFICIAL_TOOL_CONTRACTS) {
-    registerOfficialTool(server, analysis, contract, {
+    registerOfficialTool(server, contract, {
       logger: options.logger,
       activeTarget: options.activeTarget,
       recordEvidence: options.recordEvidence,
-      recordUnknown: options.recordUnknown,
+      withAdmittedAnalysis: options.withAdmittedAnalysis,
     });
   }
 };
 
 const registerOfficialTool = (
-  server: McpServer,
-  analysis: AnalysisOperationPort,
+  server: EvidenceMcpServer,
   contract: (typeof OFFICIAL_TOOL_CONTRACTS)[number],
   registration: {
     readonly logger: Logger;
     readonly activeTarget: (() => BinaryTarget | undefined) | undefined;
-    readonly recordEvidence: BinarySessionPort["recordEvidence"] | undefined;
-    readonly recordUnknown: BinarySessionPort["recordUnknown"] | undefined;
+    readonly recordEvidence: EvidenceWriter["recordEvidence"] | undefined;
+    readonly withAdmittedAnalysis: WithAdmittedAnalysis;
   },
 ): void => {
   server.registerTool(
     contract.name,
     toolRegistrationOptions(contract),
-    async (input, context) => {
-      const parsedInput = safeParseToolInput(
-        contract.inputSchema,
-        input,
+    async (input: unknown, context: ServerContext) => {
+      const admitted = await registration.withAdmittedAnalysis(
         contract.name,
-      );
-      if (!parsedInput.ok) return toCallToolResult(parsedInput, contract);
-      const arguments_ = projectOfficialArguments(contract, parsedInput.value);
-      const progress = mcpProgressReporter(context);
-      const result = await runOfficialOperation(
-        analysis,
-        contract,
-        arguments_,
-        {
-          logger: registration.logger,
-          signal: context.mcpReq.signal,
-          progress,
+        context.mcpReq.signal,
+        async (admittedAnalysis) => {
+          const arguments_ = jsonObjectSchema.parse(
+            contract.inputSchema.parse(input),
+          );
+          const progress = mcpProgressReporter(context);
+          const result = await runOfficialOperation(
+            admittedAnalysis,
+            contract,
+            arguments_,
+            {
+              logger: registration.logger,
+              signal: context.mcpReq.signal,
+              progress,
+            },
+          );
+          if (!result.ok) {
+            return server.delivery.toCallToolResult(result, contract);
+          }
+          const evidence = createEvidence(
+            result.value.subject ?? registration.activeTarget?.(),
+            result.value.provider,
+            {
+              operation: contract.name,
+              parameters: arguments_,
+              result: result.value.result,
+              ...(result.value.analysisProfile === undefined
+                ? {}
+                : { analysisProfile: result.value.analysisProfile }),
+              rawResult: result.value.rawResult,
+              limitations: result.value.limitations,
+              ...(result.value.relationshipCoverage === undefined
+                ? {}
+                : {
+                    relationshipCoverage: result.value.relationshipCoverage,
+                  }),
+              locations: result.value.locations,
+            },
+          );
+          const recorded = registration.recordEvidence?.(evidence);
+          return server.delivery.toEvidenceToolResult(
+            evidence,
+            contract,
+            recorded,
+          );
         },
       );
-      if (!result.ok) {
-        const unknownError = recordOfficialUnknown(
-          input,
-          result.error,
-          contract,
-          registration.recordUnknown,
-        );
-        if (unknownError !== undefined)
-          return toCallToolResult(unknownError, contract);
-        return toCallToolResult(result, contract);
-      }
-      const evidence = createEvidence(
-        result.value.subject ?? registration.activeTarget?.(),
-        result.value.provider,
-        {
-          operation: contract.name,
-          parameters: arguments_,
-          result: result.value.result,
-          ...(result.value.analysisProfile === undefined
-            ? {}
-            : { analysisProfile: result.value.analysisProfile }),
-          rawResult: result.value.rawResult,
-          limitations: result.value.limitations,
-          locations: result.value.locations,
-        },
-      );
-      const recorded = registration.recordEvidence?.(evidence);
-      if (recorded !== undefined && !recorded.ok)
-        return toCallToolResult(recorded, contract);
-      return toCallToolResult({ ok: true, value: evidence }, contract, {
-        evidenceResourcesAvailable: recorded !== undefined,
-      });
+      return admitted.ok
+        ? admitted.value
+        : server.delivery.toCallToolResult(admitted, contract);
     },
   );
 };
@@ -150,65 +143,3 @@ const runOfficialOperation = async (
   });
   return result;
 };
-
-const recordOfficialUnknown = (
-  input: unknown,
-  error: AnalysisError,
-  contract: ToolContract,
-  recordUnknown: BinarySessionPort["recordUnknown"] | undefined,
-): Result<never, AnalysisError> | undefined => {
-  if (
-    !(error instanceof AnalysisCapabilityUnavailableError) ||
-    !approvedUnknownTracking(input) ||
-    recordUnknown === undefined
-  )
-    return undefined;
-  const unknown = recordUnknown({
-    approved: true,
-    question: "The requested analysis is unavailable for the current target.",
-    severity: "medium",
-    domain: "analysis-capability",
-    supporting_evidence_ids: [],
-    contradicting_evidence_ids: [],
-    required_authority: "shipped-artifact",
-    required_confidence: "observed",
-    required_environment: null,
-    recommended_probes: [
-      {
-        operation: contract.name,
-        rationale:
-          "Choose another analysis or target that can answer this question.",
-      },
-    ],
-    relationships: [],
-  });
-  if (
-    !unknown.ok &&
-    !(
-      unknown.error instanceof UnknownRegistryError &&
-      unknown.error.reason === "already-exists"
-    )
-  )
-    return unknown;
-  return undefined;
-};
-
-const projectOfficialArguments = (
-  contract: ToolContract,
-  input: unknown,
-): Readonly<Record<string, JsonValue>> => {
-  const parsed = jsonObjectSchema.parse(input);
-
-  const projected: Record<string, JsonValue> = {};
-  for (const key of Object.keys(contract.inputSchema.shape)) {
-    if (key === "unknown_registry_approved") continue;
-    projected[key] = jsonValueSchema.parse(parsed[key] ?? null);
-  }
-  return projected;
-};
-
-const approvedUnknownTracking = (input: unknown): boolean =>
-  typeof input === "object" &&
-  input !== null &&
-  "unknown_registry_approved" in input &&
-  input.unknown_registry_approved === true;

@@ -1,123 +1,99 @@
-import type { BinaryTarget } from "../domain/binaryTarget.js";
+import {
+  admitManagedProjection,
+  managedDecodeBudget,
+} from "./ManagedDecodeBudget.js";
+import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
 import {
   managedMemberInspectionSchema,
   type ManagedMemberInspection,
   type ManagedParseIssue,
-} from "../domain/managedArtifact.js";
+} from "../domain/managed/managedArtifact.js";
 import {
   readManagedPeLayout,
   type ManagedPeLayout,
 } from "./ManagedPeReader.js";
 import {
-  type ManagedResourceDirectory,
+  readManagedResourceDirectory,
   managedTableRowCounts,
   readManagedMetadataInventory,
 } from "./ManagedMetadataInventory.js";
 import { readManagedMetadataLayout } from "./ManagedMetadataLayout.js";
 import {
   ManagedReaderFailure,
-  managedFailure,
+  uniqueManagedParseIssues,
 } from "./ManagedReaderFailure.js";
 import {
-  emptyPage,
-  page,
   parseTypes,
   typeRanges,
-  type ManagedMemberInspectionLimits,
+  type TypeRange,
 } from "./ManagedMemberInspectorCore.js";
 import {
   edges,
+  parseExportedTypes,
   parseFields,
   parseMemberRefs,
   parseMethods,
+  type SelectedTypeTokens,
 } from "./ManagedMemberRows.js";
-
-export type { ManagedMemberInspectionLimits } from "./ManagedMemberInspectorCore.js";
 
 const unavailable = (
   target: BinaryTarget,
   bytes: Buffer,
-  limits: ManagedMemberInspectionLimits,
   issue: ManagedParseIssue | null,
+  typeNames: readonly string[] | undefined,
 ): ManagedMemberInspection =>
-  managedMemberInspectionSchema.parse({
-    schema_version: 1,
-    artifact: {
-      path: target.path,
-      sha256: target.sha256,
-      byte_length: bytes.length,
-      format: "pe",
-    },
-    module: null,
-    metadata: {
-      status: issue === null ? "absent" : "malformed",
-      version: null,
-      table_row_counts: {},
-    },
-    identity_scope: {
-      token_identity: "build-local",
-      requires_artifact_sha256: target.sha256,
-      requires_mvid: null,
-    },
-    types: emptyPage(limits.typeOffset, limits.typeLimit),
-    fields: emptyPage(limits.fieldOffset, limits.fieldLimit),
-    methods: emptyPage(limits.methodOffset, limits.methodLimit),
-    member_refs: emptyPage(limits.memberRefOffset, limits.memberRefLimit),
-    call_edges: emptyPage(limits.edgeOffset, limits.edgeLimit),
-    field_accesses: emptyPage(limits.edgeOffset, limits.edgeLimit),
-    coverage: {
-      state: "unavailable",
-      issues: issue === null ? [] : [issue],
-    },
-    limitations: [
-      issue === null
-        ? "The PE has no admitted CLI metadata; managed member inspection is unavailable."
-        : "The CLI metadata could not be admitted; managed member inspection is unavailable.",
-    ],
-  });
-
-const resourceDirectory = (
-  pe: ManagedPeLayout,
-): ManagedResourceDirectory | null => {
-  if (
-    pe.cli === null ||
-    pe.cli.resources.rva === 0 ||
-    pe.cli.resources.size === 0
-  )
-    return null;
-  return {
-    offset: pe.rvaToOffset(
-      pe.cli.resources.rva,
-      pe.cli.resources.size,
-      "cli.resources",
-    ),
-    size: pe.cli.resources.size,
-  };
-};
-
-const collectMethodBodyIssues = (
-  methods: ReturnType<typeof parseMethods>,
-  limits: ManagedMemberInspectionLimits,
-): ManagedParseIssue[] =>
-  methods.methods.flatMap((method) =>
-    method.body.status === "partial"
-      ? [
-          {
-            code: "limit-exceeded" as const,
-            scope: `method.${method.token}.body.instructions`,
-            offset: method.body.file_offset,
-            detail:
-              method.body.issue ??
-              `Instruction decode reached max_method_instructions ${String(limits.maxMethodInstructions)}`,
-          },
-        ]
-      : [],
+  managedMemberInspectionSchema.parse(
+    admitManagedProjection({
+      artifact: {
+        path: target.path,
+        sha256: target.sha256,
+        byte_length: bytes.length,
+        format: "pe",
+      },
+      module: null,
+      metadata: {
+        status:
+          issue === null
+            ? "absent"
+            : issue.code === "resource-limit"
+              ? "partial"
+              : "malformed",
+        version: null,
+        table_row_counts: {},
+      },
+      identity_scope: {
+        token_identity: "build-local",
+        requires_artifact_sha256: target.sha256,
+        requires_mvid: null,
+      },
+      types: [],
+      exported_types: null,
+      fields: [],
+      methods: [],
+      member_refs: [],
+      call_edges: [],
+      field_accesses: [],
+      // Nothing was examined, so no requested name is known to be unmatched.
+      selection:
+        typeNames === undefined
+          ? null
+          : { type_names: [...typeNames], unmatched_type_names: [] },
+      coverage: {
+        state: "unavailable",
+        issues: issue === null ? [] : [issue],
+      },
+      limitations: [
+        issue === null
+          ? "The PE has no admitted CLI metadata; managed member inspection is unavailable."
+          : "The CLI metadata could not be admitted; managed member inspection is unavailable.",
+      ],
+    }),
   );
 
 const readMemberInventory = (
   bytes: Buffer,
   pe: ManagedPeLayout,
-  limits: ManagedMemberInspectionLimits,
+  issues: ManagedParseIssue[],
 ) => {
   const cli = pe.cli;
   if (cli === null)
@@ -127,119 +103,162 @@ const readMemberInventory = (
     cli.metadata.size,
     "cli.metadata",
   );
-  if (cli.metadata.size > limits.maxMetadataBytes)
-    throw managedFailure(
-      "limit-exceeded",
-      "metadata.root",
-      `CLI metadata size exceeds max_metadata_bytes ${String(limits.maxMetadataBytes)}`,
-      rootOffset,
-    );
   const layout = readManagedMetadataLayout(
     bytes,
     rootOffset,
     cli.metadata.size,
-    limits.maxTableRows,
   );
   const inventory = readManagedMetadataInventory(
     bytes,
     layout,
-    {
-      referenceOffset: 0,
-      referenceLimit: 1,
-      resourceOffset: 0,
-      resourceLimit: 1,
-      attributeOffset: 0,
-      attributeLimit: 1,
-      maxHeapItemBytes: limits.maxHeapItemBytes,
-    },
-    resourceDirectory(pe),
+    readManagedResourceDirectory(pe, issues),
   );
   return { layout, inventory };
 };
 
-/** Inspect metadata members and method bodies without loading target code. */
+const selectTypes = (
+  ranges: readonly TypeRange[],
+  typeNames: readonly string[] | undefined,
+): {
+  readonly tokens: SelectedTypeTokens;
+  readonly selection: ManagedMemberInspection["selection"];
+  readonly unreadableNames: number;
+} => {
+  if (typeNames === undefined)
+    return { tokens: null, selection: null, unreadableNames: 0 };
+  const requested = new Set(typeNames);
+  const tokens = new Set<string>();
+  const matched = new Set<string>();
+  for (const range of ranges) {
+    if (range.fullName === null || !requested.has(range.fullName)) continue;
+    tokens.add(range.token);
+    matched.add(range.fullName);
+  }
+  return {
+    tokens,
+    unreadableNames: ranges.filter(({ fullName }) => fullName === null).length,
+    selection: {
+      type_names: [...typeNames],
+      unmatched_type_names: typeNames.filter((name) => !matched.has(name)),
+    },
+  };
+};
+
+/**
+ * Inspect metadata members and method bodies without loading target code.
+ * Selected type names restrict full decoding to members of those exact types.
+ */
 export const inspectManagedMembersBytes = (
   bytes: Buffer,
   target: BinaryTarget,
-  limits: ManagedMemberInspectionLimits,
+  { typeNames }: { readonly typeNames?: readonly string[] } = {},
 ): ManagedMemberInspection => {
   const pe = readManagedPeLayout(bytes);
-  if (pe.cli === null) return unavailable(target, bytes, limits, pe.cliIssue);
+  if (pe.cli === null)
+    return unavailable(target, bytes, pe.cliIssue, typeNames);
   const issues: ManagedParseIssue[] = [];
   try {
-    const { layout, inventory } = readMemberInventory(bytes, pe, limits);
+    const { layout, inventory } = readMemberInventory(bytes, pe, issues);
     issues.push(...inventory.issues);
-    const ranges = typeRanges(bytes, layout, limits.maxHeapItemBytes);
-    const types = parseTypes(bytes, layout, ranges, limits.maxHeapItemBytes);
-    const fields = parseFields(bytes, layout, ranges, limits.maxHeapItemBytes);
-    const memberRefs = parseMemberRefs(bytes, layout, limits.maxHeapItemBytes);
+    const ranges = typeRanges(bytes, layout, issues);
+    const {
+      tokens: selected,
+      selection,
+      unreadableNames,
+    } = selectTypes(ranges, typeNames);
+    const parsedTypes = parseTypes(bytes, layout, ranges);
+    issues.push(...parsedTypes.issues);
+    const exportedTypes = parseExportedTypes(bytes, layout);
+    issues.push(...exportedTypes.issues);
+    const fields = parseFields(bytes, layout, ranges, selected);
+    const memberRefs = parseMemberRefs(bytes, layout);
+    issues.push(...memberRefs.issues);
     const methods = parseMethods({
       bytes,
       layout,
       pe,
       ranges,
-      maxBytes: limits.maxHeapItemBytes,
-      limits,
+      selected,
     });
-    const methodBodyIssues = collectMethodBodyIssues(methods, limits);
-    const coverageIssues = [...issues, ...methodBodyIssues];
+    issues.push(...fields.issues, ...methods.issues);
+    const coverageIssues = uniqueManagedParseIssues(issues);
+    const incompleteMembers =
+      [...fields.fields, ...memberRefs.refs, ...methods.methods].some(
+        (member) => member.signature.parse_status !== "decoded",
+      ) ||
+      methods.methods.some(
+        (method) =>
+          method.body.status === "partial" ||
+          method.body.status === "malformed",
+      );
     const related = edges(
       methods.methods,
       methods.core,
       fields.core,
       memberRefs.core,
+      managedDecodeBudget(layout),
     );
-    return managedMemberInspectionSchema.parse({
-      schema_version: 1,
-      artifact: {
-        path: target.path,
-        sha256: target.sha256,
-        byte_length: bytes.length,
-        format: "pe",
-      },
-      module: inventory.module,
-      metadata: {
-        status: issues.length === 0 ? "complete" : "partial",
-        version: layout.version,
-        table_row_counts: managedTableRowCounts(layout),
-      },
-      identity_scope: {
-        token_identity: "build-local",
-        requires_artifact_sha256: target.sha256,
-        requires_mvid: inventory.module?.mvid ?? null,
-      },
-      types: page(types, limits.typeOffset, limits.typeLimit),
-      fields: page(fields.fields, limits.fieldOffset, limits.fieldLimit),
-      methods: page(methods.methods, limits.methodOffset, limits.methodLimit),
-      member_refs: page(
-        memberRefs.refs,
-        limits.memberRefOffset,
-        limits.memberRefLimit,
+    return managedMemberInspectionSchema.parse(
+      admitManagedProjection(
+        {
+          artifact: {
+            path: target.path,
+            sha256: target.sha256,
+            byte_length: bytes.length,
+            format: "pe",
+          },
+          module: inventory.module,
+          metadata: {
+            status: issues.length === 0 ? "complete" : "partial",
+            version: layout.version,
+            table_row_counts: managedTableRowCounts(layout),
+          },
+          identity_scope: {
+            token_identity: "build-local",
+            requires_artifact_sha256: target.sha256,
+            requires_mvid: inventory.module?.mvid ?? null,
+          },
+          types:
+            selected === null
+              ? parsedTypes.types
+              : parsedTypes.types.filter((type) => selected.has(type.token)),
+          exported_types: exportedTypes.exportedTypes,
+          fields: fields.fields,
+          methods: methods.methods,
+          member_refs: memberRefs.refs,
+          call_edges: related.callEdges,
+          field_accesses: related.fieldAccesses,
+          selection,
+          coverage: {
+            state:
+              issues.length === 0 && !incompleteMembers
+                ? "complete"
+                : "partial",
+            issues: coverageIssues,
+          },
+          limitations: [
+            "Metadata tokens are build-local coordinates and are only meaningful with the reported artifact SHA-256 and MVID.",
+            "CIL instruction anchors are decoded from file-backed method bodies only; no target assembly is loaded or executed.",
+            "Exported types are reported from ExportedType rows as declared; forwarded types are not resolved in their implementing assemblies.",
+            "Member signatures decode ECMA-335 primitive, class, valuetype, generic instantiation, generic variable, pointer, byref, single-dimension and general array, function pointer, custom modifier, and typed reference forms; class and valuetype operands keep their encoded TypeDefOrRefOrSpec values, and unsupported forms such as vararg sentinels retain raw signature hashes.",
+            ...(selection === null
+              ? []
+              : [
+                  "Types, fields, methods, call edges, and field accesses cover only the selected declaring types; coverage describes that selection. Edge targets outside it keep their names but are not described.",
+                ]),
+            ...(unreadableNames === 0
+              ? []
+              : [
+                  `${String(unreadableNames)} TypeDef name(s) could not be read; a name in selection.unmatched_type_names may belong to one of them, so its absence is not observed.`,
+                ]),
+          ],
+        },
+        managedDecodeBudget(layout),
       ),
-      call_edges: page(related.callEdges, limits.edgeOffset, limits.edgeLimit),
-      field_accesses: page(
-        related.fieldAccesses,
-        limits.edgeOffset,
-        limits.edgeLimit,
-      ),
-      coverage: {
-        state: coverageIssues.length === 0 ? "complete" : "partial",
-        issues: coverageIssues,
-      },
-      limitations: [
-        "Metadata tokens are build-local coordinates and are only meaningful with the reported artifact SHA-256 and MVID.",
-        "CIL instruction anchors are decoded from file-backed method bodies only; no target assembly is loaded or executed.",
-        "Signatures are decoded for common ECMA-335 primitive, class, valuetype, pointer, byref, array, and generic variable forms; unsupported forms retain raw signature hashes.",
-        ...(methodBodyIssues.length > 0
-          ? [
-              "At least one CIL method body reached max_method_instructions; its decoded prefix is partial and has no normalized CIL identity.",
-            ]
-          : []),
-      ],
-    });
+    );
   } catch (cause: unknown) {
     if (cause instanceof ManagedReaderFailure)
-      return unavailable(target, bytes, limits, cause.issue);
+      return unavailable(target, bytes, cause.issue, typeNames);
     throw cause;
   }
 };

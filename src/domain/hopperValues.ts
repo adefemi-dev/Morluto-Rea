@@ -1,8 +1,12 @@
 import { z } from "zod";
 
 import type { JsonValue } from "./jsonValue.js";
-import { AnalysisOutputError, HopperProtocolError } from "./errors.js";
+
 import { err, ok, type Result } from "./result.js";
+import { nativeApiBoundarySchema } from "./native/nativeApiBoundary.js";
+import { nativeValueFlowSchema } from "./native/nativeValueFlow.js";
+import { AnalysisOutputError } from "./analysisErrorCore.js";
+import { HopperProtocolError } from "./hopperErrors.js";
 
 export interface AddressedName {
   readonly address: string;
@@ -16,12 +20,6 @@ export interface SegmentSummary {
   readonly readable: boolean | null;
   readonly writable: boolean | null;
   readonly executable: boolean | null;
-}
-
-export interface AddressedPage {
-  readonly items: readonly AddressedName[];
-  readonly nextOffset: number | null;
-  readonly hasMore: boolean;
 }
 
 /** Return a bounded byte distance between canonical addresses in one space. */
@@ -54,41 +52,165 @@ const addressedNamesSchema = z.array(
 );
 const addressedNameMapSchema = z.record(z.string(), z.string());
 const segmentSchema = z.object({
-  name: z.string().default(""),
-  start: z.string().default(""),
-  end: z.string().default(""),
-  readable: z.boolean().nullable().default(null),
-  writable: z.boolean().nullable().default(null),
-  executable: z.boolean().nullable().default(null),
+  name: z.string(),
+  start: z.string(),
+  end: z.string(),
+  readable: z.boolean().nullable(),
+  writable: z.boolean().nullable(),
+  executable: z.boolean().nullable(),
 });
-const addressedPageSchema = z
-  .object({
-    items: z.array(z.object({ address: z.string(), value: z.string() })),
-    offset: z.number().int().min(0),
-    limit: z.number().int().min(1),
-    total: z.number().int().min(0),
-    next_offset: z.number().int().min(0).nullable(),
-    has_more: z.boolean(),
-  })
-  .superRefine((value, context) => {
-    if (value.has_more && value.next_offset === null) {
-      context.addIssue({
-        code: "custom",
-        message: "a page with more results must provide next_offset",
-        path: ["next_offset"],
-      });
-    }
-    if (!value.has_more && value.next_offset !== null) {
-      context.addIssue({
-        code: "custom",
-        message: "a complete page must not provide next_offset",
-        path: ["next_offset"],
-      });
-    }
-  });
+const segmentImageBaseSchema = z
+  .object({ image_base: z.string().min(1) })
+  .passthrough();
 const unavailableAnalysisFactSchema = z
   .object({ available: z.literal(false), reason: z.string() })
   .strict();
+/** Typed string evidence shared by inventories and referenced function literals. */
+export const analysisStringSchema = z.object({
+  address: z.string(),
+  value: z.string(),
+  provider_value: z
+    .string()
+    .exactOptional()
+    .describe(
+      "Original provider display text, which may shorten the typed object.",
+    ),
+  decoding: unavailableAnalysisFactSchema
+    .exactOptional()
+    .describe(
+      "When present, value retains native display text because typed bytes could not be decoded.",
+    ),
+  string: z
+    .object({
+      encoding: z.string().min(1),
+      encoding_status: z
+        .enum(["observed", "inferred"])
+        .exactOptional()
+        .describe(
+          "Whether the provider declares the encoding or REA infers it from the typed bytes and native display. This does not establish the original source's intended encoding.",
+        ),
+      termination: z.enum(["missing", "present_or_not_required"]),
+      byte_length: z.number().int().min(0),
+    })
+    .exactOptional(),
+});
+
+/** An analyzed bookmark retains a missing provider label as null. */
+export const analysisBookmarkSchema = z.strictObject({
+  address: z.string(),
+  name: z.string().nullable(),
+});
+/** Complete observed function-body ranges; every range endpoint is inclusive. */
+export const functionBodySchema = z.discriminatedUnion("available", [
+  unavailableAnalysisFactSchema,
+  z
+    .strictObject({
+      available: z.literal(true),
+      provenance: z.string().min(1),
+      ranges: z.array(
+        z.strictObject({
+          start: z.string(),
+          end: z
+            .string()
+            .describe("Inclusive last address of this observed body range."),
+        }),
+      ),
+      total_bytes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+      span_bytes: z
+        .number()
+        .int()
+        .min(0)
+        .max(Number.MAX_SAFE_INTEGER)
+        .nullable(),
+      non_contiguous: z.boolean(),
+      contains_entry: z.boolean(),
+    })
+    .superRefine((body, context) => {
+      let total = 0n;
+      const bounds = new Map<string, { start: bigint; end: bigint }>();
+      const closedSpaces = new Set<string>();
+      let previousSpace: string | null = null;
+      for (const range of body.ranges) {
+        const start = addressCoordinate(range.start);
+        const end = addressCoordinate(range.end);
+        if (
+          start === null ||
+          end === null ||
+          start.space !== end.space ||
+          end.offset < start.offset
+        ) {
+          context.addIssue({
+            code: "custom",
+            message: "Function body range has invalid inclusive endpoints",
+          });
+          return;
+        }
+        if (previousSpace !== null && previousSpace !== start.space)
+          closedSpaces.add(previousSpace);
+        const previous = bounds.get(start.space);
+        if (
+          closedSpaces.has(start.space) ||
+          (previous !== undefined && start.offset <= previous.end + 1n)
+        ) {
+          context.addIssue({
+            code: "custom",
+            message:
+              "Function body ranges must be ordered, disjoint and maximal within each address space",
+          });
+          return;
+        }
+        bounds.set(start.space, {
+          start: previous?.start ?? start.offset,
+          end: end.offset,
+        });
+        previousSpace = start.space;
+        total += end.offset - start.offset + 1n;
+      }
+      const onlyBounds =
+        bounds.size === 1 ? [...bounds.values()][0] : undefined;
+      const span =
+        bounds.size === 0
+          ? 0n
+          : onlyBounds === undefined
+            ? null
+            : onlyBounds.end - onlyBounds.start + 1n;
+      const reportedSpan =
+        body.span_bytes === null ? null : BigInt(body.span_bytes);
+      if (
+        total !== BigInt(body.total_bytes) ||
+        span !== reportedSpan ||
+        body.non_contiguous !== body.ranges.length > 1
+      )
+        context.addIssue({
+          code: "custom",
+          message:
+            "Function body counts, enclosing span or contiguity disagree with inclusive ranges",
+        });
+    }),
+]);
+
+/** Check the declared entry membership against complete, inclusive body ranges. */
+export const functionBodyEntryAgrees = (
+  body: z.infer<typeof functionBodySchema>,
+  address: string,
+): boolean => {
+  if (!body.available) return true;
+  const entry = addressCoordinate(address);
+  if (entry === null) return false;
+  const contains = body.ranges.some((range) => {
+    const start = addressCoordinate(range.start);
+    const end = addressCoordinate(range.end);
+    return (
+      start !== null &&
+      end !== null &&
+      start.space === entry.space &&
+      entry.offset >= start.offset &&
+      entry.offset <= end.offset
+    );
+  });
+  return contains === body.contains_entry;
+};
+
 export const procedureClassificationSchema = z
   .object({
     external: z.boolean(),
@@ -101,48 +223,42 @@ export const procedureIdentitySchema = z
   .object({
     address: z.string(),
     name: z.string(),
-    classification: procedureClassificationSchema.nullable().default(null),
+    classification: procedureClassificationSchema.nullable(),
+    body: functionBodySchema,
   })
-  .strict();
+  .strict()
+  .superRefine((identity, context) => {
+    if (!functionBodyEntryAgrees(identity.body, identity.address))
+      context.addIssue({
+        code: "custom",
+        message:
+          "Function body entry membership disagrees with procedure identity",
+      });
+  });
 export const localVariableSchema = z
   .object({
     description: z.string(),
     provenance: z.string().min(1),
+    name: z.string().nullable().exactOptional(),
+    stack_displacement: z
+      .string()
+      .regex(/^-?\d+$/u)
+      .nullable()
+      .exactOptional()
+      .describe(
+        "Observed signed stack byte displacement, encoded as decimal to preserve precision.",
+      ),
   })
   .strict();
-const boundedSchema = <T extends z.ZodType>(item: T) =>
-  z
-    .object({
-      items: z.array(item),
-      total: z.number().int().min(0).nullable(),
-      returned: z.number().int().min(0),
-      truncated: z.boolean(),
-      next_offset: z.number().int().min(0).nullable(),
-    })
-    .strict()
-    .superRefine((value, context) => {
-      if (value.returned !== value.items.length) {
-        context.addIssue({
-          code: "custom",
-          message: "returned must equal the number of items",
-          path: ["returned"],
-        });
-      }
-      if (value.total !== null && value.total < value.returned) {
-        context.addIssue({
-          code: "custom",
-          message: "total cannot be smaller than returned",
-          path: ["total"],
-        });
-      }
-      if (value.next_offset !== null && !value.truncated) {
-        context.addIssue({
-          code: "custom",
-          message: "a continuation requires truncated output",
-          path: ["next_offset"],
-        });
-      }
-    });
+/** Provider-neutral complete raw-instruction list for one analyzed function. */
+export const functionInstructionWindowSchema = z
+  .object({
+    procedure: procedureIdentitySchema,
+    instructions: z.array(z.string()),
+    limitations: z.array(z.string()),
+  })
+  .strict();
+
 const availableReferenceKindSchema = z
   .object({
     available: z.literal(true),
@@ -167,60 +283,38 @@ export const referenceKindSchema = z.discriminatedUnion("available", [
   unavailableAnalysisFactSchema,
   availableReferenceKindSchema,
 ]);
-const referenceEdgeSchema = z
+/** Reported call sites without resolved targets; unreported dispatch stays unknown. */
+export const unresolvedCallSchema = z.strictObject({
+  address: z.string(),
+  reason: z.string(),
+});
+
+/** Observed endpoints with complete or partial reference classification evidence. */
+export const referenceEdgeSchema = z
   .object({
     source_address: z.string(),
     target_address: z.string(),
     source_procedure: procedureIdentitySchema.nullable(),
     target_procedure: procedureIdentitySchema.nullable(),
     kind: referenceKindSchema,
+    call: z
+      .strictObject({
+        classification: z.enum(["none", "unknown", "direct", "objective_c"]),
+        provider_type: z.number().int(),
+        provenance: z.string().min(1),
+      })
+      .exactOptional(),
   })
   .strict();
 export const functionDossierSchema = z
   .object({
-    procedure: z
-      .object({
-        address: z.string(),
-        name: z.string(),
-        classification: procedureClassificationSchema.nullable().default(null),
-        signature: z.string().nullable(),
-        locals: z.array(localVariableSchema),
-      })
-      .strict(),
-    pseudocode: z
-      .object({
-        text: z.string(),
-        total_chars: z.number().int().min(0),
-        returned_chars: z.number().int().min(0),
-        truncated: z.boolean(),
-        next_offset: z.number().int().min(0).nullable(),
-      })
-      .strict()
-      .superRefine((value, context) => {
-        if (value.returned_chars !== [...value.text].length) {
-          context.addIssue({
-            code: "custom",
-            message: "returned_chars must equal the text length",
-            path: ["returned_chars"],
-          });
-        }
-        if (value.total_chars < value.returned_chars) {
-          context.addIssue({
-            code: "custom",
-            message: "total_chars cannot be smaller than returned_chars",
-            path: ["total_chars"],
-          });
-        }
-        if (value.next_offset !== null && !value.truncated) {
-          context.addIssue({
-            code: "custom",
-            message: "a continuation requires truncated pseudocode",
-            path: ["next_offset"],
-          });
-        }
-      }),
-    assembly: boundedSchema(z.string()),
-    comments: boundedSchema(
+    procedure: procedureIdentitySchema.safeExtend({
+      signature: z.string().nullable(),
+      locals: z.array(localVariableSchema),
+    }),
+    pseudocode: z.string(),
+    assembly: z.array(z.string()),
+    comments: z.array(
       z
         .object({
           address: z.string(),
@@ -229,11 +323,15 @@ export const functionDossierSchema = z
         })
         .strict(),
     ),
-    callers: boundedSchema(procedureIdentitySchema),
-    callees: boundedSchema(procedureIdentitySchema),
-    incoming_references: boundedSchema(referenceEdgeSchema),
-    outgoing_references: boundedSchema(referenceEdgeSchema),
-    referenced_strings: boundedSchema(
+    callers: z.array(procedureIdentitySchema),
+    callees: z.array(procedureIdentitySchema),
+    incoming_references: z.array(referenceEdgeSchema),
+    outgoing_references: z.array(referenceEdgeSchema),
+    unresolved_calls: z.array(unresolvedCallSchema).exactOptional(),
+    referenced_strings: z.array(
+      analysisStringSchema.extend({ source_address: z.string() }),
+    ),
+    referenced_names: z.array(
       z
         .object({
           address: z.string(),
@@ -242,16 +340,7 @@ export const functionDossierSchema = z
         })
         .strict(),
     ),
-    referenced_names: boundedSchema(
-      z
-        .object({
-          address: z.string(),
-          value: z.string(),
-          source_address: z.string(),
-        })
-        .strict(),
-    ),
-    basic_blocks: boundedSchema(
+    basic_blocks: z.array(
       z
         .object({
           start: z.string(),
@@ -260,10 +349,9 @@ export const functionDossierSchema = z
         })
         .strict(),
     ),
-    instruction_scan: z
-      .object({ scanned: z.number().int().min(0), truncated: z.boolean() })
-      .strict(),
-    limitations: z.array(z.string()).default([]),
+    native_api: nativeApiBoundarySchema.nullable(),
+    native_value_flow: nativeValueFlowSchema.nullable(),
+    limitations: z.array(z.string()),
   })
   .strict();
 
@@ -286,29 +374,10 @@ export const parseFunctionDossier = (
       );
 };
 
-/** Parse page entries and continuation metadata returned by list operations. */
-export const parseAddressedPage = (
-  value: JsonValue,
-): Result<AddressedPage, HopperProtocolError> => {
-  const parsed = addressedPageSchema.safeParse(value);
-  return parsed.success
-    ? ok({
-        items: parsed.data.items.map(({ address, value: name }) => ({
-          address,
-          name,
-        })),
-        nextOffset: parsed.data.next_offset,
-        hasMore: parsed.data.has_more,
-      })
-    : invalid("addressed page", parsed.error);
-};
-
 /** Parse Hopper's direct or wrapped procedure map into stable entries. */
 export const parseProcedures = (
   value: JsonValue,
 ): Result<readonly AddressedName[], HopperProtocolError> => {
-  const page = parseAddressedPage(value);
-  if (page.ok) return ok(page.value.items);
   const parsed = procedureMapSchema.safeParse(
     unwrapProperty(value, "procedures"),
   );
@@ -319,7 +388,7 @@ export const parseProcedures = (
           name,
         })),
       )
-    : page;
+    : invalid("procedure map", parsed.error);
 };
 
 /** Parse Hopper's direct or wrapped list of address/name records. */
@@ -327,15 +396,6 @@ export const parseNames = (
   value: JsonValue,
 ): Result<readonly AddressedName[], HopperProtocolError> => {
   const unwrapped = unwrapProperty(value, "names");
-  const page = z
-    .object({
-      items: z.array(z.object({ address: z.string(), value: z.string() })),
-    })
-    .safeParse(unwrapped);
-  if (page.success)
-    return ok(
-      page.data.items.map(({ address, value: name }) => ({ address, name })),
-    );
   const records = addressedNamesSchema.safeParse(unwrapped);
   if (records.success) return ok(records.data);
   const map = addressedNameMapSchema.safeParse(unwrapped);
@@ -367,6 +427,16 @@ export const parseSegments = (
     : invalid("segment list", parsed.error);
 };
 
+/** Return a provider-reported image base only when every segment agrees on it. */
+export const parseSegmentImageBase = (value: JsonValue): string | undefined => {
+  const parsed = z
+    .array(segmentImageBaseSchema)
+    .safeParse(unwrapProperty(value, "segments"));
+  if (!parsed.success) return undefined;
+  const bases = new Set(parsed.data.map(({ image_base }) => image_base));
+  return bases.size === 1 ? parsed.data[0]?.image_base : undefined;
+};
+
 /** Parse direct or wrapped Hopper document names. */
 export const parseDocuments = (
   value: JsonValue,
@@ -385,12 +455,6 @@ export const parseListCount = (
   property: string,
 ): Result<number, HopperProtocolError> => {
   const unwrapped = unwrapProperty(value, property);
-  const pageTotal = z
-    .object({ total: z.number().int().min(0) })
-    .safeParse(unwrapped);
-  if (pageTotal.success) return ok(pageTotal.data.total);
-  const page = z.object({ items: z.array(z.unknown()) }).safeParse(unwrapped);
-  if (page.success) return ok(page.data.items.length);
   const list = z.array(z.unknown()).safeParse(unwrapped);
   if (list.success) return ok(list.data.length);
   const map = z.record(z.string(), z.unknown()).safeParse(unwrapped);

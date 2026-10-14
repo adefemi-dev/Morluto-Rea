@@ -1,12 +1,13 @@
+import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 import { err, ok } from "../domain/result.js";
+import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
+import type { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 import { traverseDirectory } from "./ReferenceSourceReaderEntries.js";
-import { compareNames } from "./ReferenceSourceReaderPaths.js";
-import {
-  type ReferenceSourceLimits,
-  type ReferenceSourceReaderOptions,
-  type ReferenceSourceRead,
-  type ReferenceSourceResult,
-  type TraversalState,
+import type {
+  ReferenceSourceReaderOptions,
+  ReferenceSourceRead,
+  ReferenceSourceResult,
+  TraversalState,
 } from "./ReferenceSourceReaderTypes.js";
 import {
   isAborted,
@@ -14,27 +15,33 @@ import {
   prepareRoot,
 } from "./ReferenceSourceReaderValidate.js";
 
-export type {
-  ReferenceSourceEntry,
-  ReferenceSourceLimits,
-  ReferenceSourceRead,
-  ReferenceSourceReaderOptions,
-} from "./ReferenceSourceReaderTypes.js";
-
-const DEFAULT_LIMITS: ReferenceSourceLimits = {
-  maxBytes: 16 * 1024 * 1024,
-  maxEntries: 10_000,
-  maxDepth: 32,
-  maxPathBytes: 4_096,
-};
 const PATH_RACE_LIMITATION =
   "Path identity is revalidated around operations; Node lacks portable descriptor-relative openat traversal, so a syscall-boundary pathname race remains.";
 
-/** Read a bounded source tree without intentionally following symbolic links. */
+/** Read a source tree without intentionally following symbolic links. */
 export const readReferenceSource = async (
   root: string,
-  limits: ReferenceSourceLimits = DEFAULT_LIMITS,
+  resources: ArtifactResourceScope,
   options: ReferenceSourceReaderOptions = {},
+): Promise<ReferenceSourceResult<ReferenceSourceRead>> => {
+  try {
+    return await resources.run(() => readSource(root, resources, options));
+  } catch (cause: unknown) {
+    if (!(cause instanceof ArtifactReaderFailure)) throw cause;
+    return err({
+      tag: "reference-source-reader",
+      code: cause.reason === "cancelled" ? "cancelled" : "io",
+      message: cause.message,
+      ...(cause.cleanup === undefined ? {} : { cleanup: cause.cleanup }),
+      cause,
+    });
+  }
+};
+
+const readSource = async (
+  root: string,
+  resources: ArtifactResourceScope,
+  options: ReferenceSourceReaderOptions,
 ): Promise<ReferenceSourceResult<ReferenceSourceRead>> => {
   if (!noFollowOpenSupported())
     return err({
@@ -42,45 +49,38 @@ export const readReferenceSource = async (
       code: "unsupported",
       message: "Safe no-follow file opens are unavailable",
     });
-  const prepared = await prepareRoot(root, limits, options.signal);
+  const prepared = await prepareRoot(root, options.signal);
   if (!prepared.ok) return prepared;
   const { canonicalRoot, rootIdentity } = prepared.value;
   const state: TraversalState = {
+    resources,
     root: canonicalRoot,
     rootIdentity,
-    limits,
     ...(options.signal === undefined ? {} : { signal: options.signal }),
     ...(options.shouldExclude === undefined
       ? {}
       : { shouldExclude: options.shouldExclude }),
     entries: [],
-    pending: [{ path: canonicalRoot, depth: 0 }],
+    pending: [{ path: canonicalRoot }],
     bytesRead: 0,
-    filesSeen: 0,
-    truncated: false,
-    stopped: false,
   };
   const traversal = await traverse(state);
-  if (!traversal.ok) return traversal;
-  state.entries.sort((left, right) => compareNames(left.path, right.path));
-  return ok({
+  state.entries.sort((left, right) =>
+    compareUnicodeCodePoints(left.path, right.path),
+  );
+  const read: ReferenceSourceRead = {
     root: canonicalRoot,
     entries: state.entries,
     bytesRead: state.bytesRead,
-    truncated: state.truncated,
-    limitations: [
-      PATH_RACE_LIMITATION,
-      ...(state.stopped
-        ? ["Traversal stopped because the entry limit was reached."]
-        : []),
-    ],
-  });
+    limitations: [PATH_RACE_LIMITATION],
+  };
+  return traversal.ok ? ok(read) : err({ ...traversal.error, partial: read });
 };
 
 const traverse = async (
   state: TraversalState,
 ): Promise<ReferenceSourceResult<undefined>> => {
-  while (state.pending.length > 0 && !state.stopped) {
+  while (state.pending.length > 0) {
     if (isAborted(state.signal))
       return err({
         tag: "reference-source-reader",

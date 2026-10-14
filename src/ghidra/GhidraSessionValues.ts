@@ -1,10 +1,15 @@
+import { ghidraSeedReportSchema } from "./GhidraAnalysisSeeds.js";
 import { z } from "zod";
 
 import type { JsonValue } from "../domain/jsonValue.js";
 import { err, ok, type Result } from "../domain/result.js";
-import { GHIDRA_BRIDGE_VERSION } from "./GhidraDefaults.js";
-import { GHIDRA_INVENTORY_OPERATIONS } from "./GhidraInventoryValues.js";
+import {
+  GHIDRA_INVENTORY_OPERATIONS,
+  GHIDRA_NAMING_OPERATIONS,
+} from "./GhidraInventoryValues.js";
 import { GHIDRA_FUNCTION_OPERATIONS } from "./GhidraFunctionValues.js";
+import { ghidraExtensionResultSchema } from "./extensions/GhidraExtensions.js";
+import { GHIDRA_MIPS_SOFT_FLOAT_STORAGE } from "./GhidraMipsProfile.js";
 
 /** Exact methods proved by the bridge handshake after auto-analysis. */
 export const GHIDRA_SESSION_CAPABILITIES = [
@@ -14,12 +19,17 @@ export const GHIDRA_SESSION_CAPABILITIES = [
   ...GHIDRA_FUNCTION_OPERATIONS,
 ] as const;
 
+/** Methods that edit the session database; read-only bridges omit them. */
+export const GHIDRA_MUTATING_OPERATIONS: ReadonlySet<string> = new Set([
+  "annotate_native_function",
+  ...GHIDRA_NAMING_OPERATIONS,
+]);
+
 const capabilitySchema = z.enum(GHIDRA_SESSION_CAPABILITIES);
 
 const sessionInfoSchema = z
   .object({
     name: z.literal("REA Ghidra bridge"),
-    bridge_version: z.literal(GHIDRA_BRIDGE_VERSION),
     run_id: z.string().uuid(),
     profile_digest: z.string().regex(/^[a-f0-9]{64}$/u),
     provider: z
@@ -28,12 +38,20 @@ const sessionInfoSchema = z
         version: z.string().min(1),
       })
       .strict(),
-    read_only: z.literal(true),
+    read_only: z.boolean(),
     analysis_complete: z.boolean(),
     analysis_timed_out: z.boolean(),
-    capabilities: z
-      .array(capabilitySchema)
-      .length(GHIDRA_SESSION_CAPABILITIES.length),
+    analysis_extensions: z.array(ghidraExtensionResultSchema).optional(),
+    analysis_seeds: ghidraSeedReportSchema.optional(),
+    mips_soft_float_storage: z
+      .object({
+        policy: z.literal(GHIDRA_MIPS_SOFT_FLOAT_STORAGE),
+        functions: z.number().int().nonnegative(),
+        definitions: z.number().int().nonnegative(),
+      })
+      .strict()
+      .optional(),
+    capabilities: z.array(capabilitySchema),
     target: z
       .object({
         name: z.string().min(1),
@@ -58,18 +76,31 @@ export const parseGhidraSessionInfo = (
     readonly providerVersion: string;
     readonly profileDigest: string;
     readonly targetSha256: string;
+    readonly expectedReadOnly?: boolean;
+    readonly expectedLanguageId?: string;
+    readonly expectedCompilerSpecId?: string;
   },
 ): Result<GhidraSessionInfo, Error> => {
   const parsed = sessionInfoSchema.safeParse(value);
+  const readOnly = expected.expectedReadOnly ?? false;
+  const expectedCapabilities = GHIDRA_SESSION_CAPABILITIES.filter(
+    (capability) => !readOnly || !GHIDRA_MUTATING_OPERATIONS.has(capability),
+  );
   if (
     !parsed.success ||
     parsed.data.run_id !== expected.runId ||
+    parsed.data.read_only !== readOnly ||
+    parsed.data.capabilities.length !== expectedCapabilities.length ||
     parsed.data.provider.version !== expected.providerVersion ||
     parsed.data.profile_digest !== expected.profileDigest ||
     parsed.data.target.sha256 !== expected.targetSha256 ||
-    new Set(parsed.data.capabilities).size !==
-      GHIDRA_SESSION_CAPABILITIES.length ||
-    GHIDRA_SESSION_CAPABILITIES.some(
+    (expected.expectedLanguageId !== undefined &&
+      parsed.data.target.language_id !== expected.expectedLanguageId) ||
+    (expected.expectedCompilerSpecId !== undefined &&
+      parsed.data.target.compiler_spec_id !==
+        expected.expectedCompilerSpecId) ||
+    new Set(parsed.data.capabilities).size !== expectedCapabilities.length ||
+    expectedCapabilities.some(
       (capability) => !parsed.data.capabilities.includes(capability),
     ) ||
     parsed.data.analysis_complete === parsed.data.analysis_timed_out

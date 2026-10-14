@@ -4,8 +4,7 @@ import { z } from "zod";
 export const analysisProviderIdSchema = z
   .string()
   .min(1)
-  .max(64)
-  .regex(/^[a-z][a-z0-9-]*$/u)
+  .regex(/^[a-z][a-z0-9\x2d]*$/u)
   .refine((value) => value !== "auto", {
     message: "auto is reserved for provider selection",
   });

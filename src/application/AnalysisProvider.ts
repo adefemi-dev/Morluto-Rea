@@ -1,10 +1,10 @@
-import type { BinaryTarget } from "../domain/binaryTarget.js";
-import type { OfficialToolName } from "../contracts/toolContracts.js";
+import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
+import type { OfficialToolName } from "../contracts/officialToolContracts.js";
 import type { EnhancedToolName } from "../contracts/enhancedInputs.js";
-import type { NativeToolName } from "../contracts/nativeToolContracts.js";
-import type { ArtifactToolName } from "../contracts/artifactToolContracts.js";
-import type { ManagedToolName } from "../contracts/managedToolContracts.js";
-import type { AnalysisError } from "../domain/errors.js";
+import type { NativeToolName } from "../contracts/native/nativeToolContracts.js";
+import type { ArtifactAnalysisOperation } from "../contracts/artifactToolContracts.js";
+import type { ManagedToolName } from "../contracts/managed/managedToolContracts.js";
+import type { AnalysisError } from "../domain/analysisErrorBase.js";
 import type { AnalysisProfileCommitment } from "../domain/analysisProfile.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 import type { Result } from "../domain/result.js";
@@ -13,10 +13,23 @@ import type { EvidenceSubjectTarget } from "../domain/evidence.js";
 import { jsonValueSchema } from "../domain/jsonValue.js";
 import type { ProgressReporter } from "./ProgressReporter.js";
 import type { ProviderRejectionCode } from "../contracts/providerSelection.js";
+import type { ProcessLineageObservation } from "../process/ProcessOwnership.js";
+import type { ProviderOperationHealth } from "../domain/providerOperationHealth.js";
+import {
+  relationshipCoverageSchema,
+  type RelationshipCoverage,
+} from "../domain/relationshipCoverage.js";
 
 export interface ExecutionOptions {
   readonly signal?: AbortSignal;
   readonly progress?: ProgressReporter;
+  /**
+   * Set when a procedure selector came from provider output, such as a
+   * revisited callee, rather than from the caller. A provider-derived
+   * selector is never the caller's input mistake. Absent means the caller
+   * supplied it.
+   */
+  readonly selectorOrigin?: "provider";
 }
 
 /** Closed operations accepted by provider-backed analysis sessions. */
@@ -24,7 +37,7 @@ export type AnalysisOperation =
   | OfficialToolName
   | EnhancedToolName
   | NativeToolName
-  | ArtifactToolName
+  | ArtifactAnalysisOperation
   | ManagedToolName
   | "health";
 
@@ -35,35 +48,65 @@ export interface AnalysisExecution {
   readonly provider: ProviderIdentity;
   readonly analysisProfile?: AnalysisProfileCommitment;
   readonly limitations: readonly string[];
+  /** Provider-owned completeness assessment for caller/callee observations. */
+  readonly relationshipCoverage?: RelationshipCoverage;
   readonly locations: readonly EvidenceLocation[];
   readonly subject: EvidenceSubjectTarget | null;
 }
 
-/** Build a validated atomic provider observation at an adapter boundary. */
-export const createAnalysisExecution = (
+interface CreateAnalysisExecutionOptions {
+  readonly rawResult?: unknown;
+  readonly analysisProfile?: AnalysisProfileCommitment;
+  readonly limitations?: readonly string[];
+  readonly relationshipCoverage?: RelationshipCoverage;
+  readonly locations?: readonly EvidenceLocation[];
+  readonly subject?: EvidenceSubjectTarget;
+}
+
+/**
+ * Build a validated atomic provider observation at an adapter boundary.
+ *
+ * Pass `rawResult` only for a provider representation distinct from
+ * `result`. Omitting it records `null` rather than a second complete copy of
+ * the normalized result in every Evidence record and tool response.
+ */
+export function createAnalysisExecution<Subject extends EvidenceSubjectTarget>(
   result: unknown,
   provider: ProviderIdentity,
-  options: {
-    readonly rawResult?: unknown;
-    readonly analysisProfile?: AnalysisProfileCommitment;
-    readonly limitations?: readonly string[];
-    readonly locations?: readonly EvidenceLocation[];
-    readonly subject?: EvidenceSubjectTarget;
-  } = {},
-): AnalysisExecution => ({
-  result: jsonValueSchema.parse(result),
-  rawResult:
-    options.rawResult === undefined
-      ? jsonValueSchema.parse(result)
-      : jsonValueSchema.parse(options.rawResult),
-  provider,
-  ...(options.analysisProfile === undefined
-    ? {}
-    : { analysisProfile: structuredClone(options.analysisProfile) }),
-  limitations: [...(options.limitations ?? [])],
-  locations: [...(options.locations ?? [])],
-  subject: options.subject ?? null,
-});
+  options: CreateAnalysisExecutionOptions & { readonly subject: Subject },
+): Omit<AnalysisExecution, "subject"> & { readonly subject: Subject };
+export function createAnalysisExecution(
+  result: unknown,
+  provider: ProviderIdentity,
+  options?: CreateAnalysisExecutionOptions,
+): AnalysisExecution;
+export function createAnalysisExecution(
+  result: unknown,
+  provider: ProviderIdentity,
+  options: CreateAnalysisExecutionOptions = {},
+): AnalysisExecution {
+  return {
+    result: jsonValueSchema.parse(result),
+    rawResult:
+      options.rawResult === undefined
+        ? null
+        : jsonValueSchema.parse(options.rawResult),
+    provider,
+    ...(options.analysisProfile === undefined
+      ? {}
+      : { analysisProfile: structuredClone(options.analysisProfile) }),
+    limitations: [...(options.limitations ?? [])],
+    ...(options.relationshipCoverage === undefined
+      ? {}
+      : {
+          relationshipCoverage: relationshipCoverageSchema.parse(
+            options.relationshipCoverage,
+          ),
+        }),
+    locations: [...(options.locations ?? [])],
+    subject: options.subject ?? null,
+  };
+}
 
 /** Provider-neutral application capability for one analysis operation. */
 export interface AnalysisOperationPort {
@@ -74,15 +117,50 @@ export interface AnalysisOperationPort {
   ): Promise<Result<AnalysisExecution, AnalysisError>>;
 }
 
-/** Provider session bound to exactly one parsed artifact. */
-export interface AnalysisClient extends AnalysisOperationPort {
-  close(): Promise<void>;
+/** Retained provider-process observation attributed to its producing provider. */
+export interface ProviderRuntimeLineageSnapshot {
+  readonly provider: ProviderIdentity;
+  readonly observation: ProcessLineageObservation;
 }
 
-export type AnalysisClientFactory = (
-  target: BinaryTarget,
-  profile?: AnalysisProfileCommitment,
-) => AnalysisClient;
+/** One provider's current serial-request activity, including detached callers. */
+export interface ProviderRequestActivitySnapshot {
+  readonly provider: ProviderIdentity;
+  readonly active: {
+    readonly requestId: number;
+    readonly operation: string;
+    readonly elapsedMs: number;
+    readonly callerState: "waiting" | "cancelled";
+  } | null;
+  readonly queuedRequests: number;
+}
+
+/** Provider session bound to exactly one parsed artifact. */
+export interface AnalysisClient extends AnalysisOperationPort {
+  /** Execute only if this operation can run without loading or starting a provider. */
+  executeIfReady?(
+    operation: AnalysisOperation,
+    parameters: Readonly<Record<string, JsonValue>>,
+    options?: ExecutionOptions,
+  ): Promise<Result<AnalysisExecution, AnalysisError> | undefined>;
+  /** Retained token-verified process snapshots for dynamic providers this client started. */
+  runtimeLineageSnapshots?(): readonly ProviderRuntimeLineageSnapshot[];
+  /** Current provider work that may outlive a timed-out or cancelled caller. */
+  requestActivitySnapshots?(): readonly ProviderRequestActivitySnapshot[];
+  /** Current operational health for the active provider bridge. */
+  operationHealthSnapshot?(): ProviderOperationHealth | undefined;
+  /** Close owned resources and retain failed cleanup for a later retry. */
+  close(
+    options?: Pick<ExecutionOptions, "progress"> & {
+      readonly retainDocument?: boolean;
+    },
+  ): Promise<Result<null, AnalysisError>>;
+}
+
+/** Per-client identity allocated before any provider side effect starts. */
+export interface AnalysisClientContext {
+  readonly runId: string;
+}
 
 export interface ProviderIdentity {
   readonly id: string;
@@ -90,10 +168,9 @@ export interface ProviderIdentity {
   readonly version: string | null;
 }
 
-/** Profile plus opaque compatibility output resolved before provider startup. */
+/** Typed analysis profile resolved before provider startup; null means unresolved. */
 export interface AnalysisProfileResolution {
   readonly profile: AnalysisProfileCommitment | null;
-  readonly compatibility: Readonly<Record<string, JsonValue>>;
 }
 
 /** Cancellation context for side-effect-free provider profile resolution. */
@@ -112,24 +189,28 @@ interface CapabilityEffects {
 }
 
 type CapabilityAvailability =
-  | { readonly available: true; readonly reason: null }
-  | { readonly available: false; readonly reason: string };
-
-interface CapabilityLimits {
-  readonly maxResults: number | null;
-  readonly maxPayloadBytes: number | null;
-  readonly timeoutMs: number | null;
-}
+  | {
+      readonly available: true;
+      readonly reason: null;
+      readonly availabilityCode?: null;
+    }
+  | {
+      readonly available: false;
+      readonly reason: string;
+      readonly availabilityCode?: ProviderRejectionCode;
+    };
 
 export type CapabilityDescriptor = CapabilityAvailability & {
+  /**
+   * Snapshot opts immutable, profile-bound reads into replay despite incidental
+   * private filesystem writes. Live state must always be re-observed. Omitting
+   * this policy retains conservative effect checks; mutation and UI-state
+   * exclusions apply to every policy.
+   */
+  readonly cachePolicy?: "snapshot" | "live";
   readonly provider: ProviderIdentity;
   readonly operation: Exclude<AnalysisOperation, "health">;
-  readonly inputContractVersion: number;
-  readonly outputContractVersion: number;
-  readonly pagination: "none" | "offset" | "cursor";
-  readonly exhaustive: boolean;
   readonly effects: CapabilityEffects;
-  readonly limits: CapabilityLimits;
   readonly limitations: readonly string[];
 };
 
@@ -144,6 +225,7 @@ export interface AnalysisProvider {
   createClient(
     target: BinaryTarget,
     profile?: AnalysisProfileCommitment,
+    context?: AnalysisClientContext,
   ): AnalysisClient;
 }
 

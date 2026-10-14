@@ -1,28 +1,54 @@
 import { z } from "incur";
 
-import { runDoctor } from "../application/Doctor.js";
-import { runSetup, systemSetupHost } from "../application/Setup.js";
-import { runUninstall } from "../application/Uninstall.js";
-import { runUpgrade, systemUpgradeHost } from "../application/Upgrade.js";
+import type { DoctorScope } from "../application/Doctor.js";
+import { DOCTOR_PROVIDER_IDS } from "../application/DoctorProviderIds.js";
 import {
-  conciseSetupResult,
+  isSetupFailure,
+  type SetupOptions,
+} from "../application/SetupTypes.js";
+import { isUninstallFailure } from "../application/UninstallFailure.js";
+import { homeDirectoryFromEnvironment } from "../config/homeDirectory.js";
+import { isUpdateFailure } from "../application/UpdateFailure.js";
+import {
   confirmInteractiveSetup,
+  renderSetupDryRun,
   renderInteractiveSetupResult,
   renderSetupProgress,
-} from "../cliSetup.js";
+} from "./interactiveSetup.js";
 import { PRODUCT_IDENTITY } from "../identity.js";
 import { logCliCommand } from "../cliLogging.js";
-import { createSystemDoctorHost } from "../doctorRuntime.js";
 import { CLI_COMMANDS } from "../cliCommandNames.js";
-import type { Logger } from "../logger.js";
+import type { Logger } from "pino";
 import type { CliInstance } from "./types.js";
+import { SUPPORTED_CLIENT_DEFINITIONS } from "../application/SupportedClients.js";
 
+const supportedClientIds = SUPPORTED_CLIENT_DEFINITIONS.map(({ name }) => name);
+const supportedClientSchema = z
+  .string()
+  .refine(
+    (candidate) => supportedClientIds.some((name) => name === candidate),
+    "Unsupported agent integration",
+  );
+const skillClientSchema = z.union([z.literal("shared"), supportedClientSchema]);
+
+/** Register setup, doctor, uninstall, and update CLI commands. */
 export const registerSetupCommands = (
   cli: CliInstance,
   logger: Logger,
+  environment: Readonly<NodeJS.ProcessEnv>,
+): void => {
+  registerSetupCommand(cli, logger, environment);
+  registerDoctorCommand(cli, logger, environment);
+  registerMaintenanceCommands(cli, logger, environment);
+};
+
+const registerSetupCommand = (
+  cli: CliInstance,
+  logger: Logger,
+  environment: Readonly<NodeJS.ProcessEnv>,
 ): void => {
   cli.command(CLI_COMMANDS.setup, {
-    description: "Install requirements and configure agents",
+    description: "Configure agent integrations and optional analysis providers",
     outputPolicy: "agent-only",
     options: z.object({
       yes: z
@@ -34,18 +60,13 @@ export const registerSetupCommands = (
         .default(false)
         .describe("Also approve Hopper installation with --yes"),
       client: z
-        .array(
-          z.enum([
-            "claude_code",
-            "claude_desktop",
-            "codex",
-            "cursor",
-            "gemini_cli",
-            "windsurf",
-          ]),
-        )
+        .array(supportedClientSchema)
         .default([])
         .describe("Agent integration to configure; repeat for multiple agents"),
+      skillClient: z
+        .array(skillClientSchema)
+        .default([])
+        .describe("Existing client skill destination to update; repeatable"),
       allDetected: z
         .boolean()
         .default(false)
@@ -53,7 +74,9 @@ export const registerSetupCommands = (
       skill: z
         .boolean()
         .optional()
-        .describe("Install or skip the bundled REA skill"),
+        .describe(
+          "Override the bundled skill included with agent integrations",
+        ),
       dryRun: z
         .boolean()
         .default(false)
@@ -64,21 +87,59 @@ export const registerSetupCommands = (
         .describe("Use sequential accessible setup prompts"),
     }),
     alias: { yes: "y" },
-    run: ({ options, formatExplicit, agent }) =>
-      logCliCommand(logger, "setup", () =>
-        runSetupCommand({ options, formatExplicit, agent }),
+    run: ({ options, formatExplicit }) =>
+      logCliCommand(
+        logger,
+        CLI_COMMANDS.setup,
+        () => runSetupCommand({ options, formatExplicit }, environment),
+        isSetupFailure,
       ),
   });
+};
+
+const registerDoctorCommand = (
+  cli: CliInstance,
+  logger: Logger,
+  environment: Readonly<NodeJS.ProcessEnv>,
+): void => {
   cli.command(CLI_COMMANDS.doctor, {
     description: "Check whether REA is ready",
     options: z.object({
       target: z.string().optional().describe("Optional app path to check"),
+      client: z
+        .array(supportedClientSchema)
+        .default([])
+        .describe("Agent registration whose readiness is required; repeatable"),
+      provider: z
+        .array(z.enum(DOCTOR_PROVIDER_IDS))
+        .default([])
+        .describe("Deep-analysis provider whose readiness is required"),
+      skill: z
+        .boolean()
+        .optional()
+        .describe("Require the installed REA skill identity to be aligned"),
     }),
     run: ({ options }) =>
-      logCliCommand(logger, "doctor", () =>
-        runDoctor(options.target, createSystemDoctorHost()),
-      ),
+      logCliCommand(logger, "doctor", async () => {
+        const [{ runDoctorOwned }, { createSystemDoctorHost }] =
+          await Promise.all([
+            import("../application/Doctor.js"),
+            import("../doctorRuntime.js"),
+          ]);
+        return runDoctorOwned(
+          options.target,
+          createSystemDoctorHost(environment),
+          doctorScope(options),
+        );
+      }),
   });
+};
+
+const registerMaintenanceCommands = (
+  cli: CliInstance,
+  logger: Logger,
+  environment: Readonly<NodeJS.ProcessEnv>,
+): void => {
   cli.command(CLI_COMMANDS.uninstall, {
     description: "Remove REA-owned agent configuration and skill files",
     options: z.object({
@@ -87,19 +148,44 @@ export const registerSetupCommands = (
         .default(false)
         .describe("Also remove REA caches and state"),
     }),
-    alias: { purgeData: "purge-data" },
     run: ({ options }) =>
-      logCliCommand(logger, "uninstall", () => runUninstall(options.purgeData)),
+      logCliCommand(
+        logger,
+        "uninstall",
+        async () => {
+          const { runUninstall, systemUninstallHost } =
+            await import("../application/Uninstall.js");
+          return runUninstall(
+            options.purgeData,
+            systemUninstallHost(
+              homeDirectoryFromEnvironment(environment, process.platform),
+              undefined,
+              environment,
+            ),
+          );
+        },
+        isUninstallFailure,
+      ),
   });
-  cli.command(CLI_COMMANDS.upgrade, {
-    description: "Upgrade a global npm installation to the latest REA release",
+  cli.command(CLI_COMMANDS.update, {
+    description:
+      "Update this REA installation and verify the installed release",
     run: ({ formatExplicit }) =>
-      logCliCommand(logger, "upgrade", () =>
-        runUpgrade(
-          PRODUCT_IDENTITY.packageVersion,
-          systemUpgradeHost(),
-          formatExplicit ? "structured" : "human",
-        ),
+      logCliCommand(
+        logger,
+        CLI_COMMANDS.update,
+        async () => {
+          const [{ runUpdate }, { systemUpdateHost }] = await Promise.all([
+            import("../application/Update.js"),
+            import("../application/UpdateRuntime.js"),
+          ]);
+          return runUpdate(
+            PRODUCT_IDENTITY.packageVersion,
+            systemUpdateHost(undefined, undefined, environment),
+            formatExplicit ? "structured" : "human",
+          );
+        },
+        isUpdateFailure,
       ),
   });
 };
@@ -108,52 +194,122 @@ interface SetupCommandOptions {
   readonly yes: boolean;
   readonly installHopper: boolean;
   readonly client: readonly string[];
+  readonly skillClient: readonly string[];
   readonly allDetected: boolean;
   readonly skill?: boolean | undefined;
   readonly dryRun: boolean;
   readonly accessible: boolean;
 }
 
-const runSetupCommand = async (input: {
-  readonly options: SetupCommandOptions;
-  readonly formatExplicit: boolean;
-  readonly agent: boolean;
-}) => {
+const runSetupCommand = async (
+  input: {
+    readonly options: SetupCommandOptions;
+    readonly formatExplicit: boolean;
+  },
+  environment: Readonly<NodeJS.ProcessEnv>,
+) => {
   const { options } = input;
-  const interactive =
-    !options.yes &&
-    !options.dryRun &&
-    !input.formatExplicit &&
-    process.stdin.isTTY === true &&
-    process.stderr.isTTY === true;
+  const interactive = setupIsInteractive(options, input.formatExplicit);
   const hasExplicitScope = setupHasExplicitScope(options);
-  if (options.yes && !hasExplicitScope)
-    process.stderr.write(
-      "!  Implicit `rea setup --yes` scope is deprecated; use `--all-detected --skill` to retain it.\n",
-    );
+  const [{ runSetup }, { systemSetupHost }, { createSystemDoctorHost }] =
+    await Promise.all([
+      import("../application/Setup.js"),
+      import("../application/SetupHost.js"),
+      import("../doctorRuntime.js"),
+    ]);
   const result = await runSetup(
-    {
-      approved: options.yes && !options.dryRun,
-      installHopper: options.installHopper,
-      structured: input.formatExplicit || options.dryRun,
-      proposeHopper: !hasExplicitScope || options.installHopper,
-      ...(!hasExplicitScope || options.allDetected
-        ? {}
-        : { clientIds: options.client }),
-      ...(!hasExplicitScope ? {} : { installSkill: options.skill ?? false }),
-      ...(interactive ? { onProgress: renderSetupProgress } : {}),
-    },
-    systemSetupHost(createSystemDoctorHost()),
+    setupRunOptions(input, interactive, hasExplicitScope),
+    systemSetupHost(createSystemDoctorHost(environment), environment),
     interactive
-      ? (actions) => confirmInteractiveSetup(actions, options.accessible)
+      ? (actions, context) =>
+          confirmInteractiveSetup(actions, options.accessible, context)
       : undefined,
   );
-  if (interactive) renderInteractiveSetupResult(result);
-  return input.formatExplicit ? result : conciseSetupResult(result);
+  if (interactive) renderInteractiveSetupResult(result, environment);
+  else if (options.dryRun && !input.formatExplicit && hasInteractiveTerminal())
+    renderSetupDryRun(result.plannedActions);
+  return result;
 };
+
+const setupRunOptions = (
+  input: {
+    readonly options: SetupCommandOptions;
+    readonly formatExplicit: boolean;
+  },
+  interactive: boolean,
+  hasExplicitScope: boolean,
+): SetupOptions => {
+  const { options } = input;
+  const agentIntegrationSelected =
+    options.allDetected ||
+    options.client.length > 0 ||
+    options.skillClient.length > 0;
+  const hasSelectedClients =
+    hasExplicitScope &&
+    !options.allDetected &&
+    (options.client.length > 0 || options.skillClient.length > 0);
+  return {
+    approved: options.yes && !options.dryRun,
+    installHopper: options.installHopper,
+    structured: input.formatExplicit || options.dryRun,
+    dryRun: options.dryRun,
+    allDetectedClients: options.allDetected,
+    proposeHopper: interactive || options.installHopper,
+    ...(hasSelectedClients ? { clientIds: options.client } : {}),
+    ...(options.skillClient.length > 0
+      ? { skillClientIds: options.skillClient }
+      : {}),
+    ...(hasExplicitScope
+      ? { installSkill: options.skill ?? agentIntegrationSelected }
+      : {}),
+    ...(interactive ? { onProgress: renderSetupProgress } : {}),
+    ...(hasSelectedClients
+      ? {
+          readinessScope: {
+            clients: options.client,
+            ...(options.skillClient.length > 0
+              ? { skillClients: options.skillClient }
+              : {}),
+            providers: options.installHopper ? ["hopper"] : [],
+            skill: options.skill ?? agentIntegrationSelected,
+          },
+        }
+      : {}),
+  };
+};
+
+const setupIsInteractive = (
+  options: SetupCommandOptions,
+  formatExplicit: boolean,
+): boolean =>
+  !options.yes &&
+  !options.dryRun &&
+  !formatExplicit &&
+  hasInteractiveTerminal();
+
+const hasInteractiveTerminal = (): boolean =>
+  process.stdin.isTTY === true &&
+  process.stdout.isTTY === true &&
+  process.stderr.isTTY === true;
 
 const setupHasExplicitScope = (options: SetupCommandOptions): boolean =>
   options.allDetected ||
   options.client.length > 0 ||
+  options.skillClient.length > 0 ||
   options.skill !== undefined ||
   options.installHopper;
+
+const doctorScope = (options: {
+  readonly client: readonly string[];
+  readonly provider: readonly string[];
+  readonly skill?: boolean | undefined;
+}): DoctorScope | undefined =>
+  options.client.length === 0 &&
+  options.provider.length === 0 &&
+  options.skill === undefined
+    ? undefined
+    : {
+        clients: options.client,
+        providers: options.provider,
+        skill: options.skill === true,
+      };

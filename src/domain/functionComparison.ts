@@ -1,40 +1,28 @@
+import { canonicalJson } from "./comparisonSemantics.js";
+import { compareUnicodeCodePoints } from "./unicodeCodePointOrder.js";
 import { parseFunctionEvidence } from "./functionDossierEvidence.js";
 import { functionMatch } from "./functionComparisonNormalization.js";
 import {
   functionComparisonResultSchema,
   type FunctionComparisonResult,
 } from "./functionComparisonSchemas.js";
-import {
-  overallStatus,
-  summarize,
-  canonicalJson,
-} from "./functionComparisonResults.js";
+import { overallStatus, summarize } from "./functionComparisonResults.js";
 import { compareDimensions } from "./functionComparisonDimensions.js";
 
-export {
-  functionComparisonInputSchema,
-  functionComparisonResultSchema,
-} from "./functionComparisonSchemas.js";
-
-/** Compare two explicit function Evidence page sets without fuzzy matching. */
+/** Compare two complete function Evidence records without fuzzy matching. */
 export const compareFunctions = (
   leftInput: unknown,
   rightInput: unknown,
-  offset: number,
-  limit: number,
 ): FunctionComparisonResult => {
   const left = parseFunctionEvidence(leftInput);
   const right = parseFunctionEvidence(rightInput);
-  const links = [
-    ...left.evidence.map(({ evidence_id: id }) => id),
-    ...right.evidence.map(({ evidence_id: id }) => id),
-  ];
+  const links = [left.evidence.evidence_id, right.evidence.evidence_id];
   const providersDiffer =
-    canonicalJson(left.provider) !== canonicalJson(right.provider);
-  const dimensions = compareDimensions(left, right, links, providersDiffer);
+    canonicalJson(left.evidence.provider, "Function comparison") !==
+    canonicalJson(right.evidence.provider, "Function comparison");
+  const dimensions = compareDimensions(left, right, { links, providersDiffer });
   const match = functionMatch(left, right);
   const changes = dimensions.filter(({ status }) => status !== "unchanged");
-  const page = changes.slice(offset, offset + limit);
   return functionComparisonResultSchema.parse({
     status: overallStatus(dimensions, match.status),
     function_match: match,
@@ -42,14 +30,7 @@ export const compareFunctions = (
     right_subject_sha256: right.subject.digest.sha256,
     summary: summarize(dimensions),
     dimensions,
-    changes: {
-      items: page,
-      offset,
-      limit,
-      total: changes.length,
-      next_offset:
-        offset + page.length < changes.length ? offset + page.length : null,
-    },
+    changes,
     limitations: [
       ...new Set([
         ...left.limitations.map((item) => `Left: ${item}`),
@@ -60,6 +41,6 @@ export const compareFunctions = (
             ]
           : []),
       ]),
-    ].sort((a, b) => a.localeCompare(b)),
+    ].sort((a, b) => compareUnicodeCodePoints(a, b)),
   });
 };

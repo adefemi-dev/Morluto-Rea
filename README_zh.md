@@ -1,257 +1,304 @@
 <div align="center">
 
-[English](README.md) · **简体中文** · [日本語](README_ja.md) · [한국어](README_ko.md) · [العربية](README_ar.md)
+[English](README.md) · **简体中文** · [繁體中文](README_zh-TW.md) · [日本語](README_ja.md) · [한국어](README_ko.md) · [Türkçe](README_tr.md) · [Русский](README_ru.md) · [Tiếng Việt](README_vi.md) · [ไทย](README_th.md) · [Deutsch](README_de.md) · [Español](README_es.md) · [Français](README_fr.md) · [Українська](README_uk.md) · [Polski](README_pl.md) · [Português (Brasil)](README_pt-BR.md) · [العربية](README_ar.md) · [فارسی](README_fa.md) · [Bahasa Indonesia](README_id.md) · [Italiano](README_it.md)
 
-# REA：逆向工程一切
+# REA：逆向一切
 
-### 一个 CLI 与 MCP 服务器，让编程智能体逆向工程任何程序
+### 通过一个 MCP 服务，逆向分析二进制文件、应用程序和运行时行为。
 
-**看到喜欢的功能。理解它的原理。按照你的方式实现。**
+**看到喜欢的功能，弄清它的工作原理，深入到二进制层面。**
 
 [![npm version](https://img.shields.io/npm/v/rea-agents?style=flat-square&color=cb3837)](https://www.npmjs.com/package/rea-agents)
-[![CI](https://img.shields.io/github/actions/workflow/status/morluto/rea/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/morluto/rea/actions/workflows/ci.yml)
-[![MCP tool catalog](https://img.shields.io/badge/MCP-tool_catalog-5c4ee5?style=flat-square)](#调查工具目录)
-[![Node.js 22+](https://img.shields.io/badge/Node.js-22.19%2B-339933?style=flat-square&logo=nodedotjs&logoColor=white)](https://nodejs.org/)
+[![MCP tool catalog](https://img.shields.io/badge/MCP-tool_catalog-5c4ee5?style=flat-square)](docs/mcp-contracts.md#generated-catalog)
+[![Node.js requirements](https://img.shields.io/badge/Node.js-requirements-339933?style=flat-square&logo=nodedotjs&logoColor=white)](#current-status)
+[![skills.sh](https://skills.sh/b/morluto/rea?style=flat-square)](https://skills.sh/morluto/rea/reverse-engineer-anything)
 [![MIT license](https://img.shields.io/badge/license-MIT-f4c430?style=flat-square)](LICENSE)
+[![Discord](https://img.shields.io/discord/1556595354999332884?logo=discord&logoColor=white&label=Discord&color=5865F2)](https://discord.gg/GkcryMnJDM)
 
-[快速开始](#快速开始) · [从二进制到行为](#从二进制到行为) · [工具目录](#调查工具目录) · [工作原理](#工作原理) · [常见问题](#常见问题)
+<a href="https://trendshift.io/repositories/82054?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-82054" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/82054" alt="morluto%2Frea | Trendshift" width="250" height="55"/></a>
+
+**[网站](https://rea.tools/zh-CN/) · [指南](https://rea.tools/zh-CN/guides/) · [案例](https://rea.tools/zh-CN/showcase/)**
+
+[快速开始](#快速开始) · [REA 的工作原理](#rea-的工作原理) · [可以分析什么](#可以分析什么) · [案例](#案例) · [常见问题](#常见问题) · [文档](#文档)
+
+<code>npx rea-agents setup</code>
 
 <br />
 
-<code>curl -fsSL https://raw.githubusercontent.com/morluto/rea/main/install.sh | bash</code>
+<img src="docs/assets/rea-hopper-analysis.png" alt="REA 在 Hopper 中启动分析桥，检查原生二进制文件" width="1200" />
+
+<br /><br />
+
+<table aria-label="REA 社区">
+<tr>
+<td align="center" width="360">
+  <a href="https://discord.gg/GkcryMnJDM">
+    <img src="docs/assets/discord.svg" height="42" alt="Discord" /><br />
+    <strong>加入逆向工程社区</strong>
+  </a><br />
+  <sub>Discord · 问答 · 成果分享</sub>
+</td>
+</tr>
+</table>
+
+<br />
 
 </div>
 
 ---
 
-看到某个应用中想加入自己产品的功能？即使没有源代码，也可以把应用交给编程智能体。借助 REA，智能体能够调查该功能、理解其工作原理，并按照你的技术栈、设计和需求构建适合你产品的版本。
+在应用中看到一个想加入自己产品的功能？让智能体用 REA 调查它。即使没有源代码，智能体也可以检查应用、解释功能的工作方式、展示证据，并为你的项目实现类似功能。
 
-REA 通过一个 CLI 与 MCP 服务器实现这套流程。智能体可以检查编译后的应用、追踪功能的工作方式，并把了解到的内容用于日常编码。REA 在一个接口背后处理复杂的逆向工程工具。
+REA 将智能体连接到分析工具，用于检查原生二进制文件、JavaScript 和 Electron 应用、.NET 程序集以及网站。你也可以在终端中使用同样的工具。分析在本机运行，结果包含支撑各项结论的证据和相关限制。
 
-## 直接询问智能体
+设置流程会向智能体注册 REA，并安装匹配的工作流指引。原生分析可以使用已有的 Hopper 或 Ghidra；设置流程也可以在你批准后安装 Hopper。静态 JavaScript 分析不需要这两个引擎。
 
-```bash
-npx skills add morluto/rea
-```
-
-然后说：
-
-```text
-设置 REA 并逆向工程“备忘录”应用。解释搜索功能的工作方式，
-说明你是如何得出结论的，然后为我的项目构建类似功能。
-```
-
-“备忘录”只是示例。你可以说出任何想了解的应用，也可以让智能体先从概览开始。
-
-## 从二进制到行为
-
-| 反编译                                                                       | 理解                                                                                   | 重建                                                         |
-| ---------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
-| 打开原生应用或可执行文件，恢复过程、伪代码、汇编、字符串、符号、段和元数据。 | 沿调用者、被调用者、交叉引用和调用图追踪，直到智能体能够解释功能或算法的实际工作方式。 | 将智能体学到的内容变成适合你的技术栈、界面和需求的产品功能。 |
-
-REA 让调查始终以二进制证据为依据。它不会声称能恢复原始源代码，也不会自动克隆整个应用。
-
-## 为什么选择 REA
-
-|                  |                                                                |
-| ---------------- | -------------------------------------------------------------- |
-| **为智能体设计** | 直接询问编译后应用的行为，让智能体搜集证据，而不是猜测。       |
-| **CLI 与 MCP**   | 在终端或编程智能体中使用同一套逆向工程能力。                   |
-| **处理复杂流程** | REA 负责工具设置、打开应用、维持调查过程，并在完成后清理资源。 |
-| **完整工作流**   | 从初步概览推进到伪代码、调用关系、类型和实现线索。             |
-| **本地运行**     | 分析在你的 Mac 上运行；REA 不会把二进制上传到托管式分析服务。  |
-| **保留上下文**   | 连续调查多个二进制文件，无需为每个问题重新开始整个分析过程。   |
+> **[访问 REA 网站](https://rea.tools/zh-CN/)**，查看设置说明、图解指南和真实案例。
 
 ## 快速开始
 
-### 使用编程智能体（推荐）
+### 设置智能体
+
+安装 Node.js 和 npm 后，运行：
 
 ```bash
-npx skills add morluto/rea
-```
-
-让智能体设置 REA。它会检查你的 Mac，说明需要安装的内容，先征得同意，并引导你处理系统提示。如果智能体要求重启以加载完整工具，请在设置后重启。
-
-### 开始之前
-
-- macOS 12 或更高版本
-- Ubuntu 24.04+、Fedora 41+ 或 64 位 Arch Linux
-- Node.js 22.19+ 或 24.11+，以及随 Node 安装的 npm
-
-`rea setup` 会先显示完整变更计划并请求确认。它不会安装或更新 Homebrew、Node.js 或 npm。缺少 [Hopper](https://www.hopperapp.com/) 时，Setup 会提议安装官方软件包；Hopper 是需要单独许可证的独立软件。
-
-如果你已在 64 位 Linux 上安装 Ghidra 12.1.2 PUBLIC 和完整的 64 位 JDK 21，Setup 也可以在批准后登记 `GHIDRA_INSTALL_DIR` 和可选的 `JAVA_HOME`。REA 不会下载、安装或修改 Ghidra 或 Java。Ghidra provider 在隔离的只读 headless 会话中提供清单、反编译、汇编、调用关系、带类型的引用、xref、CFG 与函数 dossier；GUI 状态和修改操作仍不可用。
-
-#### Linux 安装与故障排除
-
-在 Ubuntu 24.04+、Fedora 41+ 和 64 位 Arch Linux 上，REA 会下载 Hopper 官方的 DEB、RPM 或 Arch 软件包，验证发布方提供的大小和校验和，然后通过 `apt-get`、`dnf` 或 `pacman` 安装依赖。非 root 运行时，`pkexec` 会显示系统授权提示；REA 不调用 `sudo`。
-
-默认启动器是 `/opt/hopper/bin/Hopper`。自定义安装可设置 `HOPPER_LAUNCHER_PATH`。如果 Doctor 报告缺少分析引擎，请运行 `ldd /opt/hopper/bin/Hopper | grep 'not found'`，安装缺少的系统库后重新运行 `rea setup`。REA 会在私有 Xvfb 显示器上运行受支持的 Hopper 演示版，并为每个分析会话选择 Hopper 提供的演示模式；无需桌面 `DISPLAY` 或付费许可证，但演示版受厂商限制。Linux 上还应确保 `~/.local/bin` 位于 `PATH` 中。
-
-```bash
-# 1. 安装和配置 REA
-curl -fsSL https://raw.githubusercontent.com/morluto/rea/main/install.sh | bash
 npx rea-agents setup
 ```
 
-如果 macOS 或安装程序要求确认，请完成提示，然后再次运行同一命令。
+选择智能体，检查计划中的变更并批准。设置流程会添加 REA 的 MCP 服务和匹配的工作流指引，并备份已有配置。完成后重启智能体。
 
-### 2. 重启编程智能体
+设置流程支持 Claude Code、Codex、Cursor、Gemini CLI、Grok Build 和[其他智能体](docs/installation.md#supported-agents)。提供方配置和手动注册 MCP 的方法见[安装与设置](docs/installation.md)。
 
-Setup 会检测 Claude Code、Claude Desktop、Codex、Cursor、Gemini CLI、Windsurf 和 Devin。它会自动配置检测到的前六种客户端；由于目前没有明确的本地 MCP 配置边界，检测到 Devin 时只会报告而不会修改。重启已配置的客户端，让它加载 REA。
-
-### 3. 直接询问智能体
-
-你可以直接说出应用名称。编程智能体会找到应用，并把 REA 所需的程序文件交给它。
+### 询问智能体
 
 ```text
-使用 REA 逆向工程“备忘录”应用。解释搜索功能的工作方式，展示证据，
-然后使用 SQLite 为我的项目构建一个类似功能。
+弄清 Notes 应用的搜索功能如何工作，展示证据，并为我的项目实现类似功能。
 ```
 
-如果遇到问题，请运行：
+把 Notes 替换为目标应用，并描述你想了解的功能。
+
+### 使用终端
+
+检查已解包的 JavaScript/Electron 应用目录或 ASAR 文件：
 
 ```bash
-npx -y rea-agents@latest doctor
-rea uninstall
-rea uninstall --purge-data
+npx -y rea-agents@latest analyze-javascript-application /absolute/path/to/app --json
 ```
 
-## 一个提示词，完成一次完整调查
+结果包含模块、导入、Electron 边界及相关证据。将路径替换为你的目标路径，例如 Windows 上的 `"D:/apps/example"`。
 
-```text
-逆向工程“备忘录”应用，找到离线搜索功能的工作方式，解释其控制流，
-并使用 TypeScript 和 SQLite 为我的项目构建一个版本。
-```
-
-| 步骤 | 智能体的操作           | REA 工具                                                         |
-| ---: | ---------------------- | ---------------------------------------------------------------- |
-|    1 | 打开并识别二进制文件   | `open_binary`, `binary_overview`                                 |
-|    2 | 搜索可能的离线搜索线索 | `search_strings`, `search_procedures`, `list_names`              |
-|    3 | 将线索连接到可执行代码 | `find_xrefs_to_name`, `xrefs`, `procedure_callers`               |
-|    4 | 重建相关控制流         | `get_call_graph`, `procedure_callees`, `procedure_info`          |
-|    5 | 反编译相关程序         | `procedure_pseudo_code`, `procedure_assembly`, `batch_decompile` |
-|    6 | 在你的项目中构建该功能 | 适合你的技术栈、产品和需求的代码                                 |
-
-REA 负责第 1–5 步中的二进制分析。第 6 步由智能体使用其常规文件编辑与测试工具完成。
-
-## 智能体可以完成什么
-
-- 在没有源代码时解释某项功能的实现方式。
-- 重建应用的身份验证、存储、更新或网络流程。
-- 恢复足够的结构，以记录未公开的格式或接口。
-- 从字符串或符号追踪到实现可疑行为的代码。
-- 在一个会话中切换两个应用版本并比较实现路径。
-- 调查你喜欢的功能，并为自己的产品构建量身定制的版本。
-- 将恢复的行为转换为产品功能、测试、迁移说明、移植代码或互操作替代品。
-- 分析 Swift 和 Objective-C 元数据。
-- 在 Hopper 中留下名称、注释与书签，使人与智能体的分析互相增强。
-
-## 调查工具目录
-
-| 工具类别       | 数量 | 示例                                                                                                                                          |
-| -------------- | ---: | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| 二进制检查     |   33 | 过程、伪代码、汇编、字符串、名称、段、调用者、被调用者、交叉引用、注释                                                                        |
-| 组合分析       |   10 | `binary_overview`, `analyze_function`, `batch_decompile`, `get_call_graph`, `find_xrefs_to_name`、Swift 与 ObjC 发现                          |
-| macOS 原生工具 |    5 | Mach-O 元数据、代码签名、plist、架构与 Swift 符号还原，无需启动 Hopper                                                                        |
-| 制品图谱       |    2 | 确定性目录、ZIP/APK/IPA 与 ASAR 清单，以及显式选择的事务式提取                                                                                |
-| Managed PE/CLI |    8 | PE/CLI 身份、元数据成员、CIL 哈希、P/Invoke/原生边界声明与验证、应用图谱投影、反编译重建导入、结构化 token 重映射、运行时关联计划与跨版本比较 |
-| 浏览器观察     |    8 | 精确来源 CDP 抓取、bundle/source map 分析、WebMCP 发现、会话时间线、capture diff 与视觉证据                                                   |
-| Electron 分析  |    4 | 限定 canonical 文件根的被动观察、有界静态应用映射，以及基于 Evidence 的静态/运行时对账                                                        |
-| 应用工作流     |    7 | 有界跨层追踪、唯一匹配跨版本图比较、经批准的 Linux 隔离 extracted-module replay、托管运行时表征和重建覆盖闭合                                 |
-| 二进制会话     |   18 | `open_binary`、`binary_session`、证据包、进程、制品与函数比较、残余未知项注册表                                                               |
-
-## 与其他编程智能体一起使用
-
-Setup 会检测 Claude Code、Claude Desktop、Codex、Cursor、Gemini CLI、Windsurf 和 Devin，并自动配置检测到的前六种客户端；检测到 Devin 时只会报告而不会修改。任何支持本地 MCP 服务器的编程智能体都可以使用以下配置连接 REA。
-
-```json
-{
-  "mcpServers": {
-    "rea": {
-      "command": "npx",
-      "args": ["-y", "rea-agents@latest", "mcp"]
-    }
-  }
-}
-```
-
-## 工作原理
-
-```mermaid
-flowchart LR
-    Agent["编程智能体"] --> REA["REA<br/>CLI + MCP"]
-    Terminal["终端"] --> REA
-    REA --> Hopper["Hopper 分析操作"]
-    Hopper --> App["你的应用"]
-    REA --> Ghidra["Ghidra 只读分析<br/>清单 + 函数分析"]
-    Ghidra --> App
-```
-
-CLI 与 MCP 服务器使用相同的分析引擎。终端命令完成后会关闭应用；智能体会话则会在调查期间保持应用打开。
-
-## CLI
-
-上面的智能体工作流是使用 REA 最简单的方式。如果只想在终端中快速了解一个应用：
-
-```bash
-npx -y rea-agents@latest analyze /Applications/Notes.app
-```
-
-运行 `npx -y rea-agents@latest --help` 查看直接反编译和其他选项。
-
-也可以全局安装 `rea` 命令：
+如果需要经常使用，可以安装 `rea` 命令：
 
 ```bash
 npm install --global rea-agents
 rea --help
-rea mcp
 ```
 
-REA 可以直接打开 Mac 的 `.app` 文件夹。如果智能体找不到应用，请告诉它应用安装在哪里。
+原生分析需要先配置分析提供方。原生命令、提供方选择、快照和脚本用法见 [CLI 与 Evidence 指南](docs/cli.md)。
 
-## Hopper 应用行为
+### 更新 REA
 
-REA 会在需要时启动 Hopper，无需预先运行。Hopper 启动器内部会激活应用，因此打开目标时 Hopper 可能出现在其他窗口前。REA 会请求 macOS 在后台启动 Hopper，但无法保证窗口始终位于后台。
+REA 更新较快，新版本经常包含错误修复。请保持安装的版本为最新。
 
-REA 会推导明确的格式和架构参数，以避免常见的 FAT 与 ARM 选择对话框。其他 Hopper 或 macOS 对话框仍可能需要人工响应。关闭 REA 会话会终止桥并删除私有套接字目录，但不会退出用户正在使用的 Hopper 应用。
+通过 npm 安装的 CLI 使用：
 
-## 安全模型
+```bash
+rea update
+```
 
-每个桥会话都使用随机能力令牌和仅限当前用户的 Unix 套接字。协议消息有大小限制，面向调用者的错误不会暴露启动器 stderr 或内部异常原因。Ghidra 会话还使用隔离的临时项目，不会打开或修改用户自己的 Ghidra 项目。
+要更新智能体注册和 skill，请运行更新命令输出的设置命令。
 
-这不是沙箱，也无法防御以同一操作系统用户身份运行的恶意进程。打开不可信二进制文件会让所选本地提供商以当前用户权限进行解析和分析。请按照 [SECURITY.md](SECURITY.md) 中的私密流程报告漏洞。
+如果使用 `npx`，通过以下命令更新智能体设置：
+
+```bash
+npx rea-agents@latest setup
+```
+
+检查设置变更并重启智能体。单次 CLI 操作可使用 `npx rea-agents@latest`，后接所需命令。
+
+## REA 的工作原理
+
+智能体通过 MCP 调用 REA，检查目标并追踪相关代码。REA 返回发现及对应证据。智能体据此提出后续问题、解释行为，或编写并测试实现。CLI 命令使用同样的工作流。
+
+![REA 调查流程：智能体询问本地目标的行为，REA 使用分析工具检查和追踪目标，智能体再利用返回的代码、引用和未知项进行解释、实现与测试。](website/public/assets/figures/rea-investigation-flow.svg)
+
+[打开完整尺寸的图示](website/public/assets/figures/rea-investigation-flow.svg)。
+
+<a id="current-status"></a>
+
+## 可以分析什么
+
+REA 需要 Node.js 22.x（>=22.19）、24.x（>=24.11）或 26+，以及 npm。额外工具和主机支持取决于分析目标：
+
+| 目标                  | REA 返回的内容                                                | 要求与指南                                                                                                             |
+| --------------------- | ------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| 原生二进制文件        | 伪代码、汇编、字符串、符号、调用和引用                        | Hopper、Ghidra 或 IDA；[原生分析](https://rea.tools/zh-CN/guides/native/)                                              |
+| 离线 ELF 布局         | 节、段、原始符号/重定位信息及静态防护机制候选项               | Linux x64 上由调用方提供的 pwntools；[二进制诊断](docs/binary-diagnostics.md)                                          |
+| EVM 字节码            | 分派选择器、字节偏移、推断的参数和状态可变性                  | Linux x64 上的本地原始字节/十六进制输入载体；[离线 EVM 指南](docs/evm-bytecode.md)                                     |
+| 已记录的 Linux 崩溃   | 原始 note 记录、每个已记录线程的寄存器/信号及可选的映射候选项 | Linux x64 上由调用方提供的 pwntools；可选的 GDB/pwndbg；[已记录崩溃](docs/recorded-crashes.md)                         |
+| JavaScript / Electron | 模块、导入、source map、路由、IPC 和原生扩展关系              | Node.js 和 npm；[应用分析](https://rea.tools/zh-CN/guides/javascript/)                                                 |
+| 网站                  | 页面结构、脚本、网络观察结果和按请求获取的截图                | Chrome 系浏览器；[浏览器分析](https://rea.tools/zh-CN/guides/browser/)                                                 |
+| 已保存的网络捕获      | 请求、响应、可访问的载荷和来源位置                            | HAR；原生 mitmproxy 捕获需要 Linux 上的 mitmdump；[捕获指南](docs/web-network-captures.md)                             |
+| 数据包捕获            | 端点、DNS、TLS SNI、协议分布和 HTTP 请求                      | 调用方提供的 tshark 和 capinfos；[pcap 指南](docs/pcap-analysis.md)                                                    |
+| .NET 程序集           | 元数据、CIL 指令、声明的原生依赖和构建对比                    | 静态检查；[托管代码指南](docs/managed-code-analysis.md)                                                                |
+| Android APK           | 清单声明、类、反编译的方法和引用                              | Linux/macOS/Windows x64 上的无界面 JADX 和完整 JDK；[Android 指南](docs/android-analysis.md)                           |
+| Android 设备          | 设备、软件包、进程、日志、转储、屏幕截图以及 APK/文件传输     | 调用方提供的 adb（模拟器或实体设备）；[ADB 指南](docs/adb-device-analysis.md)                                          |
+| JEB 项目              | 引擎支持的项目单元、工件摘要和类型/方法的伪代码               | 由调用方启动、提供 MCP 的 JEB 客户端，通过 REA_JEB_MCP_URL 选择；[JEB 指南](docs/jeb-analysis.md)                      |
+| Android 资源          | 解码后的清单、字符串表、语言区域和版本信息                    | 调用方提供的 Apktool 启动器；[资源指南](docs/apktool-resource-analysis.md)                                             |
+| Flutter 应用          | Dart 快照哈希、按 ABI 的库摘要及引擎构建溯源                  | 无（静态 APK 解析）；[Flutter 指南](docs/flutter-analysis.md)                                                          |
+| 固件                  | 区域、提取结果和转交原生分析的内容                            | Linux 上的 Binwalk / Unblob；[固件指南](docs/firmware-analysis.md)                                                     |
+| 抓包文件              | 指定字段、重复值、过滤条件与解码规则                          | Linux: TShark 4.x + prlimit; [抓包分析指南](docs/packet-captures.md)                                                   |
+| 录制的逻辑信号        | 解码注释、样本范围和诊断信息                                  | Linux: sigrok-cli 0.7.2 + prlimit; [信号记录指南](docs/signal-recordings.md)                                           |
+| 软件包与资源          | 文件清单、摘要、plist、Apple bundle 结构和提取的资源          | [制品与 JavaScript 指南](docs/javascript-artifact-reconstruction.md)、[Apple 应用](docs/apple-application-analysis.md) |
+| 进程行为              | 终端输出、交互、退出和文件系统观察结果，以及运行对比          | 支持原生 PTY 的 Linux/macOS；[进程捕获](docs/process-capture.md)                                                       |
+
+静态 JavaScript 和 .NET 检查读取提供的文件，不运行应用。运行时捕获会以你的用户权限运行目标或与之交互；各运行时指南说明了具体影响。
+
+<a id="choosing-a-deep-analysis-provider"></a>
+
+不同提供方支持的原生格式和主机系统有所不同。请参阅 [Hopper 与 Ghidra 设置](docs/installation.md#hopper)、[IDA 指南](docs/ida-provider.md)和[实验性 Windows Ghidra 支持](docs/windows-ghidra-p0.md)。Ghidra 也支持 [16 位 DOS 分析](docs/ghidra-dos.md)。提供方选择见 [CLI 指南](docs/cli.md#choose-a-provider)。对于最新 npm 版本发布后新增的功能，请查看[发布可用性](docs/installation.md#released-package-and-main)。
+
+## 案例
+
+[![DX-Ball 声音平移、Notion 剪贴板桥接与 TH04 弹幕环案例的插图](docs/assets/rea-showcases.png)](https://rea.tools/zh-CN/showcase/)
+
+### DX-Ball：重建声像计算
+
+沿声音调用追踪到根据位置计算声像的辅助函数，检查指令，将不完整的伪代码转为 C。重建结果通过了 3,205 个原始 x86 测试用例，并复现了编译后函数的全部 63 个字节。
+
+[阅读案例](https://rea.tools/zh-CN/showcase/dx-ball/) ·
+[重建项目仓库](https://github.com/N0zoM1z0/dx-ball)
+
+### Notion：追踪 Electron 剪贴板桥
+
+找到渲染进程的剪贴板 API，沿 preload 和 IPC 追踪到主进程，并检查富格式剪贴板数据。
+
+[阅读案例](https://rea.tools/zh-CN/showcase/notion/)
+
+### TH04：恢复 DOS 环形子弹的计算
+
+检查原始 PC-98 游戏的 16 位指令，恢复固定角度和瞄准角度的计算，并将重建的 C++ 与当年的编译器输出进行对比。
+
+[阅读案例](https://rea.tools/zh-CN/showcase/th04/) ·
+[重建项目仓库](https://github.com/N0zoM1z0/th04)
+
+如果你用 REA 分析了有趣的目标，我们很想了解。欢迎通过 [issue](https://github.com/morluto/rea/issues) 或 [pull request](https://github.com/morluto/rea/pulls) 分享案例，说明目标、你的问题、REA 如何提供帮助，以及你的发现。
 
 ## 常见问题
 
-<details><summary><strong>Hopper 是否需要提前运行？</strong></summary>
+<details>
+<summary><strong>哪些智能体可以使用 REA？</strong></summary>
 
-不需要。REA 会在操作需要时启动 Hopper，也支持已经运行的 Hopper。
-
-</details>
-
-<details><summary><strong>REA 是否包含 Hopper？</strong></summary>
-
-不包含。Setup 可以为你安装 Hopper，但 Hopper 仍是需要单独授权的软件。REA 提供 CLI、MCP 服务器和面向智能体的工作流。
+任何支持本地 MCP 服务的智能体都可以使用。设置流程会配置[受支持的智能体](docs/installation.md#supported-agents)；其他客户端可通过[手动注册 MCP](docs/installation.md#mcp-registry) 使用。
 
 </details>
 
-<details><summary><strong>REA 会上传我的二进制文件吗？</strong></summary>
+<details>
+<summary><strong>需要 Hopper、Ghidra 或 IDA 吗？</strong></summary>
 
-REA 不提供托管分析服务，而是通过本地 Unix 套接字把操作交给 Hopper。你的智能体或模型服务商可能有自己的数据政策，请单独核查。
-
-</details>
-
-<details><summary><strong>REA 能恢复原始源代码吗？</strong></summary>
-
-不能保证。REA 提供伪代码、汇编、符号、字符串、元数据和关系，智能体可据此解释或兼容地重建观察到的行为。
+深入的原生分析需要其中一个引擎。静态 JavaScript 和 .NET 检查不需要原生分析引擎。设置流程可以在你批准后安装 Hopper；Ghidra 和 IDA 则使用已有安装。见[提供方设置](docs/installation.md#hopper)。
 
 </details>
 
-## 开发
+<details>
+<summary><strong>需要先启动 Hopper 吗？</strong></summary>
 
-开发环境、架构、测试和发布说明请参阅 [CONTRIBUTING.md](CONTRIBUTING.md)。
+REA 会在操作需要时启动 Hopper。在 macOS 上，首次运行时可能会出现对话框，让你选择演示模式或激活许可证。见 [Hopper 启动与故障排查](docs/installation.md#launcher-paths-and-troubleshooting)。
+
+</details>
+
+<details>
+<summary><strong>从 skills.sh 安装 skill 有什么作用？</strong></summary>
+
+skill 为智能体提供调查指引。使用 `npx rea-agents setup` 注册 REA 的 MCP 服务并安装匹配的指引，然后重启智能体。见[仅安装 skill](docs/installation.md#skill-only-installation)。
+
+</details>
+
+<details>
+<summary><strong>REA 返回什么代码？</strong></summary>
+
+原生分析返回伪代码和汇编。JavaScript/Electron 分析恢复模块及其关系。智能体利用这些发现编写并测试实现；[案例](#案例)提供了完整示例。
+
+</details>
+
+<details>
+<summary><strong>REA 会上传我的应用吗？</strong></summary>
+
+REA 在本机分析目标。智能体会接收工具结果，其模型提供商有自己的数据政策。
+
+</details>
+
+<details>
+<summary><strong>遇到错误时该怎么办？</strong></summary>
+
+先更新；最近的版本可能已经修复了问题。
+
+通过 npm 安装的 CLI 使用：
+
+```bash
+rea update
+```
+
+通过 `npx` 设置智能体时使用：
+
+```bash
+npx rea-agents@latest setup
+```
+
+如果正在使用智能体，请完成[设置更新](#更新-rea)并重启智能体。重试同一任务。如果问题仍然存在，请[提交 issue](https://github.com/morluto/rea/issues)，附上 REA 版本、目标类型、复现步骤和错误输出。
+
+</details>
+
+## 文档
+
+可以先阅读网站上的[实操指南](https://rea.tools/zh-CN/guides/)。具体选项、前提条件和结果契约见：
+
+- [安装与设置](docs/installation.md)：智能体注册、提供方配置、更新和卸载。
+- [就绪检查与故障排查](docs/installation.md#check-readiness-for-your-task)：诊断特定智能体或分析引擎。
+- [CLI 与 Evidence](docs/cli.md)：命令、提供方选择、快照、导入/导出和退出状态。
+- [MCP 契约](docs/mcp-contracts.md)和[智能体提示词](docs/mcp-prompts.md)：工具结果、会话和引导式调查。
+- [工具目录](docs/mcp-contracts.md#generated-catalog)：构建时生成的工具、提供方和 CLI 命令清单。
+- [路线图](docs/roadmap.md)：计划中的工作和能力跟踪。
+
+请按照 [SECURITY.md](SECURITY.md) 报告漏洞。
+
+## Star 历史
+
+🎉 **GitHub Star 达到 170,000 个，感谢大家！**
+
+感谢每一位使用 REA、报告错误、提出功能需求、测试构建和贡献修复的朋友。
+
+<a href="https://www.star-history.com/?repos=morluto%2Frea&amp;type=date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=morluto/rea&amp;type=date&amp;theme=dark&amp;legend=top-left" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=morluto/rea&amp;type=date" />
+    <img alt="REA 的 GitHub Star 历史" src="https://api.star-history.com/chart?repos=morluto/rea&amp;type=date" />
+  </picture>
+</a>
+
+## 免责声明
+
+负责任使用的相关指引请见 [DISCLAIMER.md](DISCLAIMER.md)。
+
+REA 用于合法的研究、教育、互操作性、软件保存，以及分析你拥有或获准检查的软件。
+
+本项目对非法或未经授权使用的立场涵盖所有 REA 版本、分发渠道和运行平台；
+每份副本仍适用其随附的许可。
+
+## 参与贡献
+
+欢迎帮助改进 REA！你可以[提交 issue](https://github.com/morluto/rea/issues) 报告错误或建议功能，也可以[提交 pull request](https://github.com/morluto/rea/pulls) 改进代码或文档。
+
+开发设置和检查见 [CONTRIBUTING.md](CONTRIBUTING.md)，验证流程见[测试指南](docs/testing.md)，项目结构见[架构图](docs/architecture.mermaid)。
 
 ## 许可证
 
 [MIT](LICENSE)
+
+REA 自行编写的代码采用 MIT 许可；第三方内容保留各自的许可和著作权声明。
+依赖清单、许可原文及外部工具条款见[第三方声明](THIRD_PARTY_NOTICES.md)。
+
+**用户须自行合法取得商用工具及所需使用权**，包括 IDA Pro / Hex-Rays 反编译器、
+Hopper 和 JEB，并遵守各自许可。REA 不提供工具许可、密钥或激活权利；试用版和
+演示版也须遵守厂商对用户、功能、自动化及输出分享的限制。不得使用破解副本、
+窃取或违规共用密钥，也不得绕过许可限制。本指引不变更 MIT 或第三方许可。

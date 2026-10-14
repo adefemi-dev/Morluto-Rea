@@ -20,7 +20,6 @@ export interface GhidraStartupHandshakeOptions {
   readonly parseSessionInfo: (
     value: JsonValue,
   ) => Result<GhidraSessionInfo, GhidraSessionError>;
-  readonly cleanup: () => Promise<void>;
   readonly failure: (
     kind: GhidraSessionFailureKind,
     message: string,
@@ -46,7 +45,6 @@ export async function completeGhidraStartupHandshake(
     const failure = options.deadline.signal.aborted
       ? interruptionFailure(options)
       : ping.error;
-    await options.cleanup();
     return err(failure);
   }
   const parsed = options.parseSessionInfo(ping.value);
@@ -57,7 +55,6 @@ export async function completeGhidraStartupHandshake(
           "Ghidra auto-analysis reached its per-file deadline",
         )
       : parsed.error;
-    await options.cleanup();
     return err(failure);
   }
   return parsed;
@@ -66,7 +63,7 @@ export async function completeGhidraStartupHandshake(
 const interruptionFailure = (
   options: GhidraStartupHandshakeOptions,
 ): GhidraSessionError =>
-  options.deadline.cancelled
+  options.deadline.interruption === "cancelled"
     ? options.failure("cancelled", "Ghidra startup was cancelled")
     : options.failure("timeout", "Ghidra startup deadline elapsed", undefined, {
         timeoutMs: options.startupTimeoutMs,
