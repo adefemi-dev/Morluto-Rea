@@ -29,9 +29,13 @@ fails with `rea: not found`.
      `.mcp.json` uses (measured: 9.4 s cold start, 1.9 s once cached);
    - pwntools: `/opt/rea-pwntools` with pwntools 4.15.0, pyelftools 0.33 and
      unicorn 2.1.2, which REA's ELF layout adapter requires;
-   - Ghidra: the official 12.1.4 archive from the NationalSecurityAgency/ghidra
-     GitHub release, checked against the SHA-256 GitHub reports and extracted
-     to `/opt/ghidra_12.1.4_PUBLIC`.
+   - Ghidra: the official 12.1.4 archive from the `v12.1.4` release of the
+     `adefemi-dev/ghidra-dist` mirror, checked against the official SHA-256
+     pinned in the script and extracted to `/opt/ghidra_12.1.4_PUBLIC`.
+     Cloud sessions reach GitHub release pages only for repositories attached
+     to the session, so the NationalSecurityAgency/ghidra release is not
+     reachable there. Set `GHIDRA_RELEASE_REPO=NationalSecurityAgency/ghidra`
+     where it is.
 
    A failed step does not stop the others, and the script exits 0 so sessions
    still start. Set `STRICT=1` to make any failure exit 1.
@@ -46,7 +50,15 @@ fails with `rea: not found`.
    `rea-agents` 6.4.0 requires `GHIDRA_INSTALL_DIR`. Later releases can also
    find Ghidra through the `/usr/local/bin/ghidraRun` link the script creates.
 
-4. Under **Network access**, allow these hosts (keep package managers allowed;
+4. Give the session access to the mirror: install the Claude GitHub App on
+   `adefemi-dev/ghidra-dist` and select that repository for the session. A
+   mirror release must hold the unmodified official archive; the script
+   rejects any archive whose SHA-256 differs from the pinned official value.
+   To mirror another version, upload its official archive to a `v<version>`
+   release and set `GHIDRA_VERSION` and `GHIDRA_SHA256` from the official
+   release notes.
+
+5. Under **Network access**, allow these hosts (keep package managers allowed;
    PyPI and npm are already on that list):
 
    ```
@@ -56,13 +68,14 @@ fails with `rea: not found`.
    objects.githubusercontent.com
    ```
 
-5. Start a new session and check:
+6. Start a new session and check:
 
    ```bash
    npx -y --prefix=/ rea-agents@6.4.0 doctor --json
    ```
 
-If GitHub is unreachable, the Ghidra step fails with
+If the release cannot be reached, for example because the mirror is not
+attached to the session, the Ghidra step fails with
 `could not resolve the Ghidra 12.1.4 release asset` while the other steps still
 finish. To install from an archive you supply instead, set `GHIDRA_ZIP` to its
 absolute path and `GHIDRA_SHA256` to the checksum published on the release
@@ -200,9 +213,14 @@ analysis that needs REA's tools.
   launcher replacement, and a blocked GitHub API (the other steps still
   completed). The pwntools and REA pre-download steps ran for real, and
   `inspect-binary-layout /usr/bin/ls` then returned 31 sections and 128
-  symbols through the script-built pwntools environment. A real Ghidra
-  download was not possible from the session that wrote it, because its
-  network policy blocks that repository's release pages.
+  symbols through the script-built pwntools environment. The
+  NationalSecurityAgency/ghidra release pages were blocked from that session.
+- Cloud mirror: run from inside a cloud session with `adefemi-dev/ghidra-dist`
+  attached, the script downloaded the 12.1.4 archive from the mirror, matched
+  the pinned SHA-256, installed it and linked `ghidraRun`; a rerun changed
+  nothing, and a wrong `GHIDRA_SHA256` or an unpinned version failed before
+  downloading. Whether the environment's setup phase, which runs before a
+  session starts, has the same repository access was not tested.
 - Windows: confirmed on one Windows machine with the Store build of Claude
   Desktop, Node.js 24.16.0, Temurin JDK 21.0.12 and Ghidra 12.1.4. After the
   private-file registration above, a Chat tab session opened
