@@ -282,6 +282,36 @@ describe("GhidraClient captured source snapshot", () => {
     }
   });
 
+  it("reports a failed source admission as not started until a later startup succeeds", async () => {
+    const root = await createTestTempDirectory("rea-ghidra-admission-");
+    const source = join(root, "selected.bin");
+    const bytes = Buffer.from("REA Ghidra admission fixture");
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    const launcher = new FixtureLauncher();
+    const client = clientFor(launcher, {
+      targetPath: source,
+      targetSha256: sha256,
+    });
+
+    await expect(client.start()).resolves.toMatchObject({ ok: false });
+    expect(launcher.processes).toHaveLength(0);
+    // A session that reuses this client must replace it rather than probe
+    // health, which would launch Ghidra against whatever the path holds then.
+    expect(client.operationHealthSnapshot()).toEqual({
+      state: "not_started",
+      stage: null,
+      retryAction: "retry",
+      exitCode: null,
+      requests: [],
+    });
+
+    await writeFile(source, bytes);
+    await expect(client.start()).resolves.toMatchObject({ ok: true });
+    expect(client.operationHealthSnapshot()).toBeUndefined();
+    await client.close();
+    expect(client.operationHealthSnapshot()).toBeUndefined();
+  });
+
   it("hashes complete private snapshots with bounded chunks and abortable reads", async () => {
     const root = await createTestTempDirectory("rea-ghidra-hash-");
     const source = join(root, "firmware.bin");
