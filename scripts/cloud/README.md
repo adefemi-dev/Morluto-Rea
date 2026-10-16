@@ -77,7 +77,9 @@ fails with `rea: not found`.
 If the release cannot be reached, for example because the mirror is not
 attached to the session, the Ghidra step fails with
 `could not resolve the Ghidra 12.1.4 release asset` while the other steps still
-finish. To install from an archive you supply instead, set `GHIDRA_ZIP` to its
+finish. A private mirror answers unauthenticated requests with 404, so the
+script sends `GH_TOKEN`, or `GITHUB_TOKEN` when `GH_TOKEN` is unset, as a bearer
+token when either is present. To install from an archive you supply instead, set `GHIDRA_ZIP` to its
 absolute path and `GHIDRA_SHA256` to the checksum published on the release
 page.
 
