@@ -25,7 +25,7 @@ fails with `rea: not found`.
 
 ### How Ghidra and pwntools get installed
 
-Two things run [`claude-cloud-setup.sh`](claude-cloud-setup.sh). Its four
+Two things run [`claude-cloud-setup.sh`](claude-cloud-setup.sh). Its six
 steps are idempotent and each runs on its own:
 
 - prerequisites: a full JDK 21, `procps`, `unzip`, `curl`, and Python venv
@@ -36,7 +36,19 @@ steps are idempotent and each runs on its own:
   unicorn 2.1.2, which REA's ELF layout adapter requires;
 - Ghidra: the official 12.1.4 archive from this repository's
   `Ghidra_12.1.4_build` release, checked against the official SHA-256 pinned
-  in the script and extracted to `/opt/ghidra_12.1.4_PUBLIC`.
+  in the script and extracted to `/opt/ghidra_12.1.4_PUBLIC`;
+- JADX: the `jadx-headless-mcp` 0.7.1 JAR REA pins for Android analysis,
+  checked against REA's pinned SHA-256 and stored at
+  `/opt/rea-jadx/jadx-headless-mcp-0.7.1-all.jar`;
+- Hopper, only when the environment sets `INSTALL_HOPPER=1`: if `rea doctor`
+  does not report an installed Hopper, REA's own installer
+  (`rea setup --yes --install-hopper`) downloads the Hopper Linux demo from
+  `www.hopperapp.com`, verifies it, and installs it with its Xvfb
+  dependencies. Hopper is commercial software; the demo has vendor-defined
+  limits. Without `--client`, this configures no agent. Setting the variable
+  is the operator's approval of that installation. When Hopper is installed
+  but another Hopper check fails, the step reports REA's remediation instead
+  of reinstalling.
 
 1. **The environment's setup script.** It runs before Claude Code starts, and
    the filesystem it leaves is cached and reused by later sessions for about
@@ -89,9 +101,11 @@ stops the session from starting. `STRICT=1` makes it exit 1 anyway.
    ```
    GHIDRA_INSTALL_DIR=/opt/ghidra_12.1.4_PUBLIC
    REA_PWNTOOLS_PYTHON=/opt/rea-pwntools/bin/python
+   REA_JADX_MCP_JAR=/opt/rea-jadx/jadx-headless-mcp-0.7.1-all.jar
+   INSTALL_HOPPER=1
    ```
 
-   `rea-agents` 6.4.0 requires `GHIDRA_INSTALL_DIR`. Later releases can also
+   Leave out `INSTALL_HOPPER=1` to skip Hopper. `rea-agents` 6.4.0 requires `GHIDRA_INSTALL_DIR`. Later releases can also
    find Ghidra through the `/usr/local/bin/ghidraRun` link the script creates.
 
 5. Under **Network access**, allow these hosts (keep package managers allowed;
@@ -102,6 +116,7 @@ stops the session from starting. `STRICT=1` makes it exit 1 anyway.
    github.com
    release-assets.githubusercontent.com
    objects.githubusercontent.com
+   www.hopperapp.com
    ```
 
 6. Start a new session with only this repository selected and check:
@@ -124,6 +139,15 @@ checksum published on the release page. To mirror another Ghidra version, set
 `GHIDRA_VERSION` and `GHIDRA_SHA256` from the official release notes; the
 public-URL fallback needs a pinned file name, so add one to
 `official_asset_name` too.
+
+### IDA in cloud sessions
+
+The setup script does not install IDA. REA uses IDA through a separate IDA MCP
+server ([IDA provider](../../docs/ida-provider.md)): either an IDA GUI that is
+already open, which a cloud session does not have, or headless `idalib`, which
+needs an IDA Pro installation and license that REA never installs or
+activates. IDA is proprietary, so it must not be uploaded to this public
+repository's releases.
 
 ## Claude Desktop on Windows
 
@@ -277,6 +301,16 @@ analysis that needs REA's tools.
   present before the first request, `open_binary` and
   `procedure_pseudo_code` worked through Ghidra 12.1.4; after a first request
   had failed, the same server kept reporting `executable_missing`.
+- JADX in a cloud session: the script downloaded the pinned JAR and matched
+  its SHA-256. Through the REA 6.4.0 MCP server, `inspect_android_package`,
+  `inspect_android_class` and `inspect_android_method` (`onCreate` of
+  `org.fdroid.ui.crash.CrashActivity`) succeeded on the public F-Droid APK.
+  On that APK, `search_android_classes` failed closed with "JADX class
+  inventory is duplicated or differs from the loaded class count".
+- Hopper: not yet verified. In the testing session `www.hopperapp.com` was not
+  on the network allowlist, so the step failed with REA's message "REA could
+  not download or unpack the official Hopper package"; installation and
+  analysis are untested.
 - Windows: confirmed on one Windows machine with the Store build of Claude
   Desktop, Node.js 24.16.0, Temurin JDK 21.0.12 and Ghidra 12.1.4. After the
   private-file registration above, a Chat tab session opened

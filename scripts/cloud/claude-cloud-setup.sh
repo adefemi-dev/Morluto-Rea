@@ -27,11 +27,21 @@
 #      them), verifies it against the official SHA-256, extracts it under
 #      GHIDRA_PREFIX (default /opt), and links ghidraRun into BIN_DIR (default
 #      /usr/local/bin).
+#   5. JADX: downloads the jadx-headless-mcp 0.7.1 JAR that REA pins for
+#      Android analysis, checks REA's pinned SHA-256, and stores it at
+#      JADX_JAR (default /opt/rea-jadx/jadx-headless-mcp-0.7.1-all.jar).
+#   6. Hopper, only with INSTALL_HOPPER=1: when `rea doctor` does not report an
+#      installed Hopper, runs `rea setup --yes --install-hopper`, REA's own
+#      installer, which downloads the Hopper Linux demo from www.hopperapp.com,
+#      verifies it, and installs it with its Xvfb dependencies. Hopper is
+#      commercial software; the demo has vendor-defined limits. Setting
+#      INSTALL_HOPPER=1 in the environment settings is the operator's approval.
 #
 # After it runs, add these environment variables in the same environment
 # settings so the REA MCP server sees the installations:
 #   GHIDRA_INSTALL_DIR=/opt/ghidra_12.1.4_PUBLIC
 #   REA_PWNTOOLS_PYTHON=/opt/rea-pwntools/bin/python
+#   REA_JADX_MCP_JAR=/opt/rea-jadx/jadx-headless-mcp-0.7.1-all.jar
 # rea-agents 6.4.0 requires GHIDRA_INSTALL_DIR. Later releases also discover
 # Ghidra through the ghidraRun PATH link when the variable is unset.
 #
@@ -60,6 +70,11 @@
 #                    (keep it equal to the version pinned in .mcp.json).
 #   PWNTOOLS_VENV    pwntools environment directory, default /opt/rea-pwntools.
 #   SKIP_PWNTOOLS=1  Skip step 3.
+#   JADX_JAR         Absolute JADX JAR path, default
+#                    /opt/rea-jadx/jadx-headless-mcp-0.7.1-all.jar. An existing
+#                    file with another digest is never replaced.
+#   SKIP_JADX=1      Skip step 5.
+#   INSTALL_HOPPER=1 Run step 6; it is skipped otherwise.
 #   LOG_FILE         Log file, default /var/log/rea-cloud-setup.log; set it
 #                    empty to disable.
 #   SUMMARY_FILE     Optional file that receives the step summary lines.
@@ -77,6 +92,10 @@ BIN_DIR="${BIN_DIR:-/usr/local/bin}"
 REA_VERSION="${REA_VERSION:-6.4.0}"
 PWNTOOLS_VENV="${PWNTOOLS_VENV:-/opt/rea-pwntools}"
 PWNTOOLS_PINS=(pwntools==4.15.0 pyelftools==0.33 unicorn==2.1.2)
+JADX_JAR="${JADX_JAR:-/opt/rea-jadx/jadx-headless-mcp-0.7.1-all.jar}"
+# Pinned by REA (docs/android-analysis.md, src/android/JadxRelease.ts).
+JADX_URL="https://github.com/1013503897/jadx-headless-mcp/releases/download/v0.7.1/jadx-headless-mcp-0.7.1-all.jar"
+JADX_SHA256="6e5eacf500b64292bfb73c49797c1958f6ee44646e43e868039ae7feb573ff75"
 GHIDRA_DIR="${GHIDRA_PREFIX}/ghidra_${GHIDRA_VERSION}_PUBLIC"
 GHIDRA_RELEASE_REPO="${GHIDRA_RELEASE_REPO:-adefemi-dev/Morluto-Rea}"
 GHIDRA_RELEASE_TAG="${GHIDRA_RELEASE_TAG:-Ghidra_${GHIDRA_VERSION}_build}"
@@ -300,6 +319,82 @@ install_pwntools() {
   log "installed ${PWNTOOLS_PINS[*]} at ${PWNTOOLS_VENV}"
 }
 
+install_jadx() {
+  local tmp
+  case "$JADX_JAR" in
+    /*) ;;
+    *) die "JADX_JAR must be an absolute path; REA rejects a relative REA_JADX_MCP_JAR (got ${JADX_JAR})" ;;
+  esac
+  if [ -e "$JADX_JAR" ] || [ -L "$JADX_JAR" ]; then
+    { [ -f "$JADX_JAR" ] && [ "$(sha256sum "$JADX_JAR" | awk '{print $1}')" = "$JADX_SHA256" ]; } ||
+      die "${JADX_JAR} exists but is not the pinned JADX 0.7.1 JAR; refusing to replace it"
+    log "JADX JAR already present at ${JADX_JAR}"
+    return
+  fi
+  WORK_DIR="$(mktemp -d)"
+  trap cleanup EXIT
+  tmp="${WORK_DIR}/jadx.jar"
+  log "downloading ${JADX_URL}"
+  curl -fSL --retry 3 -o "$tmp" "$JADX_URL" || die "could not download ${JADX_URL}"
+  [ "$(sha256sum "$tmp" | awk '{print $1}')" = "$JADX_SHA256" ] ||
+    die "SHA-256 mismatch for the JADX JAR; expected ${JADX_SHA256}"
+  chmod 0644 "$tmp"
+  as_root mkdir -p "$(dirname "$JADX_JAR")"
+  as_root mv -n "$tmp" "$JADX_JAR"
+  [ "$(sha256sum "$JADX_JAR" | awk '{print $1}')" = "$JADX_SHA256" ] ||
+    die "${JADX_JAR} appeared during installation and is not the pinned JAR"
+  log "installed the JADX JAR at ${JADX_JAR} (SHA-256 verified)"
+}
+
+# Reads `rea doctor --provider hopper` and prints one line: "installed" when
+# every Hopper check passes, "runtime" and the failing checks when Hopper is
+# installed but another Hopper check fails, or "missing".
+hopper_state() {
+  (cd / && npx -y --prefix=/ "rea-agents@${REA_VERSION}" doctor --provider hopper --json 2>/dev/null) |
+    python3 -c '
+import json, sys
+try:
+    report = json.load(sys.stdin)
+except ValueError:
+    print("missing")
+    sys.exit()
+checks = [c for c in report.get("checks", []) if str(c.get("name", "")).startswith("hopper")]
+installation = [c for c in checks if c.get("name") == "hopper"]
+failing = [c for c in checks if not c.get("ok")]
+if not installation or not installation[0].get("ok"):
+    print("missing")
+elif failing:
+    print("runtime " + "; ".join("%s: %s" % (c.get("name"), c.get("remediation") or c.get("detail")) for c in failing))
+else:
+    print("installed")
+'
+}
+
+# Uses REA's own installer, which verifies the official package before
+# installing it; without --client it configures no agent integration. It runs
+# only after the operator opts in with INSTALL_HOPPER=1, and installs only when
+# Hopper itself is missing, never to repair host runtime configuration.
+install_hopper() {
+  local state
+  command -v npx >/dev/null 2>&1 || die "npx not found; cannot run REA's Hopper installer"
+  state="$(hopper_state)"
+  case "$state" in
+    installed)
+      log "Hopper already installed and reported ready by rea doctor"
+      return
+      ;;
+    runtime*) die "Hopper is installed but not ready: ${state#runtime }" ;;
+  esac
+  # As a non-root user, REA's installer elevates through pkexec, which cloud
+  # containers do not provide; cloud setup scripts and hooks run as root.
+  [ "$(id -u)" -eq 0 ] || die "installing Hopper needs root; run this script as root"
+  (cd / && npx -y --prefix=/ "rea-agents@${REA_VERSION}" setup --yes --install-hopper) >&2 ||
+    die "rea setup --install-hopper failed"
+  state="$(hopper_state)"
+  [ "$state" = installed ] || die "rea doctor does not report Hopper as ready after installation: ${state}"
+  log "installed Hopper with rea setup"
+}
+
 install_ghidra_and_link() {
   check_java_major
   install_ghidra
@@ -338,6 +433,16 @@ else
   run_step "pwntools" install_pwntools
 fi
 run_step "Ghidra ${GHIDRA_VERSION}" install_ghidra_and_link
+if [ "${SKIP_JADX:-0}" = 1 ]; then
+  STEP_RESULTS+=("skipped JADX (SKIP_JADX=1)")
+else
+  run_step "JADX" install_jadx
+fi
+if [ "${INSTALL_HOPPER:-0}" = 1 ]; then
+  run_step "Hopper" install_hopper
+else
+  STEP_RESULTS+=("skipped Hopper (set INSTALL_HOPPER=1 to install it)")
+fi
 
 log "=== summary"
 for result in "${STEP_RESULTS[@]}"; do
@@ -349,6 +454,7 @@ fi
 log "environment variables for the REA MCP server:"
 log "  GHIDRA_INSTALL_DIR=${GHIDRA_DIR}"
 log "  REA_PWNTOOLS_PYTHON=${PWNTOOLS_VENV}/bin/python"
+log "  REA_JADX_MCP_JAR=${JADX_JAR}"
 log "check inside a session with: npx -y --prefix=/ rea-agents@${REA_VERSION} doctor --json"
 if [ "$FAILED" -eq 1 ] && [ "${STRICT:-0}" = 1 ]; then
   exit 1
