@@ -2,9 +2,13 @@
 # Setup script for a Claude Code cloud environment that uses REA with Ghidra.
 #
 # Paste this file's contents into the environment's "Setup script" field
-# (claude.ai > cloud environment menu > Edit). It is not part of REA's
-# installer: `rea setup` never installs Java or Ghidra, and this script is
-# operator-owned environment provisioning for disposable cloud containers.
+# (claude.ai > cloud environment menu > Edit). The repository's SessionStart
+# hook (.claude/settings.json -> scripts/cloud/session-start.sh) also runs it at
+# the start of every cloud session, because the setup script runs only when the
+# environment cache is rebuilt and possibly without GitHub credentials.
+# It is not part of REA's installer: `rea setup` never installs Java or
+# Ghidra, and this script is operator-owned environment provisioning for
+# disposable cloud containers.
 #
 # What it does, idempotently. Each step runs on its own, so one failure (for
 # example a blocked download) does not stop the others; a summary at the end
@@ -18,10 +22,11 @@
 #      /opt/rea-pwntools) with the exact versions REA's ELF layout adapter
 #      requires (pwntools 4.15.0, pyelftools 0.33, unicorn 2.1.2).
 #   4. Ghidra: downloads the official release archive from a GitHub release
-#      (default: the operator's adefemi-dev/ghidra-dist mirror, because cloud
-#      sessions can reach only repositories attached to them), verifies it
-#      against the official SHA-256, extracts it under GHIDRA_PREFIX (default
-#      /opt), and links ghidraRun into BIN_DIR (default /usr/local/bin).
+#      (default: the Ghidra_<version>_build release of adefemi-dev/Morluto-Rea,
+#      because cloud sessions reach GitHub only for repositories attached to
+#      them), verifies it against the official SHA-256, extracts it under
+#      GHIDRA_PREFIX (default /opt), and links ghidraRun into BIN_DIR (default
+#      /usr/local/bin).
 #
 # After it runs, add these environment variables in the same environment
 # settings so the REA MCP server sees the installations:
@@ -30,17 +35,19 @@
 # rea-agents 6.4.0 requires GHIDRA_INSTALL_DIR. Later releases also discover
 # Ghidra through the ghidraRun PATH link when the variable is unset.
 #
-# The script exits 0 even when a step fails, so a blocked download cannot
-# stop sessions from starting. Set STRICT=1 to exit 1 when any step fails.
+# The script exits 0 even when a step fails, because a setup script that exits
+# non-zero stops the session from starting. Set STRICT=1 to exit 1 when any
+# step fails. All output is also appended to LOG_FILE so a session can read
+# what happened during setup.
 #
 # Optional overrides:
 #   GHIDRA_VERSION   Ghidra release, default 12.1.4 (REA accepts 12.1.x and
 #                    verifies its bridge with 12.1.4).
 #   GHIDRA_RELEASE_REPO  GitHub owner/repo holding the release, default
-#                    adefemi-dev/ghidra-dist. Use NationalSecurityAgency/ghidra
+#                    adefemi-dev/Morluto-Rea. Use NationalSecurityAgency/ghidra
 #                    where the official repository is reachable.
-#   GHIDRA_RELEASE_TAG   Release tag, default v<version> for a mirror and
-#                    Ghidra_<version>_build for NationalSecurityAgency/ghidra.
+#   GHIDRA_RELEASE_TAG   Release tag, default Ghidra_<version>_build (the
+#                    official tag name).
 #   GHIDRA_SHA256    Expected archive SHA-256. Defaults to the official value
 #                    pinned below for known versions; required otherwise.
 #   GH_TOKEN         Optional GitHub token for a private release repository
@@ -53,7 +60,16 @@
 #                    (keep it equal to the version pinned in .mcp.json).
 #   PWNTOOLS_VENV    pwntools environment directory, default /opt/rea-pwntools.
 #   SKIP_PWNTOOLS=1  Skip step 3.
+#   LOG_FILE         Log file, default /var/log/rea-cloud-setup.log; set it
+#                    empty to disable.
+#   SUMMARY_FILE     Optional file that receives the step summary lines.
 set -euo pipefail
+
+LOG_FILE="${LOG_FILE-/var/log/rea-cloud-setup.log}"
+if [ -n "$LOG_FILE" ] && mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null &&
+  printf '\n[rea-cloud-setup] === %s start\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$LOG_FILE" 2>/dev/null; then
+  exec 2> >(tee -a "$LOG_FILE" >&2)
+fi
 
 GHIDRA_VERSION="${GHIDRA_VERSION:-12.1.4}"
 GHIDRA_PREFIX="${GHIDRA_PREFIX:-/opt}"
@@ -62,12 +78,8 @@ REA_VERSION="${REA_VERSION:-6.4.0}"
 PWNTOOLS_VENV="${PWNTOOLS_VENV:-/opt/rea-pwntools}"
 PWNTOOLS_PINS=(pwntools==4.15.0 pyelftools==0.33 unicorn==2.1.2)
 GHIDRA_DIR="${GHIDRA_PREFIX}/ghidra_${GHIDRA_VERSION}_PUBLIC"
-GHIDRA_RELEASE_REPO="${GHIDRA_RELEASE_REPO:-adefemi-dev/ghidra-dist}"
-if [ "$GHIDRA_RELEASE_REPO" = "NationalSecurityAgency/ghidra" ]; then
-  GHIDRA_RELEASE_TAG="${GHIDRA_RELEASE_TAG:-Ghidra_${GHIDRA_VERSION}_build}"
-else
-  GHIDRA_RELEASE_TAG="${GHIDRA_RELEASE_TAG:-v${GHIDRA_VERSION}}"
-fi
+GHIDRA_RELEASE_REPO="${GHIDRA_RELEASE_REPO:-adefemi-dev/Morluto-Rea}"
+GHIDRA_RELEASE_TAG="${GHIDRA_RELEASE_TAG:-Ghidra_${GHIDRA_VERSION}_build}"
 RELEASE_API="https://api.github.com/repos/${GHIDRA_RELEASE_REPO}/releases/tags/${GHIDRA_RELEASE_TAG}"
 
 # Official archive checksums. A mirror's own digest only shows the upload was
@@ -75,6 +87,14 @@ RELEASE_API="https://api.github.com/repos/${GHIDRA_RELEASE_REPO}/releases/tags/$
 official_sha256() {
   case "$1" in
     12.1.4) printf '%s\n' ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db ;;
+    *) return 1 ;;
+  esac
+}
+
+# Official archive file names, for the public download URL that needs no API.
+official_asset_name() {
+  case "$1" in
+    12.1.4) printf '%s\n' ghidra_12.1.4_PUBLIC_20260921.zip ;;
     *) return 1 ;;
   esac
 }
@@ -168,20 +188,36 @@ print(asset["name"], asset["url"], sha)
 ' "$GHIDRA_VERSION"
 }
 
+# Tries the API asset url first (it serves private repositories through
+# credentials), then the public download url without credentials, which needs
+# no API call and works for a public repository when no proxy supplies
+# credentials, for example during the environment's setup phase.
 download_ghidra() {
-  local work="$1" asset name url api_sha expected
-  asset="$(resolve_release_asset)" ||
-    die "could not resolve the Ghidra ${GHIDRA_VERSION} release asset from ${RELEASE_API}"
-  read -r name url api_sha <<<"$asset"
+  local work="$1" asset name url api_sha expected public_name
   expected="${GHIDRA_SHA256:-$(official_sha256 "$GHIDRA_VERSION" || true)}"
   [ -n "$expected" ] || die "no official SHA-256 is pinned for Ghidra ${GHIDRA_VERSION}; set GHIDRA_SHA256 from the official release notes"
-  if [ -n "$api_sha" ] && [ "$expected" != "$api_sha" ]; then
-    die "${GHIDRA_RELEASE_REPO} reports SHA-256 ${api_sha} for ${name}, not the expected ${expected}"
-  fi
-  log "downloading ${name} from ${GHIDRA_RELEASE_REPO} ${GHIDRA_RELEASE_TAG}"
-  github_curl -o "${work}/${name}" -H 'Accept: application/octet-stream' "$url"
   printf '%s\n' "$expected" >"${work}/expected.sha256"
-  printf '%s\n' "${work}/${name}"
+  if asset="$(resolve_release_asset)"; then
+    read -r name url api_sha <<<"$asset"
+    if [ -n "$api_sha" ] && [ "$expected" != "$api_sha" ]; then
+      die "${GHIDRA_RELEASE_REPO} reports SHA-256 ${api_sha} for ${name}, not the expected ${expected}"
+    fi
+    log "downloading ${name} from ${GHIDRA_RELEASE_REPO} ${GHIDRA_RELEASE_TAG} through the API"
+    if github_curl -o "${work}/${name}" -H 'Accept: application/octet-stream' "$url"; then
+      printf '%s\n' "${work}/${name}"
+      return
+    fi
+    log "API download failed"
+  else
+    log "could not resolve the release asset from ${RELEASE_API}"
+  fi
+  public_name="$(official_asset_name "$GHIDRA_VERSION")" ||
+    die "could not download Ghidra ${GHIDRA_VERSION} from ${RELEASE_API}, and no official file name is pinned for a public download"
+  url="https://github.com/${GHIDRA_RELEASE_REPO}/releases/download/${GHIDRA_RELEASE_TAG}/${public_name}"
+  log "downloading ${public_name} from ${url}"
+  curl -fSL --retry 3 -o "${work}/${public_name}" "$url" ||
+    die "could not download Ghidra ${GHIDRA_VERSION} from ${RELEASE_API} or ${url}"
+  printf '%s\n' "${work}/${public_name}"
 }
 
 verify_sha256() {
@@ -307,6 +343,9 @@ log "=== summary"
 for result in "${STEP_RESULTS[@]}"; do
   log "$result"
 done
+if [ -n "${SUMMARY_FILE:-}" ]; then
+  printf '%s\n' "${STEP_RESULTS[@]}" >"$SUMMARY_FILE"
+fi
 log "environment variables for the REA MCP server:"
 log "  GHIDRA_INSTALL_DIR=${GHIDRA_DIR}"
 log "  REA_PWNTOOLS_PYTHON=${PWNTOOLS_VENV}/bin/python"
