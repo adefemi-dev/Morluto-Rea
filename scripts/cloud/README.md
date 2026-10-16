@@ -40,11 +40,15 @@ steps are idempotent and each runs on its own:
 - JADX: the `jadx-headless-mcp` 0.7.1 JAR REA pins for Android analysis,
   checked against REA's pinned SHA-256 and stored at
   `/opt/rea-jadx/jadx-headless-mcp-0.7.1-all.jar`;
-- Hopper: when `rea doctor` does not already report a working Hopper, REA's
-  own installer (`rea setup --yes --install-hopper`) downloads the Hopper
-  Linux demo from `www.hopperapp.com`, verifies it, and installs it with its
-  Xvfb dependencies. Hopper is commercial software; the demo has
-  vendor-defined limits. Without `--client`, this configures no agent.
+- Hopper, only when the environment sets `INSTALL_HOPPER=1`: if `rea doctor`
+  does not report an installed Hopper, REA's own installer
+  (`rea setup --yes --install-hopper`) downloads the Hopper Linux demo from
+  `www.hopperapp.com`, verifies it, and installs it with its Xvfb
+  dependencies. Hopper is commercial software; the demo has vendor-defined
+  limits. Without `--client`, this configures no agent. Setting the variable
+  is the operator's approval of that installation. When Hopper is installed
+  but another Hopper check fails, the step reports REA's remediation instead
+  of reinstalling.
 
 1. **The environment's setup script.** It runs before Claude Code starts, and
    the filesystem it leaves is cached and reused by later sessions for about
@@ -98,9 +102,10 @@ stops the session from starting. `STRICT=1` makes it exit 1 anyway.
    GHIDRA_INSTALL_DIR=/opt/ghidra_12.1.4_PUBLIC
    REA_PWNTOOLS_PYTHON=/opt/rea-pwntools/bin/python
    REA_JADX_MCP_JAR=/opt/rea-jadx/jadx-headless-mcp-0.7.1-all.jar
+   INSTALL_HOPPER=1
    ```
 
-   `rea-agents` 6.4.0 requires `GHIDRA_INSTALL_DIR`. Later releases can also
+   Leave out `INSTALL_HOPPER=1` to skip Hopper. `rea-agents` 6.4.0 requires `GHIDRA_INSTALL_DIR`. Later releases can also
    find Ghidra through the `/usr/local/bin/ghidraRun` link the script creates.
 
 5. Under **Network access**, allow these hosts (keep package managers allowed;
