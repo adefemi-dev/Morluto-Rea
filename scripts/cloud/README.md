@@ -4,43 +4,87 @@ This fork-local guide covers the three places you can chat with Claude and
 what each needs to use REA. REA is a local-only MCP server: something on the
 same machine as the analysis target must launch it.
 
-| Surface                            | REA skill                     | REA MCP tools                    | Ghidra                          |
-| ---------------------------------- | ----------------------------- | -------------------------------- | ------------------------------- |
-| Claude Code cloud sessions         | Account-synced                | Yes, from `.mcp.json`            | Yes, via the setup script below |
-| Claude Desktop / local Claude Code | Account-synced or `rea setup` | Yes, via `rea setup`             | Yes, your own installation      |
-| claude.ai web and mobile chat      | Account-synced                | No (cannot launch local servers) | No                              |
+| Surface                            | REA skill                     | REA MCP tools                    | Ghidra                                                |
+| ---------------------------------- | ----------------------------- | -------------------------------- | ----------------------------------------------------- |
+| Claude Code cloud sessions         | Account-synced                | Yes, from `.mcp.json`            | Yes, via the setup script and SessionStart hook below |
+| Claude Desktop / local Claude Code | Account-synced or `rea setup` | Yes, via `rea setup`             | Yes, your own installation                            |
+| claude.ai web and mobile chat      | Account-synced                | No (cannot launch local servers) | No                                                    |
 
 ## Claude Code cloud sessions
+
+Start each cloud session with **only this repository** selected. Claude Code
+loads a repository's `.mcp.json` and its `.claude/settings.json` hooks only in
+a session with one repository. A session with several repositories starts in
+the folder above the clones and loads neither, so REA's tools do not appear
+([docs](https://code.claude.com/docs/en/settings#settings-in-cloud-sessions)).
 
 The repository's `.mcp.json` starts `rea-agents@6.4.0` in every new session.
 It runs `npx` with `--prefix=/` because this repository's own `package.json`
 is also named `rea-agents`; without it, `npx` resolves the local project and
 fails with `rea: not found`.
 
-### Add Ghidra and pwntools to the cloud environment
+### How Ghidra and pwntools get installed
 
-1. Open the cloud environment menu in a session's title bar and choose
+Two things run [`claude-cloud-setup.sh`](claude-cloud-setup.sh). Its four
+steps are idempotent and each runs on its own:
+
+- prerequisites: a full JDK 21, `procps`, `unzip`, `curl`, and Python venv
+  support, installed only when missing;
+- REA package: pre-downloads `rea-agents@6.4.0` with the same command
+  `.mcp.json` uses;
+- pwntools: `/opt/rea-pwntools` with pwntools 4.15.0, pyelftools 0.33 and
+  unicorn 2.1.2, which REA's ELF layout adapter requires;
+- Ghidra: the official 12.1.4 archive from this repository's
+  `Ghidra_12.1.4_build` release, checked against the official SHA-256 pinned
+  in the script and extracted to `/opt/ghidra_12.1.4_PUBLIC`.
+
+1. **The environment's setup script.** It runs before Claude Code starts, and
+   the filesystem it leaves is cached and reused by later sessions for about
+   seven days, without running the script again
+   ([docs](https://code.claude.com/docs/en/cloud-environments#environment-caching)).
+   It runs before Claude Code connects to the session's proxy, and the docs do
+   not say whether GitHub credentials exist at that point, so the script
+   falls back to the release's public URL, which needs none. If the download
+   still fails, the cache is built without Ghidra.
+2. **The SessionStart hook** in `.claude/settings.json`, which runs
+   [`session-start.sh`](session-start.sh) whenever a cloud session starts or
+   resumes, after Claude Code launches. It runs the same script inside
+   the session, where the GitHub proxy authenticates downloads from this
+   repository, and installs whatever the cache lacks: about 20 seconds for
+   Ghidra, about 3 seconds when everything is present. It prints the step
+   summary into Claude's context and writes the full log to
+   `/var/log/rea-cloud-session-start.log`. It does nothing outside cloud
+   sessions (`CLAUDE_CODE_REMOTE` is not `true`).
+
+The setup script also appends its output to `/var/log/rea-cloud-setup.log`.
+It exits 0 when a step fails, because a setup script that exits non-zero
+stops the session from starting. `STRICT=1` makes it exit 1 anyway.
+
+### Set up the cloud environment
+
+1. Publish the Ghidra archive as a release of this repository (once):
+   - download `ghidra_12.1.4_PUBLIC_20260921.zip` from the official
+     [Ghidra 12.1.4 release](https://github.com/NationalSecurityAgency/ghidra/releases/tag/Ghidra_12.1.4_build);
+   - on this repository's GitHub page, open **Releases**, then
+     **Draft a new release**;
+   - in the tag box, type `Ghidra_12.1.4_build` and choose to create it as
+     a new tag; keep the target `main`;
+   - title it `Ghidra 12.1.4 archive for cloud sessions (not an REA release)`;
+   - drag the zip into the attachments box and wait for the upload to finish;
+   - untick **Set as the latest release**, then select **Publish release**.
+
+   The tag does not follow the `rea-agents-<version>` pattern of REA's own
+   release tags, and no workflow runs on tags or releases.
+   Ghidra is Apache 2.0 licensed and the archive carries its LICENSE and
+   NOTICE files. The script rejects an archive whose SHA-256 differs from the
+   official value.
+
+2. Open the cloud environment menu in a session's title bar and choose
    **Edit**.
-2. Paste the contents of [`claude-cloud-setup.sh`](claude-cloud-setup.sh)
-   into **Setup script**. It runs four independent steps and prints a summary:
-   - prerequisites: a full JDK 21, `procps`, `unzip`, `curl`, and Python venv
-     support, installed only when missing;
-   - REA package: pre-downloads `rea-agents@6.4.0` with the same command
-     `.mcp.json` uses (measured: 9.4 s cold start, 1.9 s once cached);
-   - pwntools: `/opt/rea-pwntools` with pwntools 4.15.0, pyelftools 0.33 and
-     unicorn 2.1.2, which REA's ELF layout adapter requires;
-   - Ghidra: the official 12.1.4 archive from the `v12.1.4` release of the
-     `adefemi-dev/ghidra-dist` mirror, checked against the official SHA-256
-     pinned in the script and extracted to `/opt/ghidra_12.1.4_PUBLIC`.
-     Cloud sessions reach GitHub release pages only for repositories attached
-     to the session, so the NationalSecurityAgency/ghidra release is not
-     reachable there. Set `GHIDRA_RELEASE_REPO=NationalSecurityAgency/ghidra`
-     where it is.
-
-   A failed step does not stop the others, and the script exits 0 so sessions
-   still start. Set `STRICT=1` to make any failure exit 1.
-
-3. Add these environment variables in the same settings:
+3. Replace the **Setup script** with the contents of
+   [`claude-cloud-setup.sh`](claude-cloud-setup.sh). Changing the script also
+   makes the environment rebuild its cache.
+4. Keep these environment variables in the same settings:
 
    ```
    GHIDRA_INSTALL_DIR=/opt/ghidra_12.1.4_PUBLIC
@@ -49,14 +93,6 @@ fails with `rea: not found`.
 
    `rea-agents` 6.4.0 requires `GHIDRA_INSTALL_DIR`. Later releases can also
    find Ghidra through the `/usr/local/bin/ghidraRun` link the script creates.
-
-4. Give the session access to the mirror: install the Claude GitHub App on
-   `adefemi-dev/ghidra-dist` and select that repository for the session. A
-   mirror release must hold the unmodified official archive; the script
-   rejects any archive whose SHA-256 differs from the pinned official value.
-   To mirror another version, upload its official archive to a `v<version>`
-   release and set `GHIDRA_VERSION` and `GHIDRA_SHA256` from the official
-   release notes.
 
 5. Under **Network access**, allow these hosts (keep package managers allowed;
    PyPI and npm are already on that list):
@@ -68,20 +104,26 @@ fails with `rea: not found`.
    objects.githubusercontent.com
    ```
 
-6. Start a new session and check:
+6. Start a new session with only this repository selected and check:
 
    ```bash
    npx -y --prefix=/ rea-agents@6.4.0 doctor --json
    ```
 
-If the release cannot be reached, for example because the mirror is not
-attached to the session, the Ghidra step fails with
-`could not resolve the Ghidra 12.1.4 release asset` while the other steps still
-finish. A private mirror answers unauthenticated requests with 404, so the
-script sends `GH_TOKEN`, or `GITHUB_TOKEN` when `GH_TOKEN` is unset, as a bearer
-token when either is present. To install from an archive you supply instead, set `GHIDRA_ZIP` to its
-absolute path and `GHIDRA_SHA256` to the checksum published on the release
-page.
+REA's MCP server checks the Ghidra installation on its first Ghidra request
+and keeps that result for the life of the server. If Ghidra was installed
+after such a request, reconnect the `rea` server with `/mcp`.
+
+To use another release source, set `GHIDRA_RELEASE_REPO` and
+`GHIDRA_RELEASE_TAG` (for the earlier `adefemi-dev/ghidra-dist` mirror:
+`GHIDRA_RELEASE_TAG=v12.1.4`, with that repository attached to the session).
+For a private repository the script sends `GH_TOKEN`, or `GITHUB_TOKEN` when
+`GH_TOKEN` is unset, as a bearer token. To install from an archive you supply
+instead, set `GHIDRA_ZIP` to its absolute path and `GHIDRA_SHA256` to the
+checksum published on the release page. To mirror another Ghidra version, set
+`GHIDRA_VERSION` and `GHIDRA_SHA256` from the official release notes; the
+public-URL fallback needs a pinned file name, so add one to
+`official_asset_name` too.
 
 ## Claude Desktop on Windows
 
@@ -221,8 +263,20 @@ analysis that needs REA's tools.
   attached, the script downloaded the 12.1.4 archive from the mirror, matched
   the pinned SHA-256, installed it and linked `ghidraRun`; a rerun changed
   nothing, and a wrong `GHIDRA_SHA256` or an unpinned version failed before
-  downloading. Whether the environment's setup phase, which runs before a
-  session starts, has the same repository access was not tested.
+  downloading. In a later fresh session with two repositories selected, the
+  setup phase left no Ghidra install and the REA MCP server did not load.
+- SessionStart hook: run by hand in a cloud session (not yet as a real hook),
+  `session-start.sh` installed Ghidra through the API path in 16 seconds,
+  reran in 3 seconds with all four steps present, did nothing without
+  `CLAUDE_CODE_REMOTE=true`, and reported a failed Ghidra step in its summary.
+  With the API stubbed to fail, the public-URL fallback sent no credentials,
+  installed the official archive, and refused a tampered one. Downloading
+  from this repository's release and the setup phase's access to the public
+  URL were not tested before the release existed.
+- REA 6.4.0 MCP server: with `GHIDRA_INSTALL_DIR` missing at server start and
+  present before the first request, `open_binary` and
+  `procedure_pseudo_code` worked through Ghidra 12.1.4; after a first request
+  had failed, the same server kept reporting `executable_missing`.
 - Windows: confirmed on one Windows machine with the Store build of Claude
   Desktop, Node.js 24.16.0, Temurin JDK 21.0.12 and Ghidra 12.1.4. After the
   private-file registration above, a Chat tab session opened
