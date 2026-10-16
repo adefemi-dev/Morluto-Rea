@@ -44,7 +44,8 @@
 #   GHIDRA_SHA256    Expected archive SHA-256. Defaults to the official value
 #                    pinned below for known versions; required otherwise.
 #   GH_TOKEN         Optional GitHub token for a private release repository
-#                    when no proxy supplies credentials. Never logged.
+#                    when no proxy supplies credentials. GITHUB_TOKEN is used
+#                    when GH_TOKEN is unset. Never logged.
 #   GHIDRA_ZIP       Absolute path to an already downloaded release archive.
 #   GHIDRA_PREFIX    Extraction parent directory, default /opt.
 #   BIN_DIR          Directory for the ghidraRun link, default /usr/local/bin.
@@ -136,10 +137,11 @@ installed_version() {
   sed -n 's/^application\.version=//p' "$props" | head -n 1
 }
 
-# GitHub API request, with GH_TOKEN as a bearer token when one is set.
+# GitHub API request, with GH_TOKEN (or else GITHUB_TOKEN) as a bearer token
+# when one is set. A private mirror answers 404 to unauthenticated requests.
 github_curl() {
-  local auth=()
-  [ -z "${GH_TOKEN:-}" ] || auth=(-H "Authorization: Bearer ${GH_TOKEN}")
+  local auth=() token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+  [ -z "$token" ] || auth=(-H "Authorization: Bearer ${token}")
   curl -fSL --retry 3 ${auth[@]+"${auth[@]}"} "$@"
 }
 
