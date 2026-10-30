@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { access, rm, writeFile } from "node:fs/promises";
+import { access, realpath, rm, writeFile } from "node:fs/promises";
 import { expect, onTestFinished } from "vitest";
 import { createFirmwareAnalysisProvider } from "../../../src/composition/firmware.js";
 import { FirmwareAnalysisService } from "../../../src/application/firmware/FirmwareAnalysisService.js";
@@ -20,17 +20,21 @@ export const firmwareFixture = async (mode = "normal", banner?: string) => {
     args: readonly string[];
   }[] = [];
   let cleanupUnverified = mode === "cleanup-failure";
+  const binwalkCommand = "/usr/bin/true";
+  // The provider launches the resolved path, whose name differs where
+  // /usr/bin/true is a symlink (for example to gnutrue on Ubuntu 26.04).
+  const resolvedBinwalkCommand = await realpath(binwalkCommand);
   const provider = createFirmwareAnalysisProvider(
     {
       ...process.env,
-      REA_BINWALK_COMMAND: "/usr/bin/true",
+      REA_BINWALK_COMMAND: binwalkCommand,
       REA_UNBLOB_COMMAND: process.execPath,
     },
     async (options) => {
       const start = options.arguments.indexOf("--") + 2;
       const args = options.arguments.slice(start);
       const engine =
-        options.arguments[start - 1]?.endsWith("/true") === true
+        options.arguments[start - 1] === resolvedBinwalkCommand
           ? "binwalk"
           : "unblob";
       const spawned = await spawnOwnedProviderProcess({
