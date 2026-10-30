@@ -406,10 +406,17 @@ it("public CLI uses only GET and produces a report from fixture GitHub responses
   const ghCalls = join(fixture.directory, "gh-calls.jsonl");
   const ghResponse = join(fixture.directory, "gh-response.json");
   const fakeGh = join(fixture.fakeBin, "gh");
+  // The CLI reads the real clock and keeps only recently created pull requests,
+  // so a fixed fixture date falls outside its lookback window over time.
   await writeFile(
     ghResponse,
     JSON.stringify([
-      [rawPull(51, { mergeable: true })],
+      [
+        rawPull(51, {
+          mergeable: true,
+          created_at: new Date().toISOString(),
+        }),
+      ],
       { total_count: 0, workflow_runs: [] },
     ]),
   );
