@@ -44,7 +44,9 @@ steps are idempotent and each runs on its own:
   does not report an installed Hopper, REA's own installer
   (`rea setup --yes --install-hopper`) downloads the Hopper Linux demo from
   `www.hopperapp.com`, verifies it, and installs it with its Xvfb
-  dependencies. Hopper is commercial software; the demo has vendor-defined
+  dependencies. The script refreshes the apt package lists first, because
+  that installer runs `apt-get install` without doing so and cloud images can
+  start with empty lists. Hopper is commercial software; the demo has vendor-defined
   limits. Without `--client`, this configures no agent. Setting the variable
   is the operator's approval of that installation. When Hopper is installed
   but another Hopper check fails, the step reports REA's remediation instead
@@ -307,10 +309,25 @@ analysis that needs REA's tools.
   `org.fdroid.ui.crash.CrashActivity`) succeeded on the public F-Droid APK.
   On that APK, `search_android_classes` failed closed with "JADX class
   inventory is duplicated or differs from the loaded class count".
-- Hopper: not yet verified. In the testing session `www.hopperapp.com` was not
-  on the network allowlist, so the step failed with REA's message "REA could
-  not download or unpack the official Hopper package"; installation and
-  analysis are untested.
+- Hopper: in an earlier session `www.hopperapp.com` was not on the network
+  allowlist, so the step failed with REA's message "REA could not download or
+  unpack the official Hopper package". In a later cloud session that allowed
+  the host, two script faults kept the step from installing anything: it
+  stopped silently whenever Hopper was missing, because `rea doctor` exits 1
+  for an unhealthy report and `pipefail` turned that into a step failure; and
+  with Hopper's Qt 6 dependencies absent and the apt lists empty,
+  `rea setup --yes --install-hopper` reported
+  `authorization_or_package_manager_failed` and installed nothing, while the
+  same command succeeded once the lists were populated. With both fixed, the
+  script, run with `INSTALL_HOPPER=1` from that state, installed Hopper 6.4.2
+  in 47 seconds; reruns, directly and through `session-start.sh`, changed
+  nothing, and `rea doctor --provider hopper` passed `hopper`,
+  `hopper-version` and `hopper-demo-runtime`. Through the REA 6.4.0 CLI, an
+  install of the same package analyzed `/usr/bin/true` (86 procedures) and
+  returned the entry procedure at `0x19f0` as instructions and pseudo-code
+  (not repeated after the final reinstall). The REA MCP tools were not exercised with
+  Hopper. `curl` with its default user agent received HTTP 403 from
+  `www.hopperapp.com`, while REA's own download succeeded.
 - Windows: confirmed on one Windows machine with the Store build of Claude
   Desktop, Node.js 24.16.0, Temurin JDK 21.0.12 and Ghidra 12.1.4. After the
   private-file registration above, a Chat tab session opened
