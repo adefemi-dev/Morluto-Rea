@@ -33,7 +33,8 @@
 #   6. Hopper, only with INSTALL_HOPPER=1: when `rea doctor` does not report an
 #      installed Hopper, runs `rea setup --yes --install-hopper`, REA's own
 #      installer, which downloads the Hopper Linux demo from www.hopperapp.com,
-#      verifies it, and installs it with its Xvfb dependencies. Hopper is
+#      verifies it, and installs it with its Xvfb dependencies, after
+#      refreshing the apt package lists that installer relies on. Hopper is
 #      commercial software; the demo has vendor-defined limits. Setting
 #      INSTALL_HOPPER=1 in the environment settings is the operator's approval.
 #
@@ -348,9 +349,13 @@ install_jadx() {
 
 # Reads `rea doctor --provider hopper` and prints one line: "installed" when
 # every Hopper check passes, "runtime" and the failing checks when Hopper is
-# installed but another Hopper check fails, or "missing".
+# installed but another Hopper check fails, or "missing". rea doctor exits 1
+# whenever a check fails, including a missing Hopper, so the report decides and
+# the exit status is ignored; under pipefail it would abort the step silently.
 hopper_state() {
-  (cd / && npx -y --prefix=/ "rea-agents@${REA_VERSION}" doctor --provider hopper --json 2>/dev/null) |
+  local report
+  report="$(cd / && npx -y --prefix=/ "rea-agents@${REA_VERSION}" doctor --provider hopper --json 2>/dev/null)" || true
+  printf '%s' "$report" |
     python3 -c '
 import json, sys
 try:
@@ -388,6 +393,12 @@ install_hopper() {
   # As a non-root user, REA's installer elevates through pkexec, which cloud
   # containers do not provide; cloud setup scripts and hooks run as root.
   [ "$(id -u)" -eq 0 ] || die "installing Hopper needs root; run this script as root"
+  # REA's installer runs apt-get install without refreshing package lists.
+  # Cloud images can start with empty lists, which hide Hopper's Qt 6
+  # dependencies and make the installer report a package-manager failure.
+  if command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq >&2
+  fi
   (cd / && npx -y --prefix=/ "rea-agents@${REA_VERSION}" setup --yes --install-hopper) >&2 ||
     die "rea setup --install-hopper failed"
   state="$(hopper_state)"
