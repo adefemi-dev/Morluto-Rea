@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { isOwnedClientRegistrationCommand } from "./ClientRegistrationIdentity.js";
 import {
   linuxHopperInstallDisclosure,
+  REA_MANAGED_LINUX_HOPPER_LAUNCHER,
   type LinuxPackageFamily,
 } from "./LinuxHopper.js";
 import type { SkillDestination } from "./SetupSkill.js";
@@ -44,13 +45,15 @@ export const discoverSetupState = async (input: {
   readonly initialDoctor: DoctorReport;
 }): Promise<SetupDiscovery> => {
   const { initialDoctor } = input;
+  const managedHopperSelected =
+    initialDoctor.hopperPath === REA_MANAGED_LINUX_HOPPER_LAUNCHER;
   const linuxHopperRepairNeeded =
     input.hopperLauncherConfigured !== true &&
     initialDoctor.checks.some(
-      ({ name, ok, detail }) =>
+      ({ name, ok }) =>
         !ok &&
         (name === "hopper-demo-runtime" ||
-          (name === "hopper-version" && detail === "/opt/hopper/bin/Hopper")),
+          (name === "hopper-version" && managedHopperSelected)),
     );
   const linuxDistribution =
     input.host.platform === "linux"

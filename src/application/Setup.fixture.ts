@@ -172,7 +172,8 @@ export class FakeSetupHost implements SetupHost {
               name: "hopper-version",
               ok: false,
               classification: "config_drift",
-              detail: this.hopper ?? "",
+              // Display text only; setup must not read the path back out of it.
+              detail: `${this.hopper ?? ""} (unrecognized build)`,
             },
           ] as const)
         : []),

@@ -581,12 +581,60 @@ describe("doctor Linux and Hopper discovery", () => {
             hopperSetupSupported: true,
           }),
         executable: (candidate) => Promise.resolve(candidate === path),
-        supportedLinuxHopper: () => Promise.resolve(false),
+        linuxHopperBuild: () =>
+          Promise.resolve({ status: "unsupported", sha256: "a".repeat(64) }),
       }),
     );
     expect(
-      result.checks.find(({ name }) => name === "hopper-version")?.remediation,
-    ).toContain("Unset or update HOPPER_LAUNCHER_PATH");
+      result.checks.find(({ name }) => name === "hopper-version"),
+    ).toMatchObject({
+      ok: false,
+      detail: `${path} (unrecognized build, SHA-256 ${"a".repeat(64)})`,
+      details: {
+        launcher: path,
+        build: "unsupported",
+        version: null,
+        sha256: "a".repeat(64),
+      },
+      remediation: expect.stringContaining(
+        "Unset or update HOPPER_LAUNCHER_PATH",
+      ),
+    });
+  });
+  it("reports the Hopper version of a pinned Linux launcher", async () => {
+    const path = "/opt/hopper/bin/Hopper";
+    const sha256 =
+      "0294ced141cc373468ee22d8343e7dac41980cb05a937994ca81c9f09afe7ded";
+    const result = await runDoctor(
+      undefined,
+      host({
+        platform: "linux",
+        linuxDistribution: () =>
+          Promise.resolve({
+            id: "ubuntu",
+            versionId: "24.04",
+            packageFamily: "deb",
+            hopperSetupSupported: true,
+          }),
+        executable: (candidate) => Promise.resolve(candidate === path),
+        linuxHopperBuild: () =>
+          Promise.resolve({ status: "supported", version: "6.4.2", sha256 }),
+      }),
+    );
+    expect(
+      result.checks.find(({ name }) => name === "hopper-version"),
+    ).toStrictEqual({
+      name: "hopper-version",
+      ok: true,
+      classification: "healthy",
+      detail: `${path} (Hopper 6.4.2)`,
+      details: {
+        launcher: path,
+        build: "supported",
+        version: "6.4.2",
+        sha256,
+      },
+    });
   });
 });
 

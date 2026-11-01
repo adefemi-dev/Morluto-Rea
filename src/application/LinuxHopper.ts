@@ -14,9 +14,20 @@ import {
 /** Package-manager output retained per stream without stopping the command. */
 const PACKAGE_MANAGER_OUTPUT_BYTES = 64 * 1024;
 const DOWNLOAD_PREFIX = "https://www.hopperapp.com:443/downloader/public/";
-const SUPPORTED_HOPPER_SHA256 = new Set([
-  "0294ced141cc373468ee22d8343e7dac41980cb05a937994ca81c9f09afe7ded",
-  "1339f9e58377442b0c6fcb0dfc3cec20d593cc557408521fad9a00dbc6b8da13",
+/** Hopper release of every pinned Linux package and launcher below. */
+const SUPPORTED_HOPPER_VERSION = "6.4.2";
+/** Launcher SHA-256 to Hopper version, for launchers extracted from the pinned packages. */
+const SUPPORTED_HOPPER_LAUNCHERS: ReadonlyMap<string, string> = new Map([
+  // Launcher in the .deb and .pkg.tar.xz packages.
+  [
+    "0294ced141cc373468ee22d8343e7dac41980cb05a937994ca81c9f09afe7ded",
+    SUPPORTED_HOPPER_VERSION,
+  ],
+  // Launcher in the .rpm package.
+  [
+    "1339f9e58377442b0c6fcb0dfc3cec20d593cc557408521fad9a00dbc6b8da13",
+    SUPPORTED_HOPPER_VERSION,
+  ],
 ]);
 interface LinuxHopperRelease {
   readonly filename: string;
@@ -27,17 +38,17 @@ const SUPPORTED_RELEASES: Readonly<
   Record<LinuxPackageFamily, LinuxHopperRelease>
 > = {
   deb: {
-    filename: `${DOWNLOAD_PREFIX}Hopper-6.4.2-Linux-demo.deb`,
+    filename: `${DOWNLOAD_PREFIX}Hopper-${SUPPORTED_HOPPER_VERSION}-Linux-demo.deb`,
     file_length: "35755772",
     file_hash: "e4f79dff602648a8ff4a88b773875b6bfac0dc65",
   },
   rpm: {
-    filename: `${DOWNLOAD_PREFIX}Hopper-6.4.2-Linux-demo.rpm`,
+    filename: `${DOWNLOAD_PREFIX}Hopper-${SUPPORTED_HOPPER_VERSION}-Linux-demo.rpm`,
     file_length: "32264475",
     file_hash: "b9a65f2f583a386d440d4401d9140aef3bf305de",
   },
   arch: {
-    filename: `${DOWNLOAD_PREFIX}Hopper-6.4.2-Linux-demo.pkg.tar.xz`,
+    filename: `${DOWNLOAD_PREFIX}Hopper-${SUPPORTED_HOPPER_VERSION}-Linux-demo.pkg.tar.xz`,
     file_length: "29405968",
     file_hash: "92d780b61cab38eda95dc4112dee4fbeb0920f46",
   },
@@ -304,7 +315,7 @@ export const installLinuxHopper = async (
           reason: "authorization_or_package_manager",
           packageFailure: install.failure,
         };
-      const launcherPath = "/opt/hopper/bin/Hopper";
+      const launcherPath = REA_MANAGED_LINUX_HOPPER_LAUNCHER;
       const launcherStatus = await host.launcherStatus(launcherPath);
       if (launcherStatus !== "ready")
         return {
@@ -373,7 +384,7 @@ export const systemLinuxHopperInstallHost = (
       const linked = await execFileOutput("ldd", [path], { env: environment });
       if (!linuxSharedLibrariesAvailable(`${linked.stdout}\n${linked.stderr}`))
         return "runtime_dependencies";
-      return (await linuxHopperBinarySupported(path))
+      return (await probeLinuxHopperBuild(path)).status === "supported"
         ? "ready"
         : "unsupported_hopper_build";
     } catch (cause: unknown) {
@@ -385,24 +396,44 @@ export const systemLinuxHopperInstallHost = (
   cleanup: (path) => rm(path, { recursive: true, force: true }),
 });
 
-/** Match the Linux Hopper build validated by the packaged demo-dialog adapter. */
-export const linuxHopperBinarySupported = async (
+/**
+ * Identity of a Linux Hopper launcher. A supported build is one validated by the
+ * packaged demo-dialog adapter; an unsupported build keeps its digest so the
+ * report can name what was found; an unreadable launcher has no known build.
+ */
+export type LinuxHopperBuild =
+  | {
+      readonly status: "supported";
+      readonly version: string;
+      readonly sha256: string;
+    }
+  | { readonly status: "unsupported"; readonly sha256: string }
+  | { readonly status: "unreadable" };
+
+/** Hash a Linux Hopper launcher and identify it against the pinned builds. */
+export const probeLinuxHopperBuild = async (
   path: string,
-): Promise<boolean> => {
+): Promise<LinuxHopperBuild> => {
+  let sha256: string;
   try {
     const hash = createHash("sha256");
     for await (const chunk of createReadStream(path)) hash.update(chunk);
-    return linuxHopperLauncherDigestSupported(hash.digest("hex"));
+    sha256 = hash.digest("hex");
   } catch (cause: unknown) {
-    // best-effort cleanup: optional build probing; unreadable means unsupported.
+    // best-effort cleanup: optional build probing; an unreadable launcher has no build.
     void cause;
-    return false;
+    return { status: "unreadable" };
   }
+  const version = linuxHopperLauncherVersion(sha256);
+  return version === undefined
+    ? { status: "unsupported", sha256 }
+    : { status: "supported", version, sha256 };
 };
 
-/** Match a launcher extracted from one of the pinned official Linux packages. */
-export const linuxHopperLauncherDigestSupported = (digest: string): boolean =>
-  SUPPORTED_HOPPER_SHA256.has(digest);
+/** Hopper version of a launcher extracted from one of the pinned official Linux packages. */
+export const linuxHopperLauncherVersion = (
+  digest: string,
+): string | undefined => SUPPORTED_HOPPER_LAUNCHERS.get(digest);
 
 /** Interpret ldd output conservatively so a present but broken launcher is unhealthy. */
 export const linuxSharedLibrariesAvailable = (output: string): boolean =>

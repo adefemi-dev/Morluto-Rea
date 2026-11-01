@@ -15,10 +15,11 @@ import {
 } from "../domain/runtimeVersion.js";
 import { installedCaskAppdir, probeHomebrew } from "./homebrew.js";
 import {
-  linuxHopperBinarySupported,
   linuxSharedLibrariesAvailable,
+  probeLinuxHopperBuild,
   readLinuxDistribution,
   type LinuxDistribution,
+  type LinuxHopperBuild,
 } from "./LinuxHopper.js";
 import {
   readInstalledSkillIdentity,
@@ -95,7 +96,7 @@ export interface DoctorHost {
   /** Route-specific target admission details, when supplied by the host. */
   inspectTarget?(path: string): Promise<DoctorCheck>;
   executable(path: string): Promise<boolean>;
-  supportedLinuxHopper(path: string): Promise<boolean>;
+  linuxHopperBuild(path: string): Promise<LinuxHopperBuild>;
   linuxDemoRuntimeCheck(): Promise<DoctorCheck>;
   brewHopperPath(): Promise<string | undefined>;
   manualHopperPaths(): Promise<readonly string[]>;
@@ -484,7 +485,7 @@ export const systemDoctorHost = (
       ),
     linuxDemoRuntimeCheck:
       options.linuxDemoRuntimeCheck ?? uncomposedLinuxDemoRuntimeCheck,
-    supportedLinuxHopper: linuxHopperBinarySupported,
+    linuxHopperBuild: probeLinuxHopperBuild,
     async brewHopperPath() {
       return probeHomebrew(async (command) => {
         let caskroom: string;
