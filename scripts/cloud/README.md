@@ -25,7 +25,7 @@ fails with `rea: not found`.
 
 ### How Ghidra and pwntools get installed
 
-Two things run [`claude-cloud-setup.sh`](claude-cloud-setup.sh). Its six
+Two things run [`claude-cloud-setup.sh`](claude-cloud-setup.sh). Its seven
 steps are idempotent and each runs on its own:
 
 - prerequisites: a full JDK 21, `procps`, `unzip`, `curl`, and Python venv
@@ -51,6 +51,17 @@ steps are idempotent and each runs on its own:
   is the operator's approval of that installation. When Hopper is installed
   but another Hopper check fails, the step reports REA's remediation instead
   of reinstalling.
+- Claude Code integration, only when `CONFIGURE_CLAUDE_CODE=1`, which the
+  SessionStart hook sets unless the environment sets it: when
+  `rea doctor --client claude_code --skill` reports drift, the step runs
+  `rea setup --yes --client claude_code`. That backs up `~/.claude.json` to
+  `~/.claude.json.rea.backup`, adds a user-scope `rea` registration, and
+  installs the REA skill into `~/.claude/skills`. It installs no provider.
+  Claude Code connects one `rea` server and takes the repository's
+  `.mcp.json` entry over the user-scope one
+  ([docs](https://code.claude.com/docs/en/mcp)); because the two commands
+  differ, `/mcp` and `claude mcp list` show a same-name warning. Set
+  `CONFIGURE_CLAUDE_CODE=0` in the environment to skip the step.
 
 1. **The environment's setup script.** It runs before Claude Code starts, and
    the filesystem it leaves is cached and reused by later sessions for about
@@ -328,6 +339,17 @@ analysis that needs REA's tools.
   (not repeated after the final reinstall). The REA MCP tools were not exercised with
   Hopper. `curl` with its default user agent received HTTP 403 from
   `www.hopperapp.com`, while REA's own download succeeded.
+- Claude Code integration: in a cloud session with Hopper 6.4.2 installed,
+  `rea doctor` reported `skill:identity` and `registration:claude_code` as
+  config drift. With the installed skill removed, the setup script run with
+  `CONFIGURE_CLAUDE_CODE=1` detected the drift, ran
+  `rea setup --yes --client claude_code`, and the scoped doctor then passed;
+  a rerun took about 7 seconds and left `~/.claude.json` unchanged, the step
+  was skipped without the variable, and `session-start.sh` reported it as
+  `ok`. Through `npx`, setup registers `npx -y rea-agents@6.4.0 mcp` without
+  `--prefix=/`, which would fail inside this repository; there the
+  `.mcp.json` entry is used instead. A fresh session starting from the hook
+  was not tested.
 - Windows: confirmed on one Windows machine with the Store build of Claude
   Desktop, Node.js 24.16.0, Temurin JDK 21.0.12 and Ghidra 12.1.4. After the
   private-file registration above, a Chat tab session opened
