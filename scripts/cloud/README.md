@@ -4,11 +4,11 @@ This fork-local guide covers the three places you can chat with Claude and
 what each needs to use REA. REA is a local-only MCP server: something on the
 same machine as the analysis target must launch it.
 
-| Surface                            | REA skill                            | REA MCP tools                    | Ghidra                                                |
-| ---------------------------------- | ------------------------------------ | -------------------------------- | ----------------------------------------------------- |
-| Claude Code cloud sessions         | Account-synced and SessionStart hook | Yes, from `.mcp.json`            | Yes, via the setup script and SessionStart hook below |
-| Claude Desktop / local Claude Code | Account-synced or `rea setup`        | Yes, via `rea setup`             | Yes, your own installation                            |
-| claude.ai web and mobile chat      | Account-synced                       | No (cannot launch local servers) | No                                                    |
+| Surface                            | REA skill                     | REA MCP tools                    | Ghidra                                                |
+| ---------------------------------- | ----------------------------- | -------------------------------- | ----------------------------------------------------- |
+| Claude Code cloud sessions         | Account-synced                | Yes, from `.mcp.json`            | Yes, via the setup script and SessionStart hook below |
+| Claude Desktop / local Claude Code | Account-synced or `rea setup` | Yes, via `rea setup`             | Yes, your own installation                            |
+| claude.ai web and mobile chat      | Account-synced                | No (cannot launch local servers) | No                                                    |
 
 ## Claude Code cloud sessions
 
@@ -52,9 +52,15 @@ steps are idempotent and each runs on its own:
   but another Hopper check fails, the step reports REA's remediation instead
   of reinstalling.
 - REA skill for Claude Code, only when `CONFIGURE_CLAUDE_CODE=1`, which the
-  SessionStart hook sets unless the environment sets it: when
-  `rea doctor --client claude_code` does not report the skill in
-  `~/.claude/skills` as aligned, the step runs
+  SessionStart hook sets unless the environment sets it. Claude Code already
+  loads the account-synced copy of the skill, from `~/.claude/skills/synced`.
+  When that copy declares the skill version and tool count that
+  `rea doctor --client claude_code` expects, the step installs no local copy,
+  so the skill loads once, and moves a local copy that is byte-identical to the
+  synced one, which earlier versions of the step installed, to
+  `~/.claude/rea-cloud-skill-backup-<UTC time>`. A local copy that differs
+  stays. Without a current synced copy, when doctor does not report the local
+  skill in `~/.claude/skills` as aligned, the step runs
   `rea setup --yes --skill-client claude_code`, which installs only the
   skill. It registers no MCP server, because sessions start REA from
   `.mcp.json`. Earlier versions of the step ran
@@ -143,12 +149,13 @@ stops the session from starting. `STRICT=1` makes it exit 1 anyway.
    npx -y --prefix=/ rea-agents@6.4.0 doctor --json
    ```
 
-   Expect it to exit 1 with one finding that counts toward `healthy`:
-   `registration:claude_code`, reported as config drift. Doctor checks only
-   Claude Code's user configuration (`~/.claude.json`), not the
-   repository's `.mcp.json`, which sessions use. Do not apply that finding's
-   `rea setup` remediation: it would add the user-scope entry the
-   SessionStart hook removes. `ida-registration` also fails until IDA is
+   Expect it to exit 1 with two findings that count toward `healthy`, both
+   reported as config drift. `registration:claude_code`: doctor checks only
+   Claude Code's user configuration (`~/.claude.json`), not the repository's
+   `.mcp.json`, which sessions use. `skill:identity`: doctor checks only
+   `~/.claude/skills`, not the account-synced copy Claude Code loads. Do not
+   apply their `rea setup` remediations: they would add the user-scope entry
+   and the second skill copy that the SessionStart hook removes. `ida-registration` also fails until IDA is
    configured, but it does not count toward `healthy`.
 
 REA's MCP server checks the Ghidra installation on its first Ghidra request
@@ -378,6 +385,15 @@ analysis that needs REA's tools.
   found the skill aligned and no entry, and reported `ok`; `~/.claude.json`,
   rewritten during the restart before the hook ran, still had no user-scope
   `rea` entry. A fresh session starting from the hook was not tested.
+- One skill copy: in that container the account-synced skill and the local
+  copy the step had installed were byte-identical (version 37, 170 tools), and
+  Claude Code listed the skill twice. The step then moved the local copy to a
+  backup directory and passed; a rerun changed nothing, and `rea doctor`
+  reported `skill:identity` as missing. With temporary home directories, the
+  step installed the local copy when no synced copy existed and when the synced
+  copy declared version 36, and left a local copy that differed from the
+  synced one in place. That Claude Code then lists the skill once was not yet
+  checked in a new session.
 - Windows: confirmed on one Windows machine with the Store build of Claude
   Desktop, Node.js 24.16.0, Temurin JDK 21.0.12 and Ghidra 12.1.4. After the
   private-file registration above, a Chat tab session opened
