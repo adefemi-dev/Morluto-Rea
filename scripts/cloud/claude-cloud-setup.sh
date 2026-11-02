@@ -37,6 +37,13 @@
 #      refreshing the apt package lists that installer relies on. Hopper is
 #      commercial software; the demo has vendor-defined limits. Setting
 #      INSTALL_HOPPER=1 in the environment settings is the operator's approval.
+#   7. Claude Code integration, only with CONFIGURE_CLAUDE_CODE=1 (the
+#      SessionStart hook sets it): when `rea doctor --client claude_code
+#      --skill` reports drift, runs `rea setup --yes --client claude_code`,
+#      which backs up and updates ~/.claude.json and installs the REA skill
+#      into ~/.claude/skills. It never installs Hopper. Claude Code still
+#      starts REA from the repository's .mcp.json, which takes precedence over
+#      this user-scope entry of the same name.
 #
 # After it runs, add these environment variables in the same environment
 # settings so the REA MCP server sees the installations:
@@ -76,6 +83,7 @@
 #                    file with another digest is never replaced.
 #   SKIP_JADX=1      Skip step 5.
 #   INSTALL_HOPPER=1 Run step 6; it is skipped otherwise.
+#   CONFIGURE_CLAUDE_CODE=1  Run step 7; it is skipped otherwise.
 #   LOG_FILE         Log file, default /var/log/rea-cloud-setup.log; set it
 #                    empty to disable.
 #   SUMMARY_FILE     Optional file that receives the step summary lines.
@@ -406,6 +414,48 @@ install_hopper() {
   log "installed Hopper with rea setup"
 }
 
+# Prints "configured" when `rea doctor --client claude_code --skill` reports the
+# Claude Code registration and the installed REA skill as aligned, or "drift"
+# and the failing checks otherwise. As in hopper_state, the report decides and
+# the exit status is ignored.
+claude_code_state() {
+  local report
+  report="$(cd / && npx -y --prefix=/ "rea-agents@${REA_VERSION}" doctor --client claude_code --skill --json 2>/dev/null)" || true
+  printf '%s' "$report" |
+    python3 -c '
+import json, sys
+try:
+    report = json.load(sys.stdin)
+except ValueError:
+    print("drift rea doctor did not return a report")
+    sys.exit()
+failing = [c for c in report.get("scope_checks", []) if not c.get("ok")]
+if report.get("healthy") is True and not failing:
+    print("configured")
+else:
+    print("drift " + ("; ".join("%s: %s" % (c.get("name"), c.get("remediation") or c.get("detail")) for c in failing) or "scoped report is not healthy"))
+'
+}
+
+# Registers REA with Claude Code and installs the REA skill through REA's own
+# setup, which backs up the configuration it changes. Without --install-hopper
+# it installs no provider. It runs only when doctor reports drift.
+configure_claude_code() {
+  local state
+  command -v npx >/dev/null 2>&1 || die "npx not found; cannot run rea setup"
+  state="$(claude_code_state)"
+  if [ "$state" = configured ]; then
+    log "Claude Code registration and REA skill already aligned"
+    return
+  fi
+  log "Claude Code integration needs setup: ${state#drift }"
+  (cd / && npx -y --prefix=/ "rea-agents@${REA_VERSION}" setup --yes --client claude_code) >&2 ||
+    die "rea setup --client claude_code failed"
+  state="$(claude_code_state)"
+  [ "$state" = configured ] || die "rea doctor still reports Claude Code drift after setup: ${state#drift }"
+  log "configured Claude Code with rea setup"
+}
+
 install_ghidra_and_link() {
   check_java_major
   install_ghidra
@@ -453,6 +503,11 @@ if [ "${INSTALL_HOPPER:-0}" = 1 ]; then
   run_step "Hopper" install_hopper
 else
   STEP_RESULTS+=("skipped Hopper (set INSTALL_HOPPER=1 to install it)")
+fi
+if [ "${CONFIGURE_CLAUDE_CODE:-0}" = 1 ]; then
+  run_step "Claude Code integration" configure_claude_code
+else
+  STEP_RESULTS+=("skipped Claude Code integration (set CONFIGURE_CLAUDE_CODE=1 to run it)")
 fi
 
 log "=== summary"

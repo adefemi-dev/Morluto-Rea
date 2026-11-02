@@ -1,10 +1,14 @@
 import { createHash } from "node:crypto";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
   formatCommandForDisplay,
   installLinuxHopper,
-  linuxHopperLauncherDigestSupported,
+  linuxHopperLauncherVersion,
+  probeLinuxHopperBuild,
   linuxPackageManagerCommands,
   linuxSharedLibrariesAvailable,
   parseLinuxDistribution,
@@ -166,12 +170,31 @@ describe("Linux Hopper installation", () => {
       "0294ced141cc373468ee22d8343e7dac41980cb05a937994ca81c9f09afe7ded",
     ],
     ["RPM", "1339f9e58377442b0c6fcb0dfc3cec20d593cc557408521fad9a00dbc6b8da13"],
-  ])("accepts the pinned %s launcher build", (_, digest) => {
-    expect(linuxHopperLauncherDigestSupported(digest)).toBe(true);
+  ])("identifies the pinned %s launcher as Hopper 6.4.2", (_, digest) => {
+    expect(linuxHopperLauncherVersion(digest)).toBe("6.4.2");
   });
 
   it("rejects an unverified launcher build", () => {
-    expect(linuxHopperLauncherDigestSupported("0".repeat(64))).toBe(false);
+    expect(linuxHopperLauncherVersion("0".repeat(64))).toBeUndefined();
+  });
+
+  it("keeps the digest of an unrecognized launcher file", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "rea-hopper-build-"));
+    try {
+      const launcher = join(directory, "Hopper");
+      await writeFile(launcher, "not a pinned Hopper build");
+      expect(await probeLinuxHopperBuild(launcher)).toStrictEqual({
+        status: "unsupported",
+        sha256: createHash("sha256")
+          .update("not a pinned Hopper build")
+          .digest("hex"),
+      });
+      expect(
+        await probeLinuxHopperBuild(join(directory, "missing")),
+      ).toStrictEqual({ status: "unreadable" });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it.each([

@@ -6,6 +6,7 @@ import {
   linuxHopperLauncherCandidates,
   systemLinuxHopperLauncherCandidates,
   supportsReaHost,
+  type LinuxHopperBuild,
 } from "./LinuxHopper.js";
 import type {
   DoctorCheck,
@@ -201,17 +202,37 @@ const optionalHopperVersionCheck = async (
   hopperPath: string | undefined,
 ): Promise<DoctorCheck | undefined> => {
   if (host.platform !== "linux" || hopperPath === undefined) return undefined;
-  return check(
-    "hopper-version",
-    await host.supportedLinuxHopper(hopperPath),
-    hopperPath,
-    {
-      remediation: unsupportedHopperRemediation(
-        host.configuredHopperPath === hopperPath,
-      ),
-      classification: "config_drift",
+  const build = await host.linuxHopperBuild(hopperPath);
+  return {
+    ...check(
+      "hopper-version",
+      build.status === "supported",
+      hopperBuildDetail(hopperPath, build),
+      {
+        remediation: unsupportedHopperRemediation(
+          host.configuredHopperPath === hopperPath,
+        ),
+        classification: "config_drift",
+      },
+    ),
+    details: {
+      launcher: hopperPath,
+      build: build.status,
+      version: build.status === "supported" ? build.version : null,
+      sha256: build.status === "unreadable" ? null : build.sha256,
     },
-  );
+  };
+};
+
+const hopperBuildDetail = (path: string, build: LinuxHopperBuild): string => {
+  switch (build.status) {
+    case "supported":
+      return `${path} (Hopper ${build.version})`;
+    case "unsupported":
+      return `${path} (unrecognized build, SHA-256 ${build.sha256})`;
+    case "unreadable":
+      return `${path} (launcher could not be read)`;
+  }
 };
 
 const optionalHopperDemoCheck = async (

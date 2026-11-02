@@ -13,6 +13,10 @@
 # LOG_FILE (default /var/log/rea-cloud-session-start.log). It always exits 0
 # so a failed step never blocks the session.
 #
+# It also sets CONFIGURE_CLAUDE_CODE=1 unless the environment sets it, so the
+# setup script aligns the REA registration and skill that `rea doctor` checks
+# for Claude Code. Set CONFIGURE_CLAUDE_CODE=0 in the environment to skip it.
+#
 # The hook runs when the session starts. REA's MCP server checks the Ghidra
 # installation on its first Ghidra request and keeps the result, so if Ghidra
 # was installed later, reconnect the rea server with /mcp before using it.
@@ -25,7 +29,7 @@ log_file="${LOG_FILE:-/var/log/rea-cloud-session-start.log}"
 summary="$(mktemp)"
 trap 'rm -f "$summary"' EXIT
 
-LOG_FILE="$log_file" SUMMARY_FILE="$summary" bash "${here}/claude-cloud-setup.sh" >/dev/null 2>&1
+CONFIGURE_CLAUDE_CODE="${CONFIGURE_CLAUDE_CODE:-1}" LOG_FILE="$log_file" SUMMARY_FILE="$summary" bash "${here}/claude-cloud-setup.sh" >/dev/null 2>&1
 rc=$?
 
 printf 'REA cloud setup (SessionStart hook, full log: %s):\n' "$log_file"

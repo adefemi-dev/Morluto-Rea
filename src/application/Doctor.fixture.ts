@@ -14,7 +14,13 @@ export const createDoctorHostFixture = (
   linuxDistribution: () => Promise.resolve(undefined),
   validTarget: (path) => Promise.resolve(path.includes("Hopper")),
   executable: (path) => Promise.resolve(path.includes("Hopper")),
-  supportedLinuxHopper: () => Promise.resolve(true),
+  linuxHopperBuild: () =>
+    Promise.resolve({
+      status: "supported",
+      version: "6.4.2",
+      sha256:
+        "0294ced141cc373468ee22d8343e7dac41980cb05a937994ca81c9f09afe7ded",
+    }),
   linuxDemoRuntimeCheck: () =>
     Promise.resolve({
       name: "hopper-demo-runtime",
