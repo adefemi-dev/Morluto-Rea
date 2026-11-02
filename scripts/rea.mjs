@@ -93,10 +93,22 @@ if (!(await compiledRuntimeExists(runtimeFiles))) {
         if (output.length > 0) wroteOutput = true;
         process.stdout.write(output);
       },
+      exit: endWithStatus,
     });
     if (!wroteOutput && !resultOutput?.handled)
       process.stdout.write(renderEmptyFilteredCliOutput(args) ?? "");
   }
+}
+
+// End a failed command the way the other exits here do: set the status and let
+// the event loop finish. On Node 24, process.exit() can deadlock while a V8
+// background compile waits for a main-thread garbage collection
+// (https://github.com/nodejs/node/issues/64274). Work left scheduled after an
+// error would otherwise keep the process alive, so still end it after a grace
+// period, as process.exit did; the unref'd timer never delays a clean exit.
+function endWithStatus(code) {
+  process.exitCode = code;
+  setTimeout(() => process.exit(code), 5_000).unref();
 }
 
 async function compiledRuntimeExists(paths) {
