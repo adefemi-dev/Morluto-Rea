@@ -412,7 +412,11 @@ it.skipIf(process.platform !== "darwin")(
       ]);
     }
     const target = await nativeMachoTargetForFile(path);
-    const real = new XcrunCommandRunner({});
+    // codesign lives in /usr/bin, outside Xcode's toolchains, so
+    // `xcrun --find codesign` needs PATH, as REA's own environment provides.
+    // Without it, the lookup succeeds only when xcrun's per-user cache
+    // already holds an earlier lookup made with PATH.
+    const real = new XcrunCommandRunner(process.env);
     let capturedPath: string | undefined;
     const runner: NativeCommandRunner = {
       async run(tool, args, options) {
