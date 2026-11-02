@@ -373,8 +373,11 @@ analysis that needs REA's tools.
   variable, and `session-start.sh` reported it as `ok`. With a temporary
   home directory, the step left a foreign user-scope entry (`rea mcp`) in
   place, failed on a configuration doctor reported as invalid, and failed
-  when `claude mcp remove` failed, leaving the file unchanged. A fresh
-  session starting from the hook was not tested.
+  when `claude mcp remove` failed, leaving the file unchanged. After a
+  worker restart, a real `SessionStart:resume` hook run of the current step
+  found the skill aligned and no entry, and reported `ok`; `~/.claude.json`,
+  rewritten during the restart before the hook ran, still had no user-scope
+  `rea` entry. A fresh session starting from the hook was not tested.
 - Windows: confirmed on one Windows machine with the Store build of Claude
   Desktop, Node.js 24.16.0, Temurin JDK 21.0.12 and Ghidra 12.1.4. After the
   private-file registration above, a Chat tab session opened
