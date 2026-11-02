@@ -4,11 +4,11 @@ This fork-local guide covers the three places you can chat with Claude and
 what each needs to use REA. REA is a local-only MCP server: something on the
 same machine as the analysis target must launch it.
 
-| Surface                            | REA skill                     | REA MCP tools                    | Ghidra                                                |
-| ---------------------------------- | ----------------------------- | -------------------------------- | ----------------------------------------------------- |
-| Claude Code cloud sessions         | Account-synced                | Yes, from `.mcp.json`            | Yes, via the setup script and SessionStart hook below |
-| Claude Desktop / local Claude Code | Account-synced or `rea setup` | Yes, via `rea setup`             | Yes, your own installation                            |
-| claude.ai web and mobile chat      | Account-synced                | No (cannot launch local servers) | No                                                    |
+| Surface                            | REA skill                            | REA MCP tools                    | Ghidra                                                |
+| ---------------------------------- | ------------------------------------ | -------------------------------- | ----------------------------------------------------- |
+| Claude Code cloud sessions         | Account-synced and SessionStart hook | Yes, from `.mcp.json`            | Yes, via the setup script and SessionStart hook below |
+| Claude Desktop / local Claude Code | Account-synced or `rea setup`        | Yes, via `rea setup`             | Yes, your own installation                            |
+| claude.ai web and mobile chat      | Account-synced                       | No (cannot launch local servers) | No                                                    |
 
 ## Claude Code cloud sessions
 
@@ -51,17 +51,22 @@ steps are idempotent and each runs on its own:
   is the operator's approval of that installation. When Hopper is installed
   but another Hopper check fails, the step reports REA's remediation instead
   of reinstalling.
-- Claude Code integration, only when `CONFIGURE_CLAUDE_CODE=1`, which the
+- REA skill for Claude Code, only when `CONFIGURE_CLAUDE_CODE=1`, which the
   SessionStart hook sets unless the environment sets it: when
-  `rea doctor --client claude_code --skill` reports drift, the step runs
-  `rea setup --yes --client claude_code`. That backs up `~/.claude.json` to
-  `~/.claude.json.rea.backup`, adds a user-scope `rea` registration, and
-  installs the REA skill into `~/.claude/skills`. It installs no provider.
-  Claude Code connects one `rea` server and takes the repository's
-  `.mcp.json` entry over the user-scope one
-  ([docs](https://code.claude.com/docs/en/mcp)); because the two commands
-  differ, `/mcp` and `claude mcp list` show a same-name warning. Set
-  `CONFIGURE_CLAUDE_CODE=0` in the environment to skip the step.
+  `rea doctor --client claude_code` does not report the skill in
+  `~/.claude/skills` as aligned, the step runs
+  `rea setup --yes --skill-client claude_code`, which installs only the
+  skill. It registers no MCP server, because sessions start REA from
+  `.mcp.json`. Earlier versions of the step ran
+  `rea setup --yes --client claude_code`, which also added a user-scope
+  `rea` entry, `npx -y rea-agents@6.4.0 mcp`, to `~/.claude.json`. That
+  command cannot start REA inside this repository, and `claude mcp list`
+  reported conflicting scopes for it. When the step finds a user-scope `rea`
+  entry with exactly that command, whoever added it, it copies
+  `~/.claude.json` to `~/.claude.json.rea-cloud-<UTC time>.backup` and runs
+  `claude mcp remove rea -s user`. It leaves any other user-scope `rea`
+  entry in place. Set `CONFIGURE_CLAUDE_CODE=0` in the environment to skip
+  the step.
 
 1. **The environment's setup script.** It runs before Claude Code starts, and
    the filesystem it leaves is cached and reused by later sessions for about
@@ -137,6 +142,14 @@ stops the session from starting. `STRICT=1` makes it exit 1 anyway.
    ```bash
    npx -y --prefix=/ rea-agents@6.4.0 doctor --json
    ```
+
+   Expect it to exit 1 with one finding that counts toward `healthy`:
+   `registration:claude_code`, reported as config drift. Doctor checks only
+   Claude Code's user configuration (`~/.claude.json`), not the
+   repository's `.mcp.json`, which sessions use. Do not apply that finding's
+   `rea setup` remediation: it would add the user-scope entry the
+   SessionStart hook removes. `ida-registration` also fails until IDA is
+   configured, but it does not count toward `healthy`.
 
 REA's MCP server checks the Ghidra installation on its first Ghidra request
 and keeps that result for the life of the server. If Ghidra was installed
@@ -339,17 +352,29 @@ analysis that needs REA's tools.
   (not repeated after the final reinstall). The REA MCP tools were not exercised with
   Hopper. `curl` with its default user agent received HTTP 403 from
   `www.hopperapp.com`, while REA's own download succeeded.
-- Claude Code integration: in a cloud session with Hopper 6.4.2 installed,
+- Claude Code skill: in a cloud session with Hopper 6.4.2 installed,
   `rea doctor` reported `skill:identity` and `registration:claude_code` as
-  config drift. With the installed skill removed, the setup script run with
-  `CONFIGURE_CLAUDE_CODE=1` detected the drift, ran
-  `rea setup --yes --client claude_code`, and the scoped doctor then passed;
-  a rerun took about 7 seconds and left `~/.claude.json` unchanged, the step
-  was skipped without the variable, and `session-start.sh` reported it as
-  `ok`. Through `npx`, setup registers `npx -y rea-agents@6.4.0 mcp` without
-  `--prefix=/`, which would fail inside this repository; there the
-  `.mcp.json` entry is used instead. A fresh session starting from the hook
-  was not tested.
+  config drift. The first version of the step ran
+  `rea setup --yes --client claude_code`, which installed the skill and
+  added the user-scope entry `npx -y rea-agents@6.4.0 mcp`. A real
+  `SessionStart:resume` hook run in that session then exited 0 with every
+  step `ok`; its Claude Code step found both already aligned. That entry
+  failed to connect in `claude mcp list`, which reported conflicting scopes,
+  while the session's REA server ran from `.mcp.json` (its environment had
+  `npm_config_prefix=/`). Run by hand in the same container, the current
+  step removed the entry with `claude mcp remove`; the backup was
+  byte-identical to the previous file, and nothing else in it changed.
+  `claude mcp list` then showed only the `.mcp.json` entry, as pending
+  approval from outside the session, without the diagnostic. A rerun of the
+  script, with pwntools and JADX skipped, took about 10 seconds and changed
+  nothing. With the skill removed, the step reinstalled an identical copy;
+  REA 6.4.0's setup still exited 1 with `needs_human`, which the step
+  ignores in favor of doctor's report. The step was skipped without the
+  variable, and `session-start.sh` reported it as `ok`. With a temporary
+  home directory, the step left a foreign user-scope entry (`rea mcp`) in
+  place, failed on a configuration doctor reported as invalid, and failed
+  when `claude mcp remove` failed, leaving the file unchanged. A fresh
+  session starting from the hook was not tested.
 - Windows: confirmed on one Windows machine with the Store build of Claude
   Desktop, Node.js 24.16.0, Temurin JDK 21.0.12 and Ghidra 12.1.4. After the
   private-file registration above, a Chat tab session opened

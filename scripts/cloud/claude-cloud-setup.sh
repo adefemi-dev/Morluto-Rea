@@ -37,13 +37,16 @@
 #      refreshing the apt package lists that installer relies on. Hopper is
 #      commercial software; the demo has vendor-defined limits. Setting
 #      INSTALL_HOPPER=1 in the environment settings is the operator's approval.
-#   7. Claude Code integration, only with CONFIGURE_CLAUDE_CODE=1 (the
-#      SessionStart hook sets it): when `rea doctor --client claude_code
-#      --skill` reports drift, runs `rea setup --yes --client claude_code`,
-#      which backs up and updates ~/.claude.json and installs the REA skill
-#      into ~/.claude/skills. It never installs Hopper. Claude Code still
-#      starts REA from the repository's .mcp.json, which takes precedence over
-#      this user-scope entry of the same name.
+#   7. REA skill for Claude Code, only with CONFIGURE_CLAUDE_CODE=1 (the
+#      SessionStart hook sets it): when `rea doctor --client claude_code` does
+#      not report the skill in ~/.claude/skills as aligned, runs
+#      `rea setup --yes --skill-client claude_code`, which installs only the
+#      skill. It registers no MCP server, because Claude Code starts REA from
+#      the repository's .mcp.json. Earlier versions of this step also added a
+#      user-scope `rea` entry to ~/.claude.json whose command,
+#      `npx -y rea-agents@<version> mcp`, cannot start REA inside this
+#      repository and made Claude Code report conflicting scopes. The step
+#      backs up ~/.claude.json and removes an entry with exactly that command.
 #
 # After it runs, add these environment variables in the same environment
 # settings so the REA MCP server sees the installations:
@@ -414,46 +417,72 @@ install_hopper() {
   log "installed Hopper with rea setup"
 }
 
-# Prints "configured" when `rea doctor --client claude_code --skill` reports the
-# Claude Code registration and the installed REA skill as aligned, or "drift"
-# and the failing checks otherwise. As in hopper_state, the report decides and
-# the exit status is ignored.
+# Reads the identity section of `rea doctor --client claude_code` and prints
+# "<skill state> <entry> <config path>". The skill state is doctor's state for
+# the REA skill installed for Claude Code. The entry describes REA's server in
+# Claude Code's user configuration: "added" when its command is exactly the
+# one earlier versions of this step registered, "other" for another command,
+# "none" when there is no entry, or doctor's own state (such as "invalid")
+# when doctor could not read the entry. Both are "unknown" when the report
+# lacks them. As in hopper_state, the report decides and the exit status is
+# ignored.
 claude_code_state() {
   local report
-  report="$(cd / && npx -y --prefix=/ "rea-agents@${REA_VERSION}" doctor --client claude_code --skill --json 2>/dev/null)" || true
+  report="$(cd / && npx -y --prefix=/ "rea-agents@${REA_VERSION}" doctor --client claude_code --json 2>/dev/null)" || true
   printf '%s' "$report" |
     python3 -c '
 import json, sys
+
+def state(report, version):
+    identity = report["identity"]
+    skill = identity["skill"]["state"]
+    found = [r for r in identity["registrations"] if r["client"] == "claude_code"]
+    if not found or found[0]["state"] == "missing":
+        return skill, "none", ""
+    if found[0]["state"] not in ("aligned", "stale"):
+        return skill, found[0]["state"], found[0]["config_path"]
+    added = found[0]["command"] == ["npx", "-y", "rea-agents@" + version, "mcp"]
+    return skill, "added" if added else "other", found[0]["config_path"]
+
 try:
-    report = json.load(sys.stdin)
-except ValueError:
-    print("drift rea doctor did not return a report")
-    sys.exit()
-failing = [c for c in report.get("scope_checks", []) if not c.get("ok")]
-if report.get("healthy") is True and not failing:
-    print("configured")
-else:
-    print("drift " + ("; ".join("%s: %s" % (c.get("name"), c.get("remediation") or c.get("detail")) for c in failing) or "scoped report is not healthy"))
-'
+    print(*state(json.load(sys.stdin), sys.argv[1]))
+except Exception:
+    print("unknown unknown")
+' "$REA_VERSION"
 }
 
-# Registers REA with Claude Code and installs the REA skill through REA's own
-# setup, which backs up the configuration it changes. Without --install-hopper
-# it installs no provider. It runs only when doctor reports drift.
+# Installs the REA skill for Claude Code through REA's own setup, which
+# installs only the skill with --skill-client, and removes the user-scope
+# entry that earlier versions of this step registered. That entry is removed
+# through Claude Code's own command after a backup; any other entry stays.
 configure_claude_code() {
-  local state
-  command -v npx >/dev/null 2>&1 || die "npx not found; cannot run rea setup"
-  state="$(claude_code_state)"
-  if [ "$state" = configured ]; then
-    log "Claude Code registration and REA skill already aligned"
-    return
+  local skill entry config backup
+  command -v npx >/dev/null 2>&1 || die "npx not found; cannot run rea doctor"
+  read -r skill entry config <<<"$(claude_code_state)"
+  [ "$entry" != unknown ] || die "rea doctor did not return an identity report"
+  if [ "$entry" = added ]; then
+    command -v claude >/dev/null 2>&1 || die "claude not found; cannot remove the user-scope rea entry from ${config}"
+    [ -f "$config" ] || die "rea doctor reports the rea entry in ${config}, which is not a file"
+    backup="${config}.rea-cloud-$(date -u +%Y%m%dT%H%M%SZ).backup"
+    cp -p "$config" "$backup" || die "could not back up ${config}"
+    claude mcp remove rea -s user >&2 || die "claude mcp remove rea -s user failed; the backup is ${backup}"
+    log "removed the user-scope rea entry npx -y rea-agents@${REA_VERSION} mcp; backup: ${backup}"
   fi
-  log "Claude Code integration needs setup: ${state#drift }"
-  (cd / && npx -y --prefix=/ "rea-agents@${REA_VERSION}" setup --yes --client claude_code) >&2 ||
-    die "rea setup --client claude_code failed"
-  state="$(claude_code_state)"
-  [ "$state" = configured ] || die "rea doctor still reports Claude Code drift after setup: ${state#drift }"
-  log "configured Claude Code with rea setup"
+  if [ "$skill" != aligned ]; then
+    log "the REA skill for Claude Code is ${skill}; installing it with rea setup"
+    # The exit status is ignored: the doctor check below decides.
+    (cd / && npx -y --prefix=/ "rea-agents@${REA_VERSION}" setup --yes --skill-client claude_code) >&2 ||
+      log "rea setup exited $?"
+  fi
+  read -r skill entry config <<<"$(claude_code_state)"
+  [ "$skill" = aligned ] || die "rea doctor reports the REA skill for Claude Code as ${skill}"
+  case "$entry" in
+    none) ;;
+    added) die "the user-scope rea entry is still present in ${config}" ;;
+    other) log "left the user-scope rea entry in ${config}: its command is not the one this step removes; this repository's .mcp.json entry takes precedence" ;;
+    *) die "rea doctor could not read the rea entry in ${config} (state ${entry}); run rea doctor --client claude_code for details" ;;
+  esac
+  log "the REA skill for Claude Code is aligned; Claude Code starts REA from the repository's .mcp.json"
 }
 
 install_ghidra_and_link() {
@@ -505,9 +534,9 @@ else
   STEP_RESULTS+=("skipped Hopper (set INSTALL_HOPPER=1 to install it)")
 fi
 if [ "${CONFIGURE_CLAUDE_CODE:-0}" = 1 ]; then
-  run_step "Claude Code integration" configure_claude_code
+  run_step "Claude Code skill" configure_claude_code
 else
-  STEP_RESULTS+=("skipped Claude Code integration (set CONFIGURE_CLAUDE_CODE=1 to run it)")
+  STEP_RESULTS+=("skipped Claude Code skill (set CONFIGURE_CLAUDE_CODE=1 to run it)")
 fi
 
 log "=== summary"
