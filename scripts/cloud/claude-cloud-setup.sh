@@ -30,14 +30,21 @@
 #   5. JADX: downloads the jadx-headless-mcp 0.7.1 JAR that REA pins for
 #      Android analysis, checks REA's pinned SHA-256, and stores it at
 #      JADX_JAR (default /opt/rea-jadx/jadx-headless-mcp-0.7.1-all.jar).
-#   6. Hopper, only with INSTALL_HOPPER=1: when `rea doctor` does not report an
+#   6. apktool: installs the distribution's apktool package through apt-get
+#      when no launcher is selected (REA_APKTOOL_COMMAND unset and no apktool
+#      on PATH), then checks that `apktool --version` runs. REA's Apktool
+#      resource analysis is verified with 2.7.0, the Ubuntu 24.04 package.
+#      adb is not installed: cloud sessions have no device, no emulator
+#      (no /dev/kvm) and only an HTTPS proxy, so REA's adb tools would have
+#      nothing to reach.
+#   7. Hopper, only with INSTALL_HOPPER=1: when `rea doctor` does not report an
 #      installed Hopper, runs `rea setup --yes --install-hopper`, REA's own
 #      installer, which downloads the Hopper Linux demo from www.hopperapp.com,
 #      verifies it, and installs it with its Xvfb dependencies, after
 #      refreshing the apt package lists that installer relies on. Hopper is
 #      commercial software; the demo has vendor-defined limits. Setting
 #      INSTALL_HOPPER=1 in the environment settings is the operator's approval.
-#   7. REA skill for Claude Code, only with CONFIGURE_CLAUDE_CODE=1 (the
+#   8. REA skill for Claude Code, only with CONFIGURE_CLAUDE_CODE=1 (the
 #      SessionStart hook sets it). Claude Code already loads the account-synced
 #      copy of the skill from ~/.claude/skills/synced; when
 #      `rea doctor --client claude_code`, run on a scratch copy of it, reports
@@ -91,8 +98,9 @@
 #                    /opt/rea-jadx/jadx-headless-mcp-0.7.1-all.jar. An existing
 #                    file with another digest is never replaced.
 #   SKIP_JADX=1      Skip step 5.
-#   INSTALL_HOPPER=1 Run step 6; it is skipped otherwise.
-#   CONFIGURE_CLAUDE_CODE=1  Run step 7; it is skipped otherwise.
+#   SKIP_APKTOOL=1   Skip step 6.
+#   INSTALL_HOPPER=1 Run step 7; it is skipped otherwise.
+#   CONFIGURE_CLAUDE_CODE=1  Run step 8; it is skipped otherwise.
 #   LOG_FILE         Log file, default /var/log/rea-cloud-setup.log; set it
 #                    empty to disable.
 #   SUMMARY_FILE     Optional file that receives the step summary lines.
@@ -364,6 +372,33 @@ install_jadx() {
   log "installed the JADX JAR at ${JADX_JAR} (SHA-256 verified)"
 }
 
+# Leaves a launcher the operator selected alone; otherwise installs the
+# distribution package, which brings its own aapt and Java libraries and uses
+# the JDK from the prerequisites step. REA resolves apktool the same way:
+# REA_APKTOOL_COMMAND first, then apktool on PATH.
+install_apktool() {
+  local launcher version
+  if [ -n "${REA_APKTOOL_COMMAND:-}" ]; then
+    launcher="$REA_APKTOOL_COMMAND"
+    case "$launcher" in
+      /*) ;;
+      *) die "REA_APKTOOL_COMMAND must be an absolute path; REA rejects a relative launcher (got ${launcher})" ;;
+    esac
+    [ -x "$launcher" ] || die "REA_APKTOOL_COMMAND is not an executable file: ${launcher}"
+  elif launcher="$(command -v apktool)"; then
+    :
+  else
+    command -v apt-get >/dev/null 2>&1 || die "apt-get not found; install apktool 2.7.0 or newer manually"
+    log "installing apktool from the distribution packages"
+    as_root env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends apktool
+    launcher="$(command -v apktool)" || die "apktool is not on PATH after installing the package"
+  fi
+  version="$("$launcher" --version 2>/dev/null | head -n 1)" || true
+  [ -n "$version" ] || die "${launcher} --version printed no version"
+  log "apktool ${version} at ${launcher}"
+}
+
 # Reads `rea doctor --provider hopper` and prints one line: "installed" when
 # every Hopper check passes, "runtime" and the failing checks when Hopper is
 # installed but another Hopper check fails, or "missing". rea doctor exits 1
@@ -608,6 +643,11 @@ if [ "${SKIP_JADX:-0}" = 1 ]; then
   STEP_RESULTS+=("skipped JADX (SKIP_JADX=1)")
 else
   run_step "JADX" install_jadx
+fi
+if [ "${SKIP_APKTOOL:-0}" = 1 ]; then
+  STEP_RESULTS+=("skipped apktool (SKIP_APKTOOL=1)")
+else
+  run_step "apktool" install_apktool
 fi
 if [ "${INSTALL_HOPPER:-0}" = 1 ]; then
   run_step "Hopper" install_hopper
