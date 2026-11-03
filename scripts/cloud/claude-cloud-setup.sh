@@ -38,11 +38,17 @@
 #      commercial software; the demo has vendor-defined limits. Setting
 #      INSTALL_HOPPER=1 in the environment settings is the operator's approval.
 #   7. REA skill for Claude Code, only with CONFIGURE_CLAUDE_CODE=1 (the
-#      SessionStart hook sets it): when `rea doctor --client claude_code` does
-#      not report the skill in ~/.claude/skills as aligned, runs
-#      `rea setup --yes --skill-client claude_code`, which installs only the
-#      skill. It registers no MCP server, because Claude Code starts REA from
-#      the repository's .mcp.json. Earlier versions of this step also added a
+#      SessionStart hook sets it). Claude Code already loads the account-synced
+#      copy of the skill from ~/.claude/skills/synced; when
+#      `rea doctor --client claude_code`, run on a scratch copy of it, reports
+#      it aligned (current version and tool count, every managed file
+#      byte-identical to REA's packaged bundle), the step installs no local
+#      copy and moves a byte-identical local copy, which earlier versions
+#      installed, to ~/.claude/rea-cloud-skill-backup-<time>, so the skill
+#      loads once. Otherwise, when doctor does not report the
+#      local skill as aligned, it runs `rea setup --yes --skill-client
+#      claude_code`, which installs only the skill. It registers no MCP server,
+#      because Claude Code starts REA from the repository's .mcp.json. Earlier versions of this step also added a
 #      user-scope `rea` entry to ~/.claude.json whose command,
 #      `npx -y rea-agents@<version> mcp`, cannot start REA inside this
 #      repository and made Claude Code report conflicting scopes. The step
@@ -418,48 +424,101 @@ install_hopper() {
 }
 
 # Reads the identity section of `rea doctor --client claude_code` and prints
-# "<skill state> <entry> <config path>". The skill state is doctor's state for
-# the REA skill installed for Claude Code. The entry describes REA's server in
-# Claude Code's user configuration: "added" when its command is exactly the
-# one earlier versions of this step registered, "other" for another command,
-# "none" when there is no entry, or doctor's own state (such as "invalid")
-# when doctor could not read the entry. Both are "unknown" when the report
-# lacks them. As in hopper_state, the report decides and the exit status is
-# ignored.
+# four tab-separated fields: "<skill> <entry> <local dir> <config path>", with
+# "-" for an empty path.
+#   skill   doctor's state for the REA skill in ~/.claude/skills.
+#   entry   REA's server in Claude Code's user configuration: "added" when its
+#           command is exactly the one earlier versions of this step
+#           registered, "other" for another command, "none" when there is no
+#           entry, or doctor's own state (such as "invalid") when doctor could
+#           not read it.
+# Both are "unknown" when the report lacks them. As in hopper_state, the report
+# decides and the exit status is ignored.
 claude_code_state() {
   local report
   report="$(cd / && npx -y --prefix=/ "rea-agents@${REA_VERSION}" doctor --client claude_code --json 2>/dev/null)" || true
   printf '%s' "$report" |
     python3 -c '
-import json, sys
+import json, os, sys
 
 def state(report, version):
     identity = report["identity"]
     skill = identity["skill"]["state"]
+    root = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    local = os.path.join(root, "skills", "reverse-engineer-anything")
     found = [r for r in identity["registrations"] if r["client"] == "claude_code"]
     if not found or found[0]["state"] == "missing":
-        return skill, "none", ""
+        return skill, "none", local, "-"
     if found[0]["state"] not in ("aligned", "stale"):
-        return skill, found[0]["state"], found[0]["config_path"]
+        return skill, found[0]["state"], local, found[0]["config_path"]
     added = found[0]["command"] == ["npx", "-y", "rea-agents@" + version, "mcp"]
-    return skill, "added" if added else "other", found[0]["config_path"]
+    return skill, "added" if added else "other", local, found[0]["config_path"]
 
 try:
-    print(*state(json.load(sys.stdin), sys.argv[1]))
+    print("\t".join(state(json.load(sys.stdin), sys.argv[1])))
 except Exception:
-    print("unknown unknown")
+    print("\t".join(["unknown"] * 2 + ["-", "-"]))
 ' "$REA_VERSION"
 }
 
-# Installs the REA skill for Claude Code through REA's own setup, which
-# installs only the skill with --skill-client, and removes the user-scope
-# entry that earlier versions of this step registered. That entry is removed
-# through Claude Code's own command after a backup; any other entry stays.
+# Prints each account-synced REA skill directory next to the local skill
+# directory given as the argument.
+synced_skill_dirs() {
+  python3 - "$1" <<'PY'
+import glob, os, sys
+skills = os.path.dirname(sys.argv[1])
+for path in sorted(glob.glob(os.path.join(skills, "synced", "*", "reverse-engineer-anything"))):
+    print(path)
+PY
+}
+
+# Prints "current" when rea doctor reports an account-synced copy of the skill
+# (a sibling of the local skill directory given as the argument, under
+# skills/synced) aligned, "none" when there is no synced copy, else doctor's
+# state for the last copy checked ("unknown" when doctor gave none). Doctor
+# inspects only CLAUDE_CONFIG_DIR/skills, so each synced copy is copied into a
+# scratch CLAUDE_CONFIG_DIR and doctor's own rule decides: the declared version
+# and tool count, and every managed file byte-identical to the packaged bundle.
+synced_skill_state() {
+  local candidate scratch state=none
+  while IFS= read -r candidate; do
+    state=unknown
+    scratch="$(mktemp -d)" || break
+    if mkdir "${scratch}/skills" && cp -RP "$candidate" "${scratch}/skills/"; then
+      state="$(cd / && CLAUDE_CONFIG_DIR="$scratch" npx -y --prefix=/ "rea-agents@${REA_VERSION}" doctor --client claude_code --json 2>/dev/null |
+        python3 -c '
+import json, sys
+try:
+    print(json.load(sys.stdin)["identity"]["skill"]["state"])
+except Exception:
+    print("unknown")
+')"
+    fi
+    rm -rf "$scratch"
+    if [ "$state" = aligned ]; then
+      state=current
+      break
+    fi
+  done < <(synced_skill_dirs "$1")
+  printf '%s' "$state"
+}
+
+# Gives Claude Code one copy of the REA skill and removes the user-scope entry
+# that earlier versions of this step registered.
+#   - When the account-synced copy is current, Claude Code already loads it,
+#     so no local copy is installed. A local copy byte-identical to the synced
+#     one, which earlier versions of this step installed, is moved to a backup
+#     directory outside ~/.claude/skills; a local copy that differs stays.
+#   - Otherwise REA's own setup installs the local copy (--skill-client
+#     installs only the skill), and doctor must then report it aligned.
+# The registration entry is removed through Claude Code's own command after a
+# backup; any other entry stays.
 configure_claude_code() {
-  local skill entry config backup
+  local skill entry synced local_dir config backup synced_dir candidate
   command -v npx >/dev/null 2>&1 || die "npx not found; cannot run rea doctor"
-  read -r skill entry config <<<"$(claude_code_state)"
+  IFS=$'\t' read -r skill entry local_dir config <<<"$(claude_code_state)"
   [ "$entry" != unknown ] || die "rea doctor did not return an identity report"
+  synced="$(synced_skill_state "$local_dir")"
   if [ "$entry" = added ]; then
     command -v claude >/dev/null 2>&1 || die "claude not found; cannot remove the user-scope rea entry from ${config}"
     [ -f "$config" ] || die "rea doctor reports the rea entry in ${config}, which is not a file"
@@ -468,21 +527,43 @@ configure_claude_code() {
     claude mcp remove rea -s user >&2 || die "claude mcp remove rea -s user failed; the backup is ${backup}"
     log "removed the user-scope rea entry npx -y rea-agents@${REA_VERSION} mcp; backup: ${backup}"
   fi
-  if [ "$skill" != aligned ]; then
-    log "the REA skill for Claude Code is ${skill}; installing it with rea setup"
-    # The exit status is ignored: the doctor check below decides.
-    (cd / && npx -y --prefix=/ "rea-agents@${REA_VERSION}" setup --yes --skill-client claude_code) >&2 ||
-      log "rea setup exited $?"
+  if [ "$synced" = current ]; then
+    if [ -e "$local_dir" ] || [ -L "$local_dir" ]; then
+      synced_dir=""
+      while IFS= read -r candidate; do
+        if diff -r "$candidate" "$local_dir" >/dev/null 2>&1; then
+          synced_dir="$candidate"
+          break
+        fi
+      done < <(synced_skill_dirs "$local_dir")
+      if [ -n "$synced_dir" ] && [ ! -L "$local_dir" ]; then
+        backup="$(dirname "$(dirname "$local_dir")")/rea-cloud-skill-backup-$(date -u +%Y%m%dT%H%M%SZ)"
+        mkdir -p "$backup" || die "could not create ${backup}"
+        mv "$local_dir" "$backup/" || die "could not move ${local_dir} to ${backup}"
+        log "moved the local REA skill, identical to the account-synced copy, to ${backup}"
+      else
+        log "left the local REA skill at ${local_dir}: it differs from the account-synced copy, so Claude Code loads both"
+      fi
+    fi
+    log "the account-synced REA skill is current, so this step installs no local copy"
+  else
+    if [ "$skill" != aligned ]; then
+      log "the REA skill for Claude Code is ${skill} and no current account-synced copy exists (${synced}); installing it with rea setup"
+      # The exit status is ignored: the doctor check below decides.
+      (cd / && npx -y --prefix=/ "rea-agents@${REA_VERSION}" setup --yes --skill-client claude_code) >&2 ||
+        log "rea setup exited $?"
+    fi
   fi
-  read -r skill entry config <<<"$(claude_code_state)"
-  [ "$skill" = aligned ] || die "rea doctor reports the REA skill for Claude Code as ${skill}"
+  IFS=$'\t' read -r skill entry local_dir config <<<"$(claude_code_state)"
+  [ "$synced" = current ] || [ "$skill" = aligned ] ||
+    die "rea doctor reports the REA skill for Claude Code as ${skill}, and no current account-synced copy exists"
   case "$entry" in
     none) ;;
     added) die "the user-scope rea entry is still present in ${config}" ;;
     other) log "left the user-scope rea entry in ${config}: its command is not the one this step removes; this repository's .mcp.json entry takes precedence" ;;
     *) die "rea doctor could not read the rea entry in ${config} (state ${entry}); run rea doctor --client claude_code for details" ;;
   esac
-  log "the REA skill for Claude Code is aligned; Claude Code starts REA from the repository's .mcp.json"
+  log "Claude Code has the REA skill and starts REA from the repository's .mcp.json"
 }
 
 install_ghidra_and_link() {

@@ -14,9 +14,10 @@
 # so a failed step never blocks the session.
 #
 # It also sets CONFIGURE_CLAUDE_CODE=1 unless the environment sets it, so the
-# setup script installs the REA skill for Claude Code and removes the
-# user-scope rea entry that earlier versions of that step added. Set
-# CONFIGURE_CLAUDE_CODE=0 in the environment to skip it.
+# setup script leaves Claude Code one copy of the REA skill (the account-synced
+# one when it is current) and removes the user-scope rea entry that earlier
+# versions of that step added. Set CONFIGURE_CLAUDE_CODE=0 in the environment
+# to skip it.
 #
 # The hook runs when the session starts. REA's MCP server checks the Ghidra
 # installation on its first Ghidra request and keeps the result, so if Ghidra
