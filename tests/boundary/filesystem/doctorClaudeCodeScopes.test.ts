@@ -274,6 +274,31 @@ describe("doctor Claude Code registration scopes", () => {
       "registration:claude_code",
     );
   });
+});
+
+describe("doctor Claude Code scope boundaries", () => {
+  it("reads only the user scope when no project directory is selected", async () => {
+    // Setup's own verification uses this host; the repository it runs in has
+    // a project .mcp.json that must not replace the entry setup wrote.
+    const context = await claudeCodeHome("rea-doctor-setup-scope-");
+    await writeJson(context.userConfigPath, {
+      mcpServers: { rea: server("-y", pinned, "mcp") },
+    });
+
+    const report = await runDoctor(
+      undefined,
+      systemDoctorHost({ environment: context.environment }),
+      { clients: ["claude_code"] },
+    );
+
+    expect(report.identity?.registrations).toEqual([
+      expect.objectContaining({
+        config_path: context.userConfigPath,
+        state: "aligned",
+      }),
+    ]);
+    expect(report.identity?.registrations[0]).not.toHaveProperty("scope");
+  });
 
   it("leaves update maintenance on the user scope it manages", async () => {
     const context = await claudeCodeHome("rea-doctor-maintenance-scope-");

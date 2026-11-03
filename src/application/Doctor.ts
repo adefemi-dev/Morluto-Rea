@@ -417,8 +417,9 @@ export interface SystemDoctorHostOptions {
   >;
   readonly linuxDemoRuntimeCheck?: () => Promise<DoctorCheck>;
   /**
-   * Project whose Claude Code local- and project-scope registrations apply;
-   * defaults to the current working directory, as for a client started there.
+   * Project whose Claude Code local- and project-scope registrations apply.
+   * Without one, doctor reads only the user scope that setup manages, so
+   * setup's own verification is unaffected by the directory it runs in.
    */
   readonly projectDirectory?: string;
 }
@@ -594,10 +595,9 @@ export const systemDoctorHost = (
         platform,
         environment,
       ).find(({ name }) => name === "claude_code");
-      if (claudeCode === undefined) return statuses;
-      const projectDirectory = resolve(
-        options.projectDirectory ?? process.cwd(),
-      );
+      if (claudeCode === undefined || options.projectDirectory === undefined)
+        return statuses;
+      const projectDirectory = resolve(options.projectDirectory);
       return Promise.all(
         statuses.map((status) =>
           status.client === claudeCode.name

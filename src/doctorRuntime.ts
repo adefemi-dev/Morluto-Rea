@@ -10,9 +10,14 @@ import { inspectIdaRegistration } from "./ida/IdaDoctor.js";
 import { parseJebMcpEndpoint } from "./jeb/JebMcpEndpoint.js";
 import { selectLinuxPrivateDisplayStrategy } from "./hopper/LinuxPrivateDisplayProbe.js";
 
-/** Compose provider diagnostics at the outer CLI adapter boundary. */
+/**
+ * Compose provider diagnostics at the outer CLI adapter boundary. A selected
+ * project directory adds Claude Code's local and project scopes; setup omits
+ * it because it verifies only the user-scope registration it writes.
+ */
 export const createSystemDoctorHost = (
   environment: Readonly<NodeJS.ProcessEnv> = process.env,
+  projectDirectory?: string,
 ): DoctorHost => {
   const selectedJebEndpoint = environment.REA_JEB_MCP_URL;
   const selectedJebRegistrationEnvironment: Readonly<Record<string, string>> =
@@ -23,6 +28,7 @@ export const createSystemDoctorHost = (
       : {};
   return systemDoctorHost({
     environment,
+    ...(projectDirectory === undefined ? {} : { projectDirectory }),
     providerRegistrationEnvironment: () => selectedJebRegistrationEnvironment,
     providerInspections: async () => [
       await inspectSystemGhidraProvider(environment),
