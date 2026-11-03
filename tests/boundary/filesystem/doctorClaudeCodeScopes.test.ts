@@ -1,4 +1,4 @@
-import { mkdir, rename, writeFile } from "node:fs/promises";
+import { chmod, mkdir, rename, symlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { describe, expect, it } from "vitest";
@@ -117,9 +117,55 @@ describe("doctor Claude Code account-synced skill", () => {
     expect(report.identity?.skill).toMatchObject({
       state: "stale",
       account_synced_path: synced,
+      remediation: expect.stringContaining("claude.ai account"),
+    });
+    expect(report.identity?.skill.remediation).not.toContain(
+      "Run rea setup to update",
+    );
+    expect(report.checks.map(({ name }) => name)).toContain("skill:identity");
+  });
+
+  it("reports an unreadable synced root as unknown, not missing", async () => {
+    const context = await claudeCodeHome("rea-doctor-synced-loop-");
+    const syncedRoot = join(context.configDirectory, "skills", "synced");
+    await mkdir(dirname(syncedRoot), { recursive: true });
+    // A self-referential link fails to read (ELOOP) even for root.
+    await symlink(syncedRoot, syncedRoot);
+
+    const report = await context.doctor();
+
+    expect(report.identity?.skill).toMatchObject({
+      state: "unknown",
+      issues: [
+        expect.objectContaining({ path: syncedRoot, kind: "unreadable" }),
+      ],
     });
     expect(report.checks.map(({ name }) => name)).toContain("skill:identity");
   });
+
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "reports an unreadable account directory as unknown",
+    async () => {
+      const context = await claudeCodeHome("rea-doctor-synced-eacces-");
+      const account = join(context.configDirectory, "skills/synced/account-a");
+      await mkdir(account, { recursive: true });
+      await chmod(account, 0o000);
+      try {
+        expect((await context.doctor()).identity?.skill).toMatchObject({
+          state: "unknown",
+          issues: [
+            expect.objectContaining({
+              path: join(account, PRODUCT_IDENTITY.skillName),
+              kind: "unreadable",
+              detail: expect.stringContaining("EACCES"),
+            }),
+          ],
+        });
+      } finally {
+        await chmod(account, 0o700);
+      }
+    },
+  );
 
   it("judges an existing personal copy instead of a synced one", async () => {
     const context = await claudeCodeHome("rea-doctor-personal-skill-");
@@ -244,6 +290,34 @@ describe("doctor Claude Code registration scopes", () => {
   it.each([
     ["a malformed .mcp.json", "project", "{"],
     ["a non-object project server table", "project", { mcpServers: [] }],
+    [
+      "an invalid project server environment",
+      "project",
+      {
+        mcpServers: {
+          rea: {
+            ...server("-y", pinned, "mcp"),
+            env: { REA_LOG_LEVEL: "loud" },
+          },
+        },
+      },
+    ],
+    [
+      "an invalid local server environment",
+      "local",
+      (project: string) => ({
+        projects: {
+          [project]: {
+            mcpServers: {
+              rea: {
+                ...server("-y", pinned, "mcp"),
+                env: { REA_LOG_LEVEL: 1 },
+              },
+            },
+          },
+        },
+      }),
+    ],
     [
       "a non-object local server table",
       "local",

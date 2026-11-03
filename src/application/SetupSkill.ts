@@ -607,7 +607,7 @@ export const readInstalledSkillIdentity = async (
   platform: NodeJS.Platform = process.platform,
   resources?: ArtifactResourceScope,
 ): Promise<InstalledSkillIdentity | undefined> => {
-  const { destinations, accountSyncedPath } =
+  const { destinations, accountSyncedPath, discoveryIssues } =
     await withAccountSyncedClaudeCodeSkill(
       skillDestinations(home, clientIds, environment, platform),
       resources,
@@ -616,7 +616,10 @@ export const readInstalledSkillIdentity = async (
   const content = inspection.ok
     ? inspection.value.manifest
     : inspection.error.manifest;
-  const issues = inspection.ok ? [] : inspection.error.issues;
+  const issues = [
+    ...discoveryIssues,
+    ...(inspection.ok ? [] : inspection.error.issues),
+  ];
   if (content === undefined && issues.length === 0) return undefined;
   const toolCount =
     content === undefined
@@ -648,14 +651,17 @@ const withAccountSyncedClaudeCodeSkill = async (
 ): Promise<{
   readonly destinations: readonly SkillDestination[];
   readonly accountSyncedPath?: string;
+  /** Synced locations that could not be read; their applicability is unknown. */
+  readonly discoveryIssues: readonly SkillPathIssue[];
 }> => {
   const index = destinations.findIndex(
     ({ client }) => client === "claude_code",
   );
   const personal = destinations[index];
   if (personal === undefined || (await pathExists(personal.path)))
-    return { destinations };
-  const candidates = await accountSyncedSkillPaths(dirname(personal.path));
+    return { destinations, discoveryIssues: [] };
+  const { paths: candidates, issues: discoveryIssues } =
+    await accountSyncedSkillPaths(dirname(personal.path));
   let selected = candidates[0];
   for (const path of candidates) {
     const inspection = await inspectCanonicalSkill(
@@ -667,40 +673,59 @@ const withAccountSyncedClaudeCodeSkill = async (
       break;
     }
   }
-  if (selected === undefined) return { destinations };
+  if (selected === undefined) return { destinations, discoveryIssues };
   return {
     destinations: destinations.map((destination, position) =>
       position === index ? { ...destination, path: selected } : destination,
     ),
     accountSyncedPath: selected,
+    discoveryIssues,
   };
 };
 
-/** Synced REA skill directories, in a stable order; unreadable roots yield none. */
+/**
+ * Synced REA skill directories in a stable order. Only absence (a missing
+ * path, or a non-directory where a directory would be) means no copy; any
+ * other read failure is kept as an unreadable issue.
+ */
 const accountSyncedSkillPaths = async (
   skillsDirectory: string,
-): Promise<readonly string[]> => {
+): Promise<{
+  readonly paths: readonly string[];
+  readonly issues: readonly SkillPathIssue[];
+}> => {
   const syncedRoot = join(skillsDirectory, "synced");
   let entries: readonly string[];
   try {
     entries = await readdir(syncedRoot);
   } catch (cause: unknown) {
-    // best-effort probing: no readable synced root means no synced copy.
-    void cause;
-    return [];
+    return isAbsence(cause)
+      ? { paths: [], issues: [] }
+      : { paths: [], issues: [unreadableSkillPath(syncedRoot, cause)] };
   }
   const paths: string[] = [];
+  const issues: SkillPathIssue[] = [];
   for (const entry of [...entries].sort(compareUnicodeCodePoints)) {
     const path = join(syncedRoot, entry, PRODUCT_IDENTITY.skillName);
     try {
       if ((await lstat(path)).isDirectory()) paths.push(path);
     } catch (cause: unknown) {
-      // best-effort probing: an account without the REA skill has no entry.
-      void cause;
+      if (!isAbsence(cause)) issues.push(unreadableSkillPath(path, cause));
     }
   }
-  return paths;
+  return { paths, issues };
 };
+
+const isAbsence = (cause: unknown): boolean =>
+  cause instanceof Error &&
+  "code" in cause &&
+  (cause.code === "ENOENT" || cause.code === "ENOTDIR");
+
+const unreadableSkillPath = (path: string, cause: unknown): SkillPathIssue => ({
+  path,
+  kind: "unreadable",
+  detail: cause instanceof Error ? cause.message : String(cause),
+});
 
 const pathExists = async (path: string): Promise<boolean> => {
   try {

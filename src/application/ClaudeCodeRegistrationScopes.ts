@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { PRODUCT_IDENTITY } from "../identity.js";
 import type { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 import { readConfigurationFile } from "./ClientConfigurationFiles.js";
+import { clientRegistrationEnvironment } from "./ClientRegistrationEnvironment.js";
 import {
   scopedClaudeCodeRegistrationStatus,
   type ClientRegistrationStatus,
@@ -75,6 +76,16 @@ const scopedEntry = async (
   if (typeof servers === "string") return invalid(`${servers} in ${path}.`);
   if (servers === undefined || !Object.hasOwn(servers, serverKey))
     return undefined;
+  // REA rejects an invalid server environment at startup, as for user scope.
+  const environment = clientRegistrationEnvironment({
+    ...parsed.value,
+    servers,
+    legacyServers: {},
+  });
+  if (!environment.ok)
+    return invalid(
+      `Configuration ${path} has an invalid REA server environment: ${environment.error.settings.map(({ setting, constraint }) => `${setting}: ${constraint}`).join("; ")}. Repair it, then restart Claude Code.`,
+    );
   return scopedClaudeCodeRegistrationStatus(
     servers[serverKey],
     source,

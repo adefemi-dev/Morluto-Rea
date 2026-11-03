@@ -367,6 +367,10 @@ const skillIdentityRemediation = (
   const issues = identity?.issues;
   if (issues !== undefined && issues.length > 0)
     return `${issues.map(({ path, detail }) => `${detail} (${path})`).join(" ")} Verify the reported paths and use regular skill directories, or run rea setup with --skill=false to configure the client without installing the skill.`;
+  // Claude Code loads this copy from a claude.ai account; setup never writes
+  // it, and a personal copy from setup would only hide it from later checks.
+  if (identity?.accountSyncedPath !== undefined)
+    return `Claude Code loads the REA skill synced from your claude.ai account (${identity.accountSyncedPath}). Update that account skill to the bundle packaged with REA ${PRODUCT_IDENTITY.packageVersion} and start a new session; rea setup installs only a personal copy and does not change it.`;
   return "Run rea setup to update the installed REA skill.";
 };
 
