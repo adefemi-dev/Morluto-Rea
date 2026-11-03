@@ -140,7 +140,11 @@ checked; `doctor.scope.clients` continues to describe required registrations.
 An unselected shared skill does not affect a client-only refresh.
 
 `doctor --skill --json` verifies the selected copies against the bundled
-instructions and references. Consumers should use `identity.skill.state`,
+instructions and references. When Claude Code has no personal copy in its
+skill directory, doctor checks the copies Claude Code syncs from a claude.ai
+account into `skills/synced/` there, preferring a current one, and names the
+copy it judged in `identity.skill.account_synced_path`. Setup and update never
+write synced copies. Consumers should use `identity.skill.state`,
 `installed_version`, and `installed_tool_count` for skill readiness. The
 obsolete `installed_catalog_digest` field has been removed; current catalog
 identity remains available at `identity.catalog`.
@@ -274,9 +278,14 @@ claude mcp add --scope local rea -- cmd.exe /d /c npx -y rea-agents@6.4.0 mcp
 Local scope stores the entry under that directory's path in `~/.claude.json`,
 so other projects don't load it. This route doesn't install the bundled skill.
 Avoid `--scope project`, which writes `.mcp.json` into the repository where it
-can be committed or copied. `rea doctor` and `rea uninstall` read only the
-user-level entry, so they don't report or remove a local-scope registration;
-remove it with `claude mcp remove --scope local rea` from the same directory.
+can be committed or copied. Run from that project directory, `rea doctor`
+reports the `rea` entry Claude Code uses there, following its precedence:
+local scope, then the project's `.mcp.json`, then the user entry. Each result
+names its `scope`, and a project entry's `approval` is `unknown` because Claude
+Code keeps no documented record of that answer; doctor does not count an
+unknown approval as a failure. `rea uninstall` reads only the user-level entry,
+so it doesn't remove a local-scope registration; remove it with
+`claude mcp remove --scope local rea` from the same directory.
 `rea update` doesn't refresh it either, so it stays on the version it names.
 To move it to a newer release, first back up the project entry in
 `~/.claude.json` and record its environment and other metadata. In particular,

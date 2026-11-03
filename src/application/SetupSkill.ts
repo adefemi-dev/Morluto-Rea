@@ -1,4 +1,11 @@
-import { copyFile, lstat, mkdir, readFile, rm } from "node:fs/promises";
+import {
+  copyFile,
+  lstat,
+  mkdir,
+  readFile,
+  readdir,
+  rm,
+} from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { dirname, join } from "node:path";
 import writeFileAtomic from "write-file-atomic";
@@ -8,6 +15,7 @@ import type { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.j
 import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
 
 import { PRODUCT_IDENTITY } from "../identity.js";
+import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 import {
   NonRegularFileReadError,
   RegularFileChangedError,
@@ -179,6 +187,8 @@ export interface InstalledSkillIdentity {
   readonly toolCount: number | null;
   readonly canonical: boolean;
   readonly issues?: readonly SkillPathIssue[];
+  /** Account-synced Claude Code copy inspected in place of an absent personal copy. */
+  readonly accountSyncedPath?: string;
 }
 
 /** Known management blockers and unresolved filesystem observations. */
@@ -371,18 +381,9 @@ interface SkillInspectionFailure {
 }
 
 const inspectCanonicalSkill = async (
-  home: string,
-  clientIds: readonly string[],
-  environment: Readonly<NodeJS.ProcessEnv>,
-  platform: NodeJS.Platform,
+  destinations: readonly SkillDestination[],
   resources?: ArtifactResourceScope,
 ): Promise<Result<CanonicalSkillInspection, SkillInspectionFailure>> => {
-  const destinations = skillDestinations(
-    home,
-    clientIds,
-    environment,
-    platform,
-  );
   const issues = [...(await skillDirectoryIssues(destinations))];
   if (issues.length > 0)
     return err({
@@ -445,10 +446,7 @@ export const canonicalSkillNeedsInstall = async (
 ): Promise<boolean> => {
   try {
     const inspection = await inspectCanonicalSkill(
-      home,
-      clientIds,
-      environment,
-      platform,
+      skillDestinations(home, clientIds, environment, platform),
       resources,
     );
     return !inspection.ok || !inspection.value.canonical;
@@ -609,13 +607,12 @@ export const readInstalledSkillIdentity = async (
   platform: NodeJS.Platform = process.platform,
   resources?: ArtifactResourceScope,
 ): Promise<InstalledSkillIdentity | undefined> => {
-  const inspection = await inspectCanonicalSkill(
-    home,
-    clientIds,
-    environment,
-    platform,
-    resources,
-  );
+  const { destinations, accountSyncedPath } =
+    await withAccountSyncedClaudeCodeSkill(
+      skillDestinations(home, clientIds, environment, platform),
+      resources,
+    );
+  const inspection = await inspectCanonicalSkill(destinations, resources);
   const content = inspection.ok
     ? inspection.value.manifest
     : inspection.error.manifest;
@@ -633,5 +630,86 @@ export const readInstalledSkillIdentity = async (
         : (/^\s{2}version:\s*"([^"]+)"\s*$/mu.exec(content)?.[1] ?? null),
     toolCount: toolCount === undefined ? null : Number.parseInt(toolCount, 10),
     ...(issues.length === 0 ? {} : { issues }),
+    ...(accountSyncedPath === undefined ? {} : { accountSyncedPath }),
   };
+};
+
+/**
+ * Claude Code downloads the skills enabled for a claude.ai account into
+ * `skills/synced/<id>/` beside personal skills, and cloud sessions load only
+ * those. When the personal REA skill directory is absent, inspect a synced
+ * copy instead, preferring one that matches the packaged bundle. Doctor uses
+ * this observation only; setup and update maintenance still manage the
+ * personal copy alone and never write under `synced`.
+ */
+const withAccountSyncedClaudeCodeSkill = async (
+  destinations: readonly SkillDestination[],
+  resources?: ArtifactResourceScope,
+): Promise<{
+  readonly destinations: readonly SkillDestination[];
+  readonly accountSyncedPath?: string;
+}> => {
+  const index = destinations.findIndex(
+    ({ client }) => client === "claude_code",
+  );
+  const personal = destinations[index];
+  if (personal === undefined || (await pathExists(personal.path)))
+    return { destinations };
+  const candidates = await accountSyncedSkillPaths(dirname(personal.path));
+  let selected = candidates[0];
+  for (const path of candidates) {
+    const inspection = await inspectCanonicalSkill(
+      [{ client: personal.client, path }],
+      resources,
+    );
+    if (inspection.ok && inspection.value.canonical) {
+      selected = path;
+      break;
+    }
+  }
+  if (selected === undefined) return { destinations };
+  return {
+    destinations: destinations.map((destination, position) =>
+      position === index ? { ...destination, path: selected } : destination,
+    ),
+    accountSyncedPath: selected,
+  };
+};
+
+/** Synced REA skill directories, in a stable order; unreadable roots yield none. */
+const accountSyncedSkillPaths = async (
+  skillsDirectory: string,
+): Promise<readonly string[]> => {
+  const syncedRoot = join(skillsDirectory, "synced");
+  let entries: readonly string[];
+  try {
+    entries = await readdir(syncedRoot);
+  } catch (cause: unknown) {
+    // best-effort probing: no readable synced root means no synced copy.
+    void cause;
+    return [];
+  }
+  const paths: string[] = [];
+  for (const entry of [...entries].sort(compareUnicodeCodePoints)) {
+    const path = join(syncedRoot, entry, PRODUCT_IDENTITY.skillName);
+    try {
+      if ((await lstat(path)).isDirectory()) paths.push(path);
+    } catch (cause: unknown) {
+      // best-effort probing: an account without the REA skill has no entry.
+      void cause;
+    }
+  }
+  return paths;
+};
+
+const pathExists = async (path: string): Promise<boolean> => {
+  try {
+    await lstat(path);
+    return true;
+  } catch (cause: unknown) {
+    if (cause instanceof Error && "code" in cause && cause.code === "ENOENT")
+      return false;
+    // Any other failure leaves the personal copy for the normal inspection to report.
+    return true;
+  }
 };
