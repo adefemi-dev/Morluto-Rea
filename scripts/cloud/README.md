@@ -54,8 +54,9 @@ steps are idempotent and each runs on its own:
 - REA skill for Claude Code, only when `CONFIGURE_CLAUDE_CODE=1`, which the
   SessionStart hook sets unless the environment sets it. Claude Code already
   loads the account-synced copy of the skill, from `~/.claude/skills/synced`.
-  When that copy declares the skill version and tool count that
-  `rea doctor --client claude_code` expects, the step installs no local copy,
+  When `rea doctor --client claude_code`, run on a scratch copy of it,
+  reports it aligned (current version and tool count, and every managed file
+  byte-identical to REA's packaged bundle), the step installs no local copy,
   so the skill loads once, and moves a local copy that is byte-identical to the
   synced one, which earlier versions of the step installed, to
   `~/.claude/rea-cloud-skill-backup-<UTC time>`. A local copy that differs
@@ -392,8 +393,10 @@ analysis that needs REA's tools.
   reported `skill:identity` as missing. With temporary home directories, the
   step installed the local copy when no synced copy existed and when the synced
   copy declared version 36, and left a local copy that differed from the
-  synced one in place. That Claude Code then lists the skill once was not yet
-  checked in a new session.
+  synced one in place. Since doctor judges the synced copy, a synced copy with
+  only `SKILL.md`, or with one reference file changed, is not current and the
+  step installs the local copy. That Claude Code then lists the skill once was
+  not yet checked in a new session.
 - Windows: confirmed on one Windows machine with the Store build of Claude
   Desktop, Node.js 24.16.0, Temurin JDK 21.0.12 and Ghidra 12.1.4. After the
   private-file registration above, a Chat tab session opened
