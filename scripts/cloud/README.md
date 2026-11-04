@@ -18,7 +18,7 @@ a session with one repository. A session with several repositories starts in
 the folder above the clones and loads neither, so REA's tools do not appear
 ([docs](https://code.claude.com/docs/en/settings#settings-in-cloud-sessions)).
 
-The repository's `.mcp.json` starts `rea-agents@6.4.0` in every new session.
+The repository's `.mcp.json` starts `rea-agents@6.8.0` in every new session.
 It runs `npx` with `--prefix=/` because this repository's own `package.json`
 is also named `rea-agents`; without it, `npx` resolves the local project and
 fails with `rea: not found`.
@@ -30,7 +30,7 @@ steps are idempotent and each runs on its own:
 
 - prerequisites: a full JDK 21, `procps`, `unzip`, `curl`, and Python venv
   support, installed only when missing;
-- REA package: pre-downloads `rea-agents@6.4.0` with the same command
+- REA package: pre-downloads `rea-agents@6.8.0` with the same command
   `.mcp.json` uses;
 - pwntools: `/opt/rea-pwntools` with pwntools 4.15.0, pyelftools 0.33 and
   unicorn 2.1.2, which REA's ELF layout adapter requires;
@@ -54,9 +54,13 @@ steps are idempotent and each runs on its own:
   that installer runs `apt-get install` without doing so and cloud images can
   start with empty lists. Hopper is commercial software; the demo has vendor-defined
   limits. Without `--client`, this configures no agent. Setting the variable
-  is the operator's approval of that installation. When Hopper is installed
-  but another Hopper check fails, the step reports REA's remediation instead
-  of reinstalling.
+  is the operator's approval of that installation. Each REA release accepts
+  only the Hopper builds it verifies: 6.8.0 rejects the build 6.4.0 installed,
+  and 6.4.0 rejects the build 6.8.0 installs. When only `hopper-version`
+  fails, as after changing `REA_VERSION`, the step reinstalls through the same
+  installer once; if doctor still rejects the build, the step fails. When
+  another Hopper check fails, the step reports REA's remediation instead of
+  reinstalling.
 - REA skill for Claude Code, only when `CONFIGURE_CLAUDE_CODE=1`, which the
   SessionStart hook sets unless the environment sets it. Claude Code already
   loads the account-synced copy of the skill, from `~/.claude/skills/synced`.
@@ -136,8 +140,9 @@ stops the session from starting. `STRICT=1` makes it exit 1 anyway.
    INSTALL_HOPPER=1
    ```
 
-   Leave out `INSTALL_HOPPER=1` to skip Hopper. `rea-agents` 6.4.0 requires `GHIDRA_INSTALL_DIR`. Later releases can also
-   find Ghidra through the `/usr/local/bin/ghidraRun` link the script creates.
+   Leave out `INSTALL_HOPPER=1` to skip Hopper. `rea-agents` 6.8.0 also finds
+   Ghidra through the `/usr/local/bin/ghidraRun` link the script creates, so
+   `GHIDRA_INSTALL_DIR` is optional there; 6.4.0 required it.
 
 5. Under **Network access**, allow these hosts (keep package managers allowed;
    PyPI and npm are already on that list):
@@ -153,21 +158,23 @@ stops the session from starting. `STRICT=1` makes it exit 1 anyway.
 6. Start a new session with only this repository selected and check:
 
    ```bash
-   npx -y --prefix=/ rea-agents@6.4.0 doctor --json
+   npx -y --prefix=/ rea-agents@6.8.0 doctor --json
    ```
 
-   Expect it to exit 1 with two findings that count toward `healthy`, both
-   reported as config drift. `registration:claude_code`: doctor checks only
-   Claude Code's user configuration (`~/.claude.json`), not the repository's
-   `.mcp.json`, which sessions use. `skill:identity`: doctor checks only
-   `~/.claude/skills`, not the account-synced copy Claude Code loads. Do not
-   apply their `rea setup` remediations: they would add the user-scope entry
-   and the second skill copy that the SessionStart hook removes. `ida-registration` also fails until IDA is
-   configured, but it does not count toward `healthy`. REA releases that
-   include doctor's Claude Code scope support read the repository's
-   `.mcp.json` and the account-synced skill, so these two findings go away
-   once `.mcp.json` and `REA_VERSION` pin such a release and the account's
-   synced skill matches it.
+   Expect it to exit 1 with one finding that counts toward `healthy`:
+   `registration:claude_code`, reported as config drift, because 6.8.0's
+   doctor checks only Claude Code's user configuration (`~/.claude.json`), not
+   the repository's `.mcp.json`, which sessions use. Do not apply its
+   `rea setup` remediation: it would add the user-scope entry the
+   SessionStart hook removes. `skill:identity` is aligned when the
+   account-synced skill matches 6.8.0 (skill 49); while the account still
+   holds an older skill, the hook installs a current personal copy, and
+   Claude Code then lists both until the account skill is updated, after
+   which the hook moves the personal copy aside. `ida-registration` and
+   `kuna-installation` also fail until IDA or Kuna is configured, but they do
+   not count toward `healthy`. This fork's doctor (PR #20) reads the
+   repository's `.mcp.json` and the account-synced skill; no published
+   `rea-agents` release includes that change yet.
 
 REA's MCP server checks the Ghidra installation on its first Ghidra request
 and keeps that result for the life of the server. If Ghidra was installed
@@ -369,6 +376,22 @@ analysis that needs REA's tools.
   `inspect_apktool_client` reported the `PATH` launcher, and
   `decode_android_resources` decoded the public F-Droid Diary 1.105 APK
   (manifest, version and SDK facts, 11 string locales, 110 files).
+- REA 6.8.0 in a cloud session: through its CLI, Ghidra decompiled a test
+  function (`strcmp(param_1,"s3cret-key")`), and on the F-Droid Diary 1.105
+  APK `inspect-android-package`, `inspect-android-method` (`Diary.onCreate`),
+  `decode-android-resources` and the new `inspect-apk-signature` succeeded.
+  Hopper failed with "does not match an authenticated cached release or the
+  official current Linux demo" against the build 6.4.0 had installed; after
+  6.8.0's `setup --yes --install-hopper` replaced it, 6.8.0's Hopper
+  decompiled the same function, while 6.4.0 then rejected the new build as
+  `unsupported_hopper_build`. With the new build in place, `session-start.sh`
+  with `REA_VERSION` 6.8.0 reported every step `ok` in about 24 seconds,
+  installed a personal skill copy because the account-synced skill was
+  version 37, and 6.8.0's doctor then failed only `ida-registration`,
+  `kuna-installation` and `registration:claude_code`. The reinstall decision
+  for an older build was exercised with a stand-in `npx` (outdated, healthy,
+  runtime failure, and a reinstall that leaves the build rejected), not with
+  a real older Hopper build.
 - Hopper: in an earlier session `www.hopperapp.com` was not on the network
   allowlist, so the step failed with REA's message "REA could not download or
   unpack the official Hopper package". In a later cloud session that allowed
