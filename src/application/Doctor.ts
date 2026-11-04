@@ -2,7 +2,7 @@ import { constants } from "node:fs";
 import { access, readdir, stat } from "node:fs/promises";
 import { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 import { homeDirectoryFromEnvironment } from "../config/homeDirectory.js";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import { analysisErrorRemediationAction } from "../domain/analysisErrorPresentation.js";
 import { BinaryTargetError } from "../domain/configurationErrors.js";
@@ -27,6 +27,8 @@ import {
   type SkillPathIssue,
 } from "./SetupSkill.js";
 import { CATALOG_IDENTITY } from "../catalogIdentity.js";
+import { resolveClaudeCodeRegistration } from "./ClaudeCodeRegistrationScopes.js";
+import { supportedClients } from "./SupportedClients.js";
 import { PRODUCT_IDENTITY, SDK_IDENTITY } from "../identity.js";
 import {
   readClientRegistrationStatuses,
@@ -159,6 +161,8 @@ interface DoctorIdentity {
     readonly installed_tool_count: number | null;
     readonly state: DoctorSkillState;
     readonly issues?: readonly SkillPathIssue[];
+    /** Claude Code account-synced copy inspected because no personal copy exists. */
+    readonly account_synced_path?: string;
     readonly remediation: string | null;
   };
   readonly registrations: readonly ClientRegistrationStatus[];
@@ -325,6 +329,9 @@ const collectDoctorIdentity = async (
         ...(installedSkillIdentity?.issues === undefined
           ? {}
           : { issues: installedSkillIdentity.issues }),
+        ...(installedSkillIdentity?.accountSyncedPath === undefined
+          ? {}
+          : { account_synced_path: installedSkillIdentity.accountSyncedPath }),
         remediation: skillAligned
           ? null
           : skillIdentityRemediation(installedSkillIdentity),
@@ -360,6 +367,10 @@ const skillIdentityRemediation = (
   const issues = identity?.issues;
   if (issues !== undefined && issues.length > 0)
     return `${issues.map(({ path, detail }) => `${detail} (${path})`).join(" ")} Verify the reported paths and use regular skill directories, or run rea setup with --skill=false to configure the client without installing the skill.`;
+  // Claude Code loads this copy from a claude.ai account; setup never writes
+  // it, and a personal copy from setup would only hide it from later checks.
+  if (identity?.accountSyncedPath !== undefined)
+    return `Claude Code loads the REA skill synced from your claude.ai account (${identity.accountSyncedPath}). Update that account skill to the bundle packaged with REA ${PRODUCT_IDENTITY.packageVersion} and start a new session; rea setup installs only a personal copy and does not change it.`;
   return "Run rea setup to update the installed REA skill.";
 };
 
@@ -409,6 +420,12 @@ export interface SystemDoctorHostOptions {
     Record<string, string>
   >;
   readonly linuxDemoRuntimeCheck?: () => Promise<DoctorCheck>;
+  /**
+   * Project whose Claude Code local- and project-scope registrations apply.
+   * Without one, doctor reads only the user scope that setup manages, so
+   * setup's own verification is unaffected by the directory it runs in.
+   */
+  readonly projectDirectory?: string;
 }
 
 /** Create diagnostics backed by the current process and host commands. */
@@ -571,12 +588,32 @@ export const systemDoctorHost = (
         return `Doctor resource cleanup failed: ${cause instanceof Error ? cause.message : String(cause)}`;
       }
     },
-    clientRegistrations: () =>
-      readClientRegistrationStatuses(homeDirectory, undefined, {
+    async clientRegistrations() {
+      const statuses = await readClientRegistrationStatuses(
+        homeDirectory,
+        undefined,
+        { platform, environment, resources },
+      );
+      const claudeCode = supportedClients(
+        homeDirectory,
         platform,
         environment,
-        resources,
-      }),
+      ).find(({ name }) => name === "claude_code");
+      if (claudeCode === undefined || options.projectDirectory === undefined)
+        return statuses;
+      const projectDirectory = resolve(options.projectDirectory);
+      return Promise.all(
+        statuses.map((status) =>
+          status.client === claudeCode.name
+            ? resolveClaudeCodeRegistration(status, {
+                client: claudeCode,
+                projectDirectory,
+                resources,
+              })
+            : status,
+        ),
+      );
+    },
   };
 };
 

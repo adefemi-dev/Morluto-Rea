@@ -163,7 +163,11 @@ stops the session from starting. `STRICT=1` makes it exit 1 anyway.
    `~/.claude/skills`, not the account-synced copy Claude Code loads. Do not
    apply their `rea setup` remediations: they would add the user-scope entry
    and the second skill copy that the SessionStart hook removes. `ida-registration` also fails until IDA is
-   configured, but it does not count toward `healthy`.
+   configured, but it does not count toward `healthy`. REA releases that
+   include doctor's Claude Code scope support read the repository's
+   `.mcp.json` and the account-synced skill, so these two findings go away
+   once `.mcp.json` and `REA_VERSION` pin such a release and the account's
+   synced skill matches it.
 
 REA's MCP server checks the Ghidra installation on its first Ghidra request
 and keeps that result for the life of the server. If Ghidra was installed

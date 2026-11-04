@@ -128,7 +128,7 @@ const registerDoctorCommand = (
           ]);
         return runDoctorOwned(
           options.target,
-          createSystemDoctorHost(environment),
+          createSystemDoctorHost(environment, process.cwd()),
           doctorScope(options),
         );
       }),

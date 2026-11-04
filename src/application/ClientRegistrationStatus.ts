@@ -7,7 +7,7 @@ import {
   type ClientConfigurationDocument,
 } from "./ClientConfigurationDocument.js";
 import { access } from "node:fs/promises";
-import { resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 
 import { z } from "zod";
 import { valid } from "semver";
@@ -29,9 +29,19 @@ import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 import { dshDocument } from "./DshCordisPatch.js";
 import type { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 
+/** Claude Code configuration scope that supplied the effective registration. */
+export type ClientRegistrationScope = "local" | "project" | "user";
+
 interface ClientRegistrationStatusBase {
   readonly client: string;
   readonly config_path: string;
+  /** Present when doctor resolved Claude Code's scope precedence. */
+  readonly scope?: ClientRegistrationScope;
+  /**
+   * Claude Code asks before it uses a project-scoped server and keeps no
+   * documented record of the answer, so a project entry's approval is unknown.
+   */
+  readonly approval?: "unknown";
   /** Exact package reference requested by npx/bunx, when registration uses one. */
   readonly package_reference?: string;
 }
@@ -477,3 +487,104 @@ const exists = async (path: string | undefined): Promise<boolean> => {
 
 const isMissing = (cause: unknown): boolean =>
   cause instanceof Error && "code" in cause && cause.code === "ENOENT";
+
+/** A Claude Code registration found outside the user scope that setup manages. */
+export interface ScopedClaudeCodeRegistrationSource {
+  readonly scope: Exclude<ClientRegistrationScope, "user">;
+  readonly configPath: string;
+}
+
+/**
+ * Evaluate one Claude Code local- or project-scope `rea` entry for doctor.
+ * It applies the user-scope alignment rules after removing one npx
+ * `--prefix=<absolute directory>` option, which changes only where npx keeps
+ * its packages. Setup, update maintenance, and uninstall never call this, so
+ * they still own only the exact commands setup writes.
+ */
+export const scopedClaudeCodeRegistrationStatus = (
+  value: unknown,
+  source: ScopedClaudeCodeRegistrationSource,
+  client: SetupClient,
+  currentCommandPath: string = resolve(process.argv[1] ?? "unknown"),
+  platform: NodeJS.Platform = process.platform,
+): ClientRegistrationStatus => {
+  const located = {
+    client: client.name,
+    config_path: source.configPath,
+    scope: source.scope,
+    ...(source.scope === "project" ? { approval: "unknown" as const } : {}),
+  };
+  let registration: z.output<typeof registrationSchema>;
+  try {
+    registration = parseRegistration(value, client);
+  } catch (cause: unknown) {
+    return {
+      ...located,
+      command: [],
+      state: "invalid",
+      remediation: `Repair the ${PRODUCT_IDENTITY.mcpServerKey} entry in ${source.configPath} (Claude Code ${source.scope} scope): ${cause instanceof Error ? cause.message : String(cause)}`,
+    };
+  }
+  const command: RegistrationCommand = [
+    registration.command,
+    ...registration.args,
+  ];
+  const [runner, ...runnerArguments] = withoutNpxPrefixOption(command);
+  const normalized = {
+    ...registration,
+    command: runner,
+    args: runnerArguments,
+  };
+  const packageReference = clientRegistrationPackageReference([
+    runner,
+    ...runnerArguments,
+  ]);
+  const packageVersion = exactRegisteredPackageVersion(packageReference);
+  const packageVersionDrift =
+    packageVersion !== undefined &&
+    packageVersion !== PRODUCT_IDENTITY.packageVersion;
+  const aligned =
+    registration.disabled !== true &&
+    !packageVersionDrift &&
+    registrationAligned(normalized, client, currentCommandPath, platform);
+  const reference =
+    packageReference === undefined
+      ? {}
+      : { package_reference: packageReference };
+  if (aligned)
+    return {
+      ...located,
+      command,
+      ...reference,
+      state: "aligned",
+      remediation: null,
+    };
+  return {
+    ...located,
+    command,
+    ...reference,
+    state: "stale",
+    remediation: `${
+      packageVersionDrift
+        ? `This ${source.scope}-scope registration requests ${packageReference}, while the current REA CLI package is ${PRODUCT_IDENTITY.packageVersion}.`
+        : `This ${source.scope}-scope registration does not run ${packageRunnerRegistrationCommand("npx", platform).join(" ")}.`
+    } Claude Code uses it ahead of user-scope entries, and rea setup writes only the user scope. Edit the ${PRODUCT_IDENTITY.mcpServerKey} entry in ${source.configPath}, then restart Claude Code.`,
+  };
+};
+
+/** Drop one `--prefix=<absolute directory>` option from an `npx -y` command. */
+const withoutNpxPrefixOption = (
+  command: RegistrationCommand,
+): RegistrationCommand => {
+  if (command[0] !== "npx") return command;
+  const options = command.slice(1, 3);
+  const prefix = options.find((option) => option.startsWith("--prefix="));
+  if (
+    command.length !== 5 ||
+    !options.includes("-y") ||
+    prefix === undefined ||
+    !isAbsolute(prefix.slice("--prefix=".length))
+  )
+    return command;
+  return ["npx", "-y", ...command.slice(3)];
+};
