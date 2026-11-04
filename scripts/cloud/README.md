@@ -25,7 +25,7 @@ fails with `rea: not found`.
 
 ### How Ghidra and pwntools get installed
 
-Two things run [`claude-cloud-setup.sh`](claude-cloud-setup.sh). Its seven
+Two things run [`claude-cloud-setup.sh`](claude-cloud-setup.sh). Its eight
 steps are idempotent and each runs on its own:
 
 - prerequisites: a full JDK 21, `procps`, `unzip`, `curl`, and Python venv
@@ -40,6 +40,12 @@ steps are idempotent and each runs on its own:
 - JADX: the `jadx-headless-mcp` 0.7.1 JAR REA pins for Android analysis,
   checked against REA's pinned SHA-256 and stored at
   `/opt/rea-jadx/jadx-headless-mcp-0.7.1-all.jar`;
+- apktool, unless the environment sets `SKIP_APKTOOL=1`: when no launcher is
+  selected (`REA_APKTOOL_COMMAND` unset and no `apktool` on `PATH`), installs
+  Ubuntu's `apktool` package (2.7.0, the version REA's
+  [Apktool resource analysis](../../docs/apktool-resource-analysis.md) is
+  verified with) through `apt-get`, then checks that `apktool --version` runs.
+  A launcher the operator selected is checked, never replaced;
 - Hopper, only when the environment sets `INSTALL_HOPPER=1`: if `rea doctor`
   does not report an installed Hopper, REA's own installer
   (`rea setup --yes --install-hopper`) downloads the Hopper Linux demo from
@@ -173,6 +179,15 @@ checksum published on the release page. To mirror another Ghidra version, set
 `GHIDRA_VERSION` and `GHIDRA_SHA256` from the official release notes; the
 public-URL fallback needs a pinned file name, so add one to
 `official_asset_name` too.
+
+### adb in cloud sessions
+
+The setup script does not install `adb`. REA's
+[adb tools](../../docs/adb-device-analysis.md) inspect and control an attached
+Android device or emulator, and a cloud session has neither: there is no
+`/dev/kvm` for an emulator, and outbound traffic goes through an HTTPS proxy
+that cannot carry an `adb connect` session to a remote device. Use the adb
+tools where REA runs next to a device, such as your own computer.
 
 ### IDA in cloud sessions
 
@@ -341,6 +356,15 @@ analysis that needs REA's tools.
   `org.fdroid.ui.crash.CrashActivity`) succeeded on the public F-Droid APK.
   On that APK, `search_android_classes` failed closed with "JADX class
   inventory is duplicated or differs from the loaded class count".
+- apktool in a cloud session: with no launcher present, the step installed
+  Ubuntu 24.04's `apktool` 2.7.0+dfsg-7 (it reports `2.7.0-dirty`) and its
+  dependencies in about 23 seconds, using the existing JDK 21; a rerun found
+  `/usr/bin/apktool` and changed nothing. `SKIP_APKTOOL=1` skipped it, and a
+  relative or missing `REA_APKTOOL_COMMAND` failed the step without
+  installing anything. Through the REA 6.4.0 MCP server,
+  `inspect_apktool_client` reported the `PATH` launcher, and
+  `decode_android_resources` decoded the public F-Droid Diary 1.105 APK
+  (manifest, version and SDK facts, 11 string locales, 110 files).
 - Hopper: in an earlier session `www.hopperapp.com` was not on the network
   allowlist, so the step failed with REA's message "REA could not download or
   unpack the official Hopper package". In a later cloud session that allowed
