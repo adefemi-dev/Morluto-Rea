@@ -38,10 +38,14 @@
 #      (no /dev/kvm) and only an HTTPS proxy, so REA's adb tools would have
 #      nothing to reach.
 #   7. Hopper, only with INSTALL_HOPPER=1: when `rea doctor` does not report an
-#      installed Hopper, runs `rea setup --yes --install-hopper`, REA's own
-#      installer, which downloads the Hopper Linux demo from www.hopperapp.com,
+#      installed Hopper, or reports one whose build this REA release does not
+#      accept (only its `hopper-version` check fails, as after a REA upgrade),
+#      runs `rea setup --yes --install-hopper`, REA's own installer, which
+#      downloads the current Hopper Linux demo from www.hopperapp.com,
 #      verifies it, and installs it with its Xvfb dependencies, after
-#      refreshing the apt package lists that installer relies on. Hopper is
+#      refreshing the apt package lists that installer relies on. Each REA
+#      release accepts only the Hopper builds it verifies, so REA_VERSION and
+#      the installed Hopper move together. Hopper is
 #      commercial software; the demo has vendor-defined limits. Setting
 #      INSTALL_HOPPER=1 in the environment settings is the operator's approval.
 #   8. REA skill for Claude Code, only with CONFIGURE_CLAUDE_CODE=1 (the
@@ -66,8 +70,8 @@
 #   GHIDRA_INSTALL_DIR=/opt/ghidra_12.1.4_PUBLIC
 #   REA_PWNTOOLS_PYTHON=/opt/rea-pwntools/bin/python
 #   REA_JADX_MCP_JAR=/opt/rea-jadx/jadx-headless-mcp-0.7.1-all.jar
-# rea-agents 6.4.0 requires GHIDRA_INSTALL_DIR. Later releases also discover
-# Ghidra through the ghidraRun PATH link when the variable is unset.
+# rea-agents 6.4.0 required GHIDRA_INSTALL_DIR; 6.8.0 also finds Ghidra
+# through the ghidraRun PATH link when the variable is unset.
 #
 # The script exits 0 even when a step fails, because a setup script that exits
 # non-zero stops the session from starting. Set STRICT=1 to exit 1 when any
@@ -90,7 +94,7 @@
 #   GHIDRA_ZIP       Absolute path to an already downloaded release archive.
 #   GHIDRA_PREFIX    Extraction parent directory, default /opt.
 #   BIN_DIR          Directory for the ghidraRun link, default /usr/local/bin.
-#   REA_VERSION      rea-agents version to pre-download, default 6.4.0
+#   REA_VERSION      rea-agents version to pre-download, default 6.8.0
 #                    (keep it equal to the version pinned in .mcp.json).
 #   PWNTOOLS_VENV    pwntools environment directory, default /opt/rea-pwntools.
 #   SKIP_PWNTOOLS=1  Skip step 3.
@@ -115,7 +119,7 @@ fi
 GHIDRA_VERSION="${GHIDRA_VERSION:-12.1.4}"
 GHIDRA_PREFIX="${GHIDRA_PREFIX:-/opt}"
 BIN_DIR="${BIN_DIR:-/usr/local/bin}"
-REA_VERSION="${REA_VERSION:-6.4.0}"
+REA_VERSION="${REA_VERSION:-6.8.0}"
 PWNTOOLS_VENV="${PWNTOOLS_VENV:-/opt/rea-pwntools}"
 PWNTOOLS_PINS=(pwntools==4.15.0 pyelftools==0.33 unicorn==2.1.2)
 JADX_JAR="${JADX_JAR:-/opt/rea-jadx/jadx-headless-mcp-0.7.1-all.jar}"
@@ -400,8 +404,10 @@ install_apktool() {
 }
 
 # Reads `rea doctor --provider hopper` and prints one line: "installed" when
-# every Hopper check passes, "runtime" and the failing checks when Hopper is
-# installed but another Hopper check fails, or "missing". rea doctor exits 1
+# every Hopper check passes, "outdated" when only `hopper-version` fails (an
+# installed Hopper build this REA release does not accept), "runtime" and the
+# failing checks when Hopper is installed but another Hopper check fails, or
+# "missing". rea doctor exits 1
 # whenever a check fails, including a missing Hopper, so the report decides and
 # the exit status is ignored; under pipefail it would abort the step silently.
 hopper_state() {
@@ -420,6 +426,8 @@ installation = [c for c in checks if c.get("name") == "hopper"]
 failing = [c for c in checks if not c.get("ok")]
 if not installation or not installation[0].get("ok"):
     print("missing")
+elif failing and all(c.get("name") == "hopper-version" for c in failing):
+    print("outdated " + "; ".join("%s: %s" % (c.get("name"), c.get("remediation") or c.get("detail")) for c in failing))
 elif failing:
     print("runtime " + "; ".join("%s: %s" % (c.get("name"), c.get("remediation") or c.get("detail")) for c in failing))
 else:
@@ -430,7 +438,9 @@ else:
 # Uses REA's own installer, which verifies the official package before
 # installing it; without --client it configures no agent integration. It runs
 # only after the operator opts in with INSTALL_HOPPER=1, and installs only when
-# Hopper itself is missing, never to repair host runtime configuration.
+# Hopper is missing or its build is one this REA release does not accept, never
+# to repair host runtime configuration. A build the installer cannot replace
+# with an accepted one fails the check after installation, so it is tried once.
 install_hopper() {
   local state
   command -v npx >/dev/null 2>&1 || die "npx not found; cannot run REA's Hopper installer"
@@ -441,6 +451,7 @@ install_hopper() {
       return
       ;;
     runtime*) die "Hopper is installed but not ready: ${state#runtime }" ;;
+    outdated*) log "replacing the installed Hopper build, which rea-agents ${REA_VERSION} does not accept: ${state#outdated }" ;;
   esac
   # As a non-root user, REA's installer elevates through pkexec, which cloud
   # containers do not provide; cloud setup scripts and hooks run as root.
