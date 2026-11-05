@@ -161,16 +161,20 @@ stops the session from starting. `STRICT=1` makes it exit 1 anyway.
    npx -y --prefix=/ rea-agents@6.8.0 doctor --json
    ```
 
-   Expect it to exit 1 with one finding that counts toward `healthy`:
-   `registration:claude_code`, reported as config drift, because 6.8.0's
-   doctor checks only Claude Code's user configuration (`~/.claude.json`), not
-   the repository's `.mcp.json`, which sessions use. Do not apply its
-   `rea setup` remediation: it would add the user-scope entry the
-   SessionStart hook removes. `skill:identity` is aligned when the
-   account-synced skill matches 6.8.0 (skill 49); while the account still
-   holds an older skill, the hook installs a current personal copy, and
-   Claude Code then lists both until the account skill is updated, after
-   which the hook moves the personal copy aside. `ida-registration` and
+   Expect it to exit 1 with two findings that count toward `healthy`, both
+   reported as config drift. `registration:claude_code`: 6.8.0's doctor
+   checks only Claude Code's user configuration (`~/.claude.json`), not the
+   repository's `.mcp.json`, which sessions use. `skill:identity`, reported
+   missing: 6.8.0's doctor checks only `~/.claude/skills`, while Claude Code
+   loads the account-synced copy from `~/.claude/skills/synced`. The hook's
+   skill step judges that synced copy itself and reports `ok` when it
+   matches 6.8.0 (skill 49). Do not apply either `rea setup` remediation:
+   they would add the user-scope entry and the second skill copy the
+   SessionStart hook removes. While the account still holds an older skill,
+   the hook installs a current personal copy, so `skill:identity` reads
+   aligned and Claude Code lists the skill twice; once the account skill is
+   updated, the hook moves the personal copy aside and `skill:identity`
+   reads missing again. `ida-registration` and
    `kuna-installation` also fail until IDA or Kuna is configured, but they do
    not count toward `healthy`. This fork's doctor (PR #20) reads the
    repository's `.mcp.json` and the account-synced skill; no published
@@ -392,6 +396,13 @@ analysis that needs REA's tools.
   for an older build was exercised with a stand-in `npx` (outdated, healthy,
   runtime failure, and a reinstall that leaves the build rejected), not with
   a real older Hopper build.
+- Account skill update to 6.8.0: after the account's REA skill was replaced
+  with 6.8.0's (skill 49) in claude.ai, a running session's synced copy
+  changed from skill 37 to 49 without a restart and was byte-identical to
+  6.8.0's bundle. `session-start.sh` then moved the identical personal copy
+  to a backup and reported `ok`; 6.8.0's doctor reported `skill:identity`
+  missing, while the same doctor, pointed at a scratch copy of the synced
+  skill, reported it aligned (49, 229 tools).
 - Hopper: in an earlier session `www.hopperapp.com` was not on the network
   allowlist, so the step failed with REA's message "REA could not download or
   unpack the official Hopper package". In a later cloud session that allowed
